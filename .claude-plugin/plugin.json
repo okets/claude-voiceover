@@ -1,0 +1,28 @@
+{
+  "name": "voiceover",
+  "displayName": "Claude Voiceover",
+  "version": "1.0.0",
+  "description": "Give Claude Code a voice: real-time text-to-speech narration of what Claude is doing, with local, free Kokoro neural voices (13 voices, offline, no API keys), instant macOS voices, notification sounds, and a silent/quiet/concise/verbose dial. Voice, TTS, speech, audio, narration, accessibility.",
+  "author": {
+    "name": "Hanan (okets)",
+    "url": "https://github.com/okets"
+  },
+  "homepage": "https://github.com/okets/claude-voiceover",
+  "repository": "https://github.com/okets/claude-voiceover",
+  "license": "MIT",
+  "keywords": [
+    "voice",
+    "tts",
+    "text-to-speech",
+    "narration",
+    "speech",
+    "audio",
+    "notification-sounds",
+    "kokoro",
+    "offline",
+    "local",
+    "accessibility"
+  ],
+  "hooks": "./hooks/hooks.json",
+  "commands": "./commands"
+}

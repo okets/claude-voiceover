@@ -1,0 +1,22 @@
+{
+  "name": "claude-voiceover",
+  "description": "Claude Voiceover - real-time voice narration for Claude Code",
+  "owner": {
+    "name": "Hanan (okets)",
+    "url": "https://github.com/okets"
+  },
+  "plugins": [
+    {
+      "name": "voiceover",
+      "source": "./",
+      "description": "Give Claude Code a voice: real-time text-to-speech narration of what Claude is doing, with local, free Kokoro neural voices, instant macOS voices, notification sounds, and a silent/quiet/concise/verbose dial.",
+      "author": {
+        "name": "Hanan (okets)",
+        "url": "https://github.com/okets"
+      },
+      "category": "productivity",
+      "homepage": "https://github.com/okets/claude-voiceover",
+      "license": "MIT"
+    }
+  ]
+}
