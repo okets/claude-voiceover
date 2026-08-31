@@ -10,7 +10,7 @@ Since March 2026 Claude Code has native `/voice` dictation, but it is input-only
 
 ## Why Voiceover
 
-- **Live play-by-play, not just pings.** Voiceover narrates tool activity as it happens — what file Claude is editing, what command it wants to run, what it just finished — with a dial from silent to full narration. It doesn't read responses at you, and it isn't a bell; it's a narrator.
+- **A real narrator, not a bell.** Narrator mode reads Claude's actual words aloud as it works — streaming audio that starts within seconds — and announces out loud when Claude is blocked waiting for your input, question and options included. Prefer tool-by-tool play-by-play instead? That's one level down the dial.
 - **Local and free neural voices.** 13 Kokoro neural voices run entirely on your machine — no API keys, no cloud, no cost. On macOS you can also use the built-in system voices with zero setup.
 - **Cross-platform.** macOS, Windows, and Linux.
 
@@ -22,7 +22,14 @@ Since March 2026 Claude Code has native `/voice` dictation, but it is input-only
 /voiceover:setup
 ```
 
-On macOS you'll have a voice immediately (system voices need no setup). Opt into the Kokoro neural voices during setup for the good stuff.
+On macOS you'll have a voice immediately (system voices need no setup). Opt into the Kokoro neural voices during setup for the good stuff. Then turn on the full experience:
+
+```
+/voiceover:level narrator
+/voiceover:voice emma
+```
+
+…and pick **Narration** under *Output style* in `/config` (restart Claude Code first so the bundled style appears) — Claude then writes in spoken-word cadence, so the audio keeps pace with the work.
 
 ## Interaction levels
 
@@ -53,13 +60,9 @@ Set with `/voiceover:voice <name>`. Kokoro voices are local neural TTS; the defa
 
 No voice picked? Each project gets a stable voice of its own, so you can tell your sessions apart by ear.
 
-### Pair it with the Narration output style
+## The Narration output style
 
-Narrator level tells you what Claude wrote; the bundled **Narration** output
-style makes Claude write like someone meant to be heard - outcome first,
-radio-brief progress notes, spoken-word prose. Opt in by picking **Narration** under *Output style* in `/config` when you're
-listening, and switch back anytime. (Restart Claude Code after installing for
-the style to appear.)
+Narrator level tells you what Claude wrote; the bundled **Narration** output style makes Claude write like someone meant to be heard — outcome first, radio-brief progress notes, spoken-word prose. Opt in by picking **Narration** under *Output style* in `/config` when you're listening, and switch back anytime. (Restart Claude Code after installing so the style appears.)
 
 ## Commands
 
