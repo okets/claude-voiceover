@@ -22,7 +22,15 @@ def main():
     from voiceover.templates import post_tool_announcement
 
     if get_interaction_level(payload.get("cwd")) == "narrator":
-        return  # narrator mode speaks Claude's words, not '- done' chatter
+        # No '- done' chatter, but prose written just before this tool call
+        # (which pre-tool can miss by a flush race) is picked up here, at the
+        # tool's completion, instead of waiting for the NEXT tool call.
+        from voiceover.prose import commit_offset, peek_new_prose
+        transcript = payload.get("transcript_path", "")
+        text, offset = peek_new_prose(transcript)
+        if text and speak(text, min_level="concise", cwd=payload.get("cwd"), full=True):
+            commit_offset(transcript, offset)
+        return
 
     tool_name = payload.get("tool_name", "")
     tool_input = payload.get("tool_input")

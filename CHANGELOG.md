@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.3 - 2026-08-31
+
+### Fixed
+- Question dialogs (AskUserQuestion / ExitPlanMode) appeared in silence: the
+  prose leading up to them lost the transcript flush race and no further
+  hooks fire while a dialog waits. Pre-tool now waits out the flush for
+  dialog tools, so the words are narrated while the dialog is on screen.
+- Mid-turn prose that missed the pre-tool flush race is now picked up at the
+  same tool's completion (PostToolUse) instead of the next tool call.
+
 ## 1.1.2 - 2026-08-31
 
 ### Fixed

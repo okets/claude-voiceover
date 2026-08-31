@@ -8,6 +8,7 @@ never prints to stdout, always exits 0.
 
 import json
 import sys
+import time
 from pathlib import Path
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
@@ -27,9 +28,19 @@ def main():
         # Narrator mode: speak Claude's actual words written since the last
         # narration; tool play-by-play stays silent and playing prose is
         # never cut off by new activity.
-        text, offset = peek_new_prose(payload.get("transcript_path", ""))
+        transcript = payload.get("transcript_path", "")
+        text, offset = peek_new_prose(transcript)
+        if not text and payload.get("tool_name") in ("AskUserQuestion", "ExitPlanMode"):
+            # A dialog is about to block the session with no further hooks -
+            # wait out the transcript flush race so the words leading up to
+            # the question are narrated WHILE the user reads the dialog.
+            for _ in range(4):
+                time.sleep(0.5)
+                text, offset = peek_new_prose(transcript)
+                if text:
+                    break
         if text and speak(text, min_level="concise", cwd=cwd, full=True):
-            commit_offset(payload.get("transcript_path", ""), offset)
+            commit_offset(transcript, offset)
         return
 
     # New activity always cuts off any narration still playing.
