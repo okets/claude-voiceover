@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.2 - 2026-08-31
+
+### Fixed
+- The turn's closing narration always arrived one turn late: Claude Code
+  flushes the final assistant message to the transcript ~0.5s AFTER the Stop
+  hook fires, so the finale was invisible at Stop time and only played when
+  the next hook fired. The Stop hook now polls briefly (up to 5s) for the
+  flush - narrator finales and spoken final responses land right when the
+  turn ends.
+
 ## 1.1.1 - 2026-08-31
 
 ### Fixed
