@@ -252,6 +252,25 @@ def get_voice_settings(voice):
     return VOICE_SETTINGS.get(voice, DEFAULT_VOICE_SETTINGS)
 
 
+def play_chunk(samples, sample_rate):
+    """Play one streamed chunk; extends the lock, never removes it."""
+    import soundfile as sf
+
+    duration = len(samples) / float(sample_rate) if sample_rate else 0.0
+    update_lock_expiry(duration + 20.0)  # this chunk plus headroom for the next
+    tmp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp_path = tmp_file.name
+    tmp_file.close()
+    try:
+        sf.write(tmp_path, samples, sample_rate)
+        return play_audio_file(tmp_path, timeout=max(30, int(duration) + 10))
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
 def play_samples(samples, sample_rate):
     """Write samples to a temp wav and play it under the tts lock."""
     import soundfile as sf
@@ -288,15 +307,20 @@ def speak_standard(kokoro, text, voice):
 
 
 def speak_streaming(kokoro, text, voice):
-    """Streaming synthesis; falls back to standard on any failure."""
+    """Streamed synthesis with INCREMENTAL playback.
+
+    Each chunk plays as soon as it is synthesized, so long narration starts
+    speaking within seconds instead of staying silent while the whole text
+    renders (the silence used to outlive the narration: the next turn's
+    interrupt killed the engine before a single word was heard). Chunks are
+    sequential - a short breath between sentences, like a human narrator.
+    Falls back to standard synthesis on any failure."""
     import asyncio
     import numpy as np
 
     settings = get_voice_settings(voice)
 
-    async def collect_stream():
-        chunks = []
-        sample_rate = DEFAULT_SAMPLE_RATE
+    async def synth_and_play():
         stream = kokoro.create_stream(
             text=text,
             voice=voice,
@@ -304,27 +328,30 @@ def speak_streaming(kokoro, text, voice):
             lang=settings["lang"],
             trim=settings["trim"],
         )
+        played = False
         async for chunk in stream:
+            samples, sample_rate = None, DEFAULT_SAMPLE_RATE
             if isinstance(chunk, tuple) and len(chunk) >= 2:
-                chunks.append(chunk[0])
-                sample_rate = chunk[1]
+                samples, sample_rate = chunk[0], chunk[1]
             elif isinstance(chunk, np.ndarray):
-                chunks.append(chunk)
+                samples = chunk
             elif hasattr(chunk, "audio"):
-                chunks.append(chunk.audio)
-        return chunks, sample_rate
+                samples = chunk.audio
+            if samples is None or not len(samples):
+                continue
+            play_chunk(samples, sample_rate)
+            played = True
+        return played
 
     log("[STREAM] Streaming with " + voice + "...")
     try:
-        chunks, sample_rate = asyncio.run(collect_stream())
-        if not chunks:
-            log("[ERROR] No audio data received from stream")
-            return False
-        return play_samples(np.concatenate(chunks), sample_rate)
+        return asyncio.run(synth_and_play())
     except Exception as error:
         log("[ERROR] Streaming failed: " + str(error))
         log("[FALLBACK] Falling back to standard synthesis...")
         return speak_standard(kokoro, text, voice)
+    finally:
+        remove_tts_lock()
 
 
 def speak_text(text, voice, use_streaming=False):

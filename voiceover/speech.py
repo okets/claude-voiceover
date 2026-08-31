@@ -115,7 +115,8 @@ def _dispatch(message, engine, cwd) -> None:
     if engine == "kokoro":
         command = [
             "uv", "run", "--project", str(_TTS_DIR),
-            str(_TTS_DIR / "kokoro_voice.py"), get_voice(cwd), message,
+            str(_TTS_DIR / "kokoro_voice.py"),
+            "--voice", get_voice(cwd), "--stream", message,
         ]
     elif engine in _MACOS_VOICES:
         command = [

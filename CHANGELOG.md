@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.1 - 2026-08-31
+
+### Fixed
+- Narrator prose was synthesized in full before any audio played, so long
+  answers sat in 30-60s of silence and were usually killed by the next turn
+  before a single word was heard - only the short legacy templates survived
+  to the speakers. Kokoro now streams: each chunk plays as soon as it is
+  synthesized, and first audio lands in ~5 seconds regardless of length.
+
 ## 1.1.0 - 2026-08-31
 
 ### Added
