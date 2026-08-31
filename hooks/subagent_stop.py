@@ -21,12 +21,12 @@ def main():
     if payload.get("stop_hook_active"):
         return
 
-    from voiceover.settings import get_setting, level_at_least
+    from voiceover.settings import get_interaction_level, get_setting
     from voiceover.speech import speak
     from voiceover.templates import subagent_completion_message
 
     cwd = payload.get("cwd")
-    if not level_at_least("verbose", cwd):
+    if get_interaction_level(cwd) != "verbose":
         return
     if not get_setting("speak_subagent_completions", cwd):
         return

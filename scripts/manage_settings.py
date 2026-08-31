@@ -25,9 +25,10 @@ LEVEL_DESCRIPTIONS = {
     "quiet": "Sound pings only (permission request, cycle done) - no speech",
     "concise": "Speaks permission requests and cycle completions [default]",
     "verbose": "Full play-by-play narration of tools, plus subagent completions",
+    "narrator": "Claude's actual words, read aloud - tool chatter stays quiet",
 }
 
-NUMERIC_ALIASES = {"0": "silent", "1": "quiet", "2": "concise", "3": "verbose"}
+NUMERIC_ALIASES = {"0": "silent", "1": "quiet", "2": "concise", "3": "verbose", "4": "narrator"}
 
 VALID_ENGINES = ["auto", "kokoro", "macos-female", "macos-male", "none"]
 

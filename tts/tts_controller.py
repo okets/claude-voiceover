@@ -11,7 +11,9 @@ next narration is not blocked by a lock whose playback was just killed.
 Stdlib-only; runs under plain python3.
 """
 
+import json
 import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -42,6 +44,36 @@ def data_dir():
     except OSError:
         pass
     return path
+
+
+def _lock_owner_pid():
+    """PID recorded in the lock by the engine that owns it, if any."""
+    try:
+        raw = (data_dir() / "tts.lock").read_text().strip()
+        return int(json.loads(raw).get("pid"))
+    except Exception:
+        return None
+
+
+def _kill_lock_owner_group():
+    """Kill the owning engine's whole process group - the engine plus its
+    afplay/say audio child - so no ghost audio outlives an interrupt.
+
+    Engines are spawned with start_new_session=True, so PID == PGID. The PID
+    is verified against our engine names before signalling, in case it was
+    recycled by an unrelated process."""
+    pid = _lock_owner_pid()
+    if not pid or sys.platform == "win32":
+        return
+    try:
+        probe = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                               capture_output=True, text=True, timeout=2)
+        command = probe.stdout.strip()
+        if "kokoro_voice.py" not in command and "macos_say.py" not in command:
+            return
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+    except Exception:
+        pass
 
 
 def remove_tts_lock():
@@ -85,6 +117,7 @@ def _stop_windows():
 
 def stop_tts():
     """Stop all voiceover TTS playback immediately."""
+    _kill_lock_owner_group()
     if sys.platform == "win32":
         _stop_windows()
     else:

@@ -1,5 +1,5 @@
 ---
-description: "Set the narration level: silent, quiet, concise, verbose (or 0-3)"
+description: "Set the narration level: silent, quiet, concise, verbose, narrator (or 0-4)"
 argument-hint: "[level] [--project]"
 allowed-tools: ["Bash"]
 ---
@@ -16,6 +16,7 @@ Change how much Claude Voiceover says. Arguments: `$ARGUMENTS`
 | quiet | 1 | Sound pings only (permission needed, task done) |
 | concise | 2 | Speaks permission requests and task completions (default) |
 | verbose | 3 | Full play-by-play narration of every tool Claude uses |
+| narrator | 4 | Claude's actual words, read aloud - tool chatter stays quiet |
 
 ## Steps
 

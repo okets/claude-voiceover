@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 DEFAULTS = {
-    "interaction_level": "concise",     # silent | quiet | concise | verbose
+    "interaction_level": "concise",     # silent | quiet | concise | verbose | narrator
     "tts_engine": "auto",               # auto | kokoro | macos-female | macos-male | none
     "tts_enabled": True,
     "notification_sounds": True,        # quiet-mode mp3 pings
@@ -23,7 +23,7 @@ DEFAULTS = {
     "speak_subagent_completions": True, # verbose level only
 }
 
-LEVELS = ["silent", "quiet", "concise", "verbose"]  # numeric aliases 0..3 accepted
+LEVELS = ["silent", "quiet", "concise", "verbose", "narrator"]  # numeric aliases 0..4 accepted
 
 # The 13 Kokoro voice ids, ported verbatim from the legacy kokoro_voice.py.
 KOKORO_VOICES = [

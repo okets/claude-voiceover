@@ -12,6 +12,7 @@ With env VOICEOVER_DRY_RUN set, speak()/play_sound() print
 '[voiceover] <text>' to stderr instead of producing audio.
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -35,6 +36,7 @@ _TTS_DIR = _PLUGIN_ROOT / "tts"
 _SOUNDS_DIR = Path(__file__).resolve().parent / "sounds"
 
 _LOCK_FILE_NAME = "tts.lock"
+_FULL_TEXT_CAP = 6000
 
 _MACOS_VOICES = {"macos-female": "Samantha", "macos-male": "Daniel"}
 
@@ -44,30 +46,39 @@ def lock_path() -> Path:
     return data_dir() / _LOCK_FILE_NAME
 
 
-def speak(text, min_level="concise", cwd=None, interrupt=False) -> None:
-    """Say text aloud if settings allow. Never blocks, never raises."""
+def speak(text, min_level="concise", cwd=None, interrupt=False, full=False) -> bool:
+    """Say text aloud if settings allow. Never blocks, never raises.
+
+    Returns True when the utterance was dispatched (or dry-printed) - callers
+    that track what has been narrated (the prose tailer) advance their state
+    only on True. full=True skips the word-budget truncation used for tool
+    chatter; prose is spoken whole (hard-capped at _FULL_TEXT_CAP chars)."""
     try:
         if not text or not str(text).strip():
-            return
+            return False
         if not is_tts_enabled(cwd) or not level_at_least(min_level, cwd):
-            return
-        message = truncate_for_speech(str(text).strip())
+            return False
+        if full:
+            message = str(text).strip()[:_FULL_TEXT_CAP]
+        else:
+            message = truncate_for_speech(str(text).strip())
         if _dry_run():
             _dry_print(message)
-            return
+            return True
         if interrupt:
             stop_speech()
         elif _is_locked():
-            return
-        _dispatch(message, resolve_engine(cwd), cwd)
+            return False
+        return _dispatch(message, resolve_engine(cwd), cwd)
     except Exception:
-        pass
+        return False
 
 
 def stop_speech() -> None:
-    """Kill any TTS process we spawned and clear the lock."""
+    """Kill any TTS process we spawned - the lock owner's whole process
+    group first, so its audio child dies too - and clear the lock."""
     try:
-        process_utils.stop_all_tts()
+        process_utils.stop_all_tts(lock_path=lock_path())
     except Exception:
         pass
     _clear_lock()
@@ -112,11 +123,11 @@ def _dispatch(message, engine, cwd) -> None:
             "--voice", _MACOS_VOICES[engine], message,
         ]
     else:  # "none" or unknown
-        return
-    # The engine owns the lock lifecycle (check -> create -> speak -> remove).
-    # Creating the lock here would race the engine's own startup check and
-    # make it skip: the caller only ever READS the lock (in _is_locked).
-    _spawn_detached(command)
+        return False
+    # The engine owns the lock lifecycle (atomic claim -> speak -> remove).
+    # Creating the lock here would race the engine's own claim and make it
+    # skip: the caller only ever READS the lock (in _is_locked).
+    return _spawn_detached(command)
 
 
 def _spawn_detached(command) -> bool:
@@ -152,7 +163,11 @@ def _is_locked() -> bool:
         if not lock.exists():
             return False
         with open(lock, "r", encoding="utf-8") as handle:
-            expiry = float(handle.read().strip())
+            raw = handle.read().strip()
+        try:
+            expiry = float(json.loads(raw).get("expiry"))
+        except Exception:
+            expiry = float(raw)  # pre-1.1 locks were a bare float
         if time.time() < expiry:
             return True
     except (OSError, ValueError):

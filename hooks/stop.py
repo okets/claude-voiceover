@@ -39,6 +39,18 @@ def main():
     if not transcript_path:
         return
 
+    if level == "narrator":
+        from voiceover.prose import commit_offset, peek_new_prose
+        prose, offset = peek_new_prose(transcript_path)
+        if prose:
+            # The finale is Claude's own closing words; it outranks whatever
+            # play-by-play is still in the air.
+            if speak(prose, min_level="concise", cwd=cwd, interrupt=True, full=True):
+                commit_offset(transcript_path, offset)
+            return
+        # Nothing unread (all prose narrated mid-turn): fall through to the
+        # templated completion so the turn still audibly ends.
+
     text = completion_message(cycle_stats(transcript_path))
     if text:
         speak(text, min_level="concise", cwd=cwd, interrupt=True)  # the completion always outranks leftover play-by-play

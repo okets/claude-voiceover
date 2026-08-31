@@ -17,8 +17,12 @@ sys.path.insert(0, str(PLUGIN_ROOT))
 def main():
     payload = json.load(sys.stdin)
 
+    from voiceover.settings import get_interaction_level
     from voiceover.speech import speak
     from voiceover.templates import post_tool_announcement
+
+    if get_interaction_level(payload.get("cwd")) == "narrator":
+        return  # narrator mode speaks Claude's words, not '- done' chatter
 
     tool_name = payload.get("tool_name", "")
     tool_input = payload.get("tool_input")

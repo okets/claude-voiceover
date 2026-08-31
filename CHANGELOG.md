@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.1.0 - 2026-08-31
+
+### Added
+- **Narrator level** (`/voiceover:level narrator`, alias 4): speaks Claude's
+  ACTUAL words from the session transcript - main-thread only - instead of
+  tool play-by-play. Code blocks become a spoken "...code snippet..." cue;
+  markdown is stripped to plain sentences; narration starts from "now", never
+  a session backlog. Unspoken text is retried at the next hook, and the Stop
+  hook reads Claude's closing words as the finale.
+
+### Fixed
+- Two narrations could speak over each other. The TTS lock is now claimed
+  atomically (temp file + os.link, so a racing engine can never observe an
+  empty lock), and interrupts kill the owning engine's whole process GROUP -
+  via the PID recorded in the lock - so a leftover afplay/say child can no
+  longer keep talking under the next utterance.
+
 ## 1.0.2 - 2026-08-31
 
 ### Fixed

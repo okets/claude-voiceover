@@ -13,6 +13,7 @@ text never appears in the process command line and cannot be mistaken for a
 Honors VOICEOVER_DRY_RUN: prints '[voiceover] <text>' to stderr, no audio.
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -41,30 +42,57 @@ def tts_lock_path():
     return data_dir() / "tts.lock"
 
 
-def check_tts_lock():
-    """True when another narration holds the lock (this one should skip)."""
-    lock_file = tts_lock_path()
+def _parse_lock_expiry(raw):
+    """Lock content is JSON {"expiry", "pid"}; older locks were a bare float."""
     try:
-        if not lock_file.exists():
-            return False
-        end_time = float(lock_file.read_text().strip())
-        if time.time() < end_time:
-            return True
-        lock_file.unlink()  # expired
-    except (ValueError, OSError):
+        return float(json.loads(raw).get("expiry"))
+    except Exception:
         try:
-            lock_file.unlink()  # unreadable -> stale
+            return float(raw)
+        except Exception:
+            return None
+
+
+def try_claim_lock(duration):
+    """Atomically claim the TTS lock. True = we own it and may speak.
+
+    O_CREAT|O_EXCL guarantees that of two engines racing, exactly one wins;
+    the loser skips quietly. The lock stores our PID so stop_speech() can
+    kill this engine's whole process group (including its audio child)."""
+    lock_file = tts_lock_path()
+    payload = json.dumps({"expiry": time.time() + duration, "pid": os.getpid()})
+    # Write payload to a private temp file, then os.link() it into place:
+    # the lock appears WITH its content in one atomic step, so a racing
+    # claimer can never observe an empty lock and judge it stale.
+    tmp_file = lock_file.with_name("tts.lock.{}".format(os.getpid()))
+    try:
+        tmp_file.write_text(payload)
+    except OSError:
+        return False
+    try:
+        for _ in range(2):
+            try:
+                os.link(str(tmp_file), str(lock_file))
+                return True
+            except FileExistsError:
+                try:
+                    expiry = _parse_lock_expiry(lock_file.read_text().strip())
+                except OSError:
+                    expiry = None
+                if expiry is not None and time.time() < expiry:
+                    return False  # someone else is speaking
+                try:
+                    lock_file.unlink()  # stale - retry the atomic claim once
+                except OSError:
+                    return False
+            except OSError:
+                return False
+        return False
+    finally:
+        try:
+            tmp_file.unlink()
         except OSError:
             pass
-    return False
-
-
-def create_tts_lock(duration):
-    """Write the expected playback end time so concurrent narrations skip."""
-    try:
-        tts_lock_path().write_text(str(time.time() + duration))
-    except OSError:
-        pass
 
 
 def remove_tts_lock():
@@ -85,9 +113,8 @@ def estimate_duration(text):
 
 
 def speak(voice, text):
-    if check_tts_lock():
+    if not try_claim_lock(estimate_duration(text)):
         return True  # another narration is playing - skip quietly
-    create_tts_lock(estimate_duration(text))
     try:
         subprocess.run(["say", "-v", voice], input=text, text=True, check=True)
         return True

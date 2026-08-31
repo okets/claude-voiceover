@@ -43,7 +43,7 @@ DEFAULTS = {
     "speak_subagent_completions": True, # verbose level only
 }
 
-LEVELS = ["silent", "quiet", "concise", "verbose"]   # numeric aliases 0..3 accepted everywhere
+LEVELS = ["silent", "quiet", "concise", "verbose", "narrator"]   # numeric aliases 0..4 accepted everywhere
 
 def data_dir() -> Path
 def get_setting(key: str, cwd: str | None = None)            # hierarchy lookup
@@ -65,7 +65,7 @@ KOKORO_VOICES = [...all 13 ids...]  # af_alloy? -> use the real 13 ids from old 
 ## voiceover/speech.py
 
 ```python
-def speak(text: str, min_level: str = "concise", cwd: str | None = None, interrupt: bool = False) -> None
+def speak(text, min_level="concise", cwd=None, interrupt=False, full=False) -> bool  # True = dispatched; full skips word-truncation (prose)
     # gates: is_tts_enabled + level_at_least(min_level); truncates via truncate_for_speech;
     # honors tts lock (skip if locked & not interrupt; interrupt -> stop_speech first);
     # engine dispatch:
@@ -83,7 +83,11 @@ def lock_path() -> Path                       # data_dir()/tts.lock with expiry 
 Level gating convention (callers pass min_level):
 - quiet: sounds only (play_sound works at quiet+; speak() at quiet is used for nothing today)
 - concise: permission requests, cycle completion
-- verbose: pre/post tool play-by-play, subagent completions
+- verbose: pre/post tool play-by-play, subagent completions (EXACTLY verbose)
+- narrator: Claude's actual prose via voiceover/prose.py (peek_new_prose/commit_offset,
+  byte-offset cursor in data_dir()/prose_state.json); tool chatter silent.
+  Lock is engine-owned: atomic claim (temp file + os.link), JSON {expiry, pid};
+  stop kills the owner's process group via os.killpg(os.getpgid(pid)).
 
 ## voiceover/templates.py
 
