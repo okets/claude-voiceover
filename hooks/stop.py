@@ -41,7 +41,7 @@ def main():
 
     text = completion_message(cycle_stats(transcript_path))
     if text:
-        speak(text, min_level="concise", cwd=cwd)
+        speak(text, min_level="concise", cwd=cwd, interrupt=True)  # the completion always outranks leftover play-by-play
 
 
 if __name__ == "__main__":

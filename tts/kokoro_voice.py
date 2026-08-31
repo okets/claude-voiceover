@@ -238,8 +238,6 @@ def play_samples(samples, sample_rate):
 
 def speak_standard(kokoro, text, voice):
     """Standard non-streaming synthesis with lock coordination."""
-    if check_tts_lock():
-        return True  # another narration is playing - skip quietly
     settings = get_voice_settings(voice)
     log("[TTS] Speaking with " + voice + "...")
     samples, sample_rate = kokoro.create(
@@ -257,8 +255,6 @@ def speak_streaming(kokoro, text, voice):
     import asyncio
     import numpy as np
 
-    if check_tts_lock():
-        return True  # another narration is playing - skip quietly
     settings = get_voice_settings(voice)
 
     async def collect_stream():
@@ -298,12 +294,23 @@ def speak_text(text, voice, use_streaming=False):
     try:
         if not ensure_models():
             return False
-        from kokoro_onnx import Kokoro
+        if check_tts_lock():
+            return True  # another narration is playing - skip quietly
+        # Lock BEFORE the slow model load: callers and sibling engines must
+        # see this narration during the multi-second spin-up, not only once
+        # playback begins. play_samples() overwrites the expiry with the real
+        # audio duration and removes the lock when playback ends.
+        create_tts_lock(10.0 + 0.4 * len(text.split()))
+        try:
+            from kokoro_onnx import Kokoro
 
-        kokoro = Kokoro(str(MODEL_FILE), str(VOICES_FILE))
-        if use_streaming:
-            return speak_streaming(kokoro, text, voice)
-        return speak_standard(kokoro, text, voice)
+            kokoro = Kokoro(str(MODEL_FILE), str(VOICES_FILE))
+            if use_streaming:
+                return speak_streaming(kokoro, text, voice)
+            return speak_standard(kokoro, text, voice)
+        except Exception:
+            remove_tts_lock()
+            raise
     except Exception as error:
         log("[ERROR] Speech failed: " + str(error))
         return False

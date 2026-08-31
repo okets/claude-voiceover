@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.2 - 2026-08-31
+
+### Fixed
+- Completion narration was skipped when it fired while a tool announcement was
+  still playing: the Stop hook now interrupts leftover play-by-play instead of
+  yielding to it.
+- Kokoro created its TTS lock only after the multi-second model load, leaving a
+  window where overlapping narrations double-spawned and callers mis-read the
+  engine as idle. It now locks before loading the model.
+
 ## 1.0.1 - 2026-08-31
 
 ### Fixed
