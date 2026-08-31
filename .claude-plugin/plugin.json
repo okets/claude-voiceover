@@ -1,7 +1,7 @@
 {
   "name": "voiceover",
   "displayName": "Claude Voiceover",
-  "version": "1.1.5",
+  "version": "1.1.6",
   "description": "Give Claude Code a voice: real-time text-to-speech narration of what Claude is doing, with local, free Kokoro neural voices (13 voices, offline, no API keys), instant macOS voices, notification sounds, and a silent/quiet/concise/verbose dial. Voice, TTS, speech, audio, narration, accessibility.",
   "author": {
     "name": "Hanan (okets)",

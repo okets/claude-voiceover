@@ -46,8 +46,20 @@ def main():
             from voiceover.templates import blocking_dialog_message
             alert = blocking_dialog_message(tool_name, payload.get("tool_input") or {})
             combined = (text + "\n" + alert) if text else alert
-            if speak(combined, min_level="concise", cwd=cwd, interrupt=True, full=True) and text:
-                commit_offset(transcript, offset)
+            if speak(combined, min_level="concise", cwd=cwd, interrupt=True, full=True):
+                if text:
+                    commit_offset(transcript, offset)
+                # Tell the notification hook this block was already announced,
+                # so its "needs permission" echo stays quiet (marker-based:
+                # message wording is not parseable reliably).
+                try:
+                    import json as _json
+                    import time as _time
+                    from voiceover.settings import data_dir
+                    with open(data_dir() / "dialog_alert.json", "w") as handle:
+                        _json.dump({"ts": _time.time()}, handle)
+                except Exception:
+                    pass
             return
         if text and speak(text, min_level="concise", cwd=cwd, full=True):
             commit_offset(transcript, offset)

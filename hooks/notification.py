@@ -50,14 +50,19 @@ def main():
         play_sound("notification", cwd=cwd)
         return
 
-    from voiceover.settings import get_interaction_level
-    raw_message = payload.get("message", "") or ""
-    if (get_interaction_level(cwd) == "narrator"
-            and ("AskUserQuestion" in raw_message or "ExitPlanMode" in raw_message)):
-        # Narrator's pre-tool hook already announced this dialog with the
-        # actual question text; a second "needs permission" alert would only
-        # interrupt it mid-sentence. Stay quiet.
-        return
+    from voiceover.settings import data_dir, get_interaction_level
+    if get_interaction_level(cwd) == "narrator":
+        # If the pre-tool hook announced a blocking dialog moments ago, this
+        # notification is its "needs permission" echo - speaking it would cut
+        # the real announcement mid-sentence. Marker-based: the message text
+        # is not reliably parseable for the tool name.
+        try:
+            import time as _time
+            with open(data_dir() / "dialog_alert.json") as handle:
+                if _time.time() - float(json.load(handle).get("ts", 0)) < 30:
+                    return
+        except Exception:
+            pass
 
     text = permission_request_message(payload)
     if text:

@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.6 - 2026-08-31
+
+### Fixed
+- The permission echo could still cut question announcements: the
+  notification payload does not reliably name the tool, so the substring
+  gate missed. Suppression is now marker-based - the pre-tool hook records
+  when it announced a dialog, and the notification hook skips permission
+  alerts within 30s of that marker. Bash and other real permission requests
+  are unaffected.
+
 ## 1.1.5 - 2026-08-31
 
 ### Fixed
