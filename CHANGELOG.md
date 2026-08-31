@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.1 - 2026-08-31
+
+### Fixed
+- Narration was silent when spoken through the hooks: `speak()` wrote the TTS
+  lock immediately after spawning the engine, and the engine's own startup
+  lock check then saw it and skipped. The engine now solely owns the lock
+  lifecycle (create on start, remove at true end of speech); the caller only
+  reads it for overlap gating.
+
 ## 1.0.0 — 2026-08-30
 
 Claude Voiceover 1.0 — the rebirth of smarter-claude as a focused voice-narration plugin.

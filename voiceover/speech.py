@@ -35,7 +35,6 @@ _TTS_DIR = _PLUGIN_ROOT / "tts"
 _SOUNDS_DIR = Path(__file__).resolve().parent / "sounds"
 
 _LOCK_FILE_NAME = "tts.lock"
-_MAX_LOCK_SECONDS = 30.0
 
 _MACOS_VOICES = {"macos-female": "Samantha", "macos-male": "Daniel"}
 
@@ -114,8 +113,10 @@ def _dispatch(message, engine, cwd) -> None:
         ]
     else:  # "none" or unknown
         return
-    if _spawn_detached(command):
-        _create_lock(_estimate_duration(message))
+    # The engine owns the lock lifecycle (check -> create -> speak -> remove).
+    # Creating the lock here would race the engine's own startup check and
+    # make it skip: the caller only ever READS the lock (in _is_locked).
+    _spawn_detached(command)
 
 
 def _spawn_detached(command) -> bool:
@@ -140,14 +141,8 @@ def _spawn_detached(command) -> bool:
         return False
 
 
-def _estimate_duration(message) -> float:
-    """Rough playback estimate: engine spin-up plus ~2.5 words per second."""
-    seconds = 2.0 + 0.4 * len(message.split())
-    return min(seconds, _MAX_LOCK_SECONDS)
-
-
 # ---------------------------------------------------------------------------
-# Lock file (ported check/create/clear semantics)
+# Lock file (read/clear only - the engine subprocess creates and removes it)
 # ---------------------------------------------------------------------------
 
 def _is_locked() -> bool:
@@ -164,16 +159,6 @@ def _is_locked() -> bool:
         pass
     _clear_lock()  # expired or unreadable
     return False
-
-
-def _create_lock(duration: float) -> None:
-    try:
-        lock = lock_path()
-        lock.parent.mkdir(parents=True, exist_ok=True)
-        with open(lock, "w", encoding="utf-8") as handle:
-            handle.write(str(time.time() + duration))
-    except OSError:
-        pass
 
 
 def _clear_lock() -> None:
