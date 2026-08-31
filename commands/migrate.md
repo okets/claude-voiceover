@@ -28,6 +28,10 @@ Clean up a legacy smarter-claude installation so Voiceover can take over narrati
 
    This first backs up `~/.claude/settings.json` to `settings.json.pre-voiceover.bak`, then strips the legacy hook entries and deletes the legacy files.
 
+   The legacy `~/.claude/smarter-claude/` data directory (old contextual-memory DB and logs) is kept by default. If the user also wants that history gone, add `--purge-data` to the same command — but only if they explicitly say so.
+
+   If the report lists "Review manually" items (e.g. `~/.claude/CLAUDE.md` with its obsolete Database-First Policy section), offer to help the user edit those by hand — the script deliberately never touches them because they may contain the user's own content.
+
 5. Tell the user:
    - Their settings backup location.
    - That they should restart Claude Code so the old hooks fully unload.
