@@ -53,6 +53,14 @@ Set with `/voiceover:voice <name>`. Kokoro voices are local neural TTS; the defa
 
 No voice picked? Each project gets a stable voice of its own, so you can tell your sessions apart by ear.
 
+### Pair it with the Narration output style
+
+Narrator level tells you what Claude wrote; the bundled **Narration** output
+style makes Claude write like someone meant to be heard - outcome first,
+radio-brief progress notes, spoken-word prose. Opt in with `/output-style
+Narration` when you're listening, and switch back anytime. (Restart Claude Code
+after installing for the style to appear.)
+
 ## Commands
 
 | Command | What it does |

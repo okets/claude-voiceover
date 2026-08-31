@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.0 - 2026-08-31
+
+### Added
+- Bundled "Narration" output style (output-styles/narration.md): spoken-word
+  cadence so audio keeps up with the work - lead with the outcome,
+  radio-brief progress notes, prose over tables/headers, code kept in
+  blocks, a fuller closing summary. Opt-in via /output-style Narration
+  (deliberately NOT force-applied); pairs with the narrator level.
+
 ## 1.1.7 - 2026-08-31
 
 ### Added
