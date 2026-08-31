@@ -724,3 +724,25 @@ def subagent_completion_message(payload):
     if get_interaction_level() == "verbose":
         return random.choice(_SUBAGENT_VERBOSE).format(snippet)
     return random.choice(_SUBAGENT_CONCISE).format(snippet)
+
+
+def blocking_dialog_message(tool_name, tool_input):
+    """Spoken alert for tools that BLOCK the session waiting on the user.
+
+    This is the plugin's highest-value moment for someone away from the
+    screen: it says out loud that input is needed and reads the actual
+    question and its option labels."""
+    if tool_name == "ExitPlanMode":
+        return "I need your review: my plan is ready for approval."
+    parts = ["I need your input."]
+    for question in (tool_input.get("questions") or [])[:4]:
+        if not isinstance(question, dict):
+            continue
+        text = (question.get("question") or "").strip()
+        if text:
+            parts.append(text)
+        labels = [option.get("label") for option in (question.get("options") or [])
+                  if isinstance(option, dict) and option.get("label")]
+        if labels:
+            parts.append("Options: " + ", ".join(labels) + ".")
+    return " ".join(parts)

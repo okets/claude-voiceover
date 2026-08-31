@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.4 - 2026-08-31
+
+### Added
+- Blocking dialogs are announced out loud: when AskUserQuestion or
+  ExitPlanMode is about to wait on the user, the narrator speaks
+  "I need your input" plus the actual question text and option labels,
+  interrupting any narration backlog - a blocked session outranks old
+  audio. The away-from-screen moment the plugin exists for.
+
 ## 1.1.3 - 2026-08-31
 
 ### Fixed

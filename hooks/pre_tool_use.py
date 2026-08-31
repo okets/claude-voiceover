@@ -29,16 +29,26 @@ def main():
         # narration; tool play-by-play stays silent and playing prose is
         # never cut off by new activity.
         transcript = payload.get("transcript_path", "")
+        tool_name = payload.get("tool_name", "")
         text, offset = peek_new_prose(transcript)
-        if not text and payload.get("tool_name") in ("AskUserQuestion", "ExitPlanMode"):
-            # A dialog is about to block the session with no further hooks -
-            # wait out the transcript flush race so the words leading up to
-            # the question are narrated WHILE the user reads the dialog.
-            for _ in range(4):
-                time.sleep(0.5)
-                text, offset = peek_new_prose(transcript)
-                if text:
-                    break
+        if tool_name in ("AskUserQuestion", "ExitPlanMode"):
+            # A dialog is about to block the session with no further hooks.
+            # Wait out the transcript flush race for the lead-in prose, then
+            # speak prose + an explicit 'I need your input' announcement of
+            # the actual question - interrupting any backlog, because a
+            # blocked session outranks old narration.
+            if not text:
+                for _ in range(3):
+                    time.sleep(0.5)
+                    text, offset = peek_new_prose(transcript)
+                    if text:
+                        break
+            from voiceover.templates import blocking_dialog_message
+            alert = blocking_dialog_message(tool_name, payload.get("tool_input") or {})
+            combined = (text + "\n" + alert) if text else alert
+            if speak(combined, min_level="concise", cwd=cwd, interrupt=True, full=True) and text:
+                commit_offset(transcript, offset)
+            return
         if text and speak(text, min_level="concise", cwd=cwd, full=True):
             commit_offset(transcript, offset)
         return
