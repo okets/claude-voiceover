@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.5 - 2026-08-31
+
+### Fixed
+- The question announcement was cut mid-sentence by its own echo: the same
+  dialog also raises a "needs permission" notification, which spoke with
+  interrupt. In narrator mode, permission notifications for AskUserQuestion /
+  ExitPlanMode now stay silent - the pre-tool announcement already reads the
+  actual question. All other permission requests keep their voice.
+
 ## 1.1.4 - 2026-08-31
 
 ### Added

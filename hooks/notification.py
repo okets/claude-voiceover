@@ -50,6 +50,15 @@ def main():
         play_sound("notification", cwd=cwd)
         return
 
+    from voiceover.settings import get_interaction_level
+    raw_message = payload.get("message", "") or ""
+    if (get_interaction_level(cwd) == "narrator"
+            and ("AskUserQuestion" in raw_message or "ExitPlanMode" in raw_message)):
+        # Narrator's pre-tool hook already announced this dialog with the
+        # actual question text; a second "needs permission" alert would only
+        # interrupt it mid-sentence. Stay quiet.
+        return
+
     text = permission_request_message(payload)
     if text:
         speak(text, min_level="concise", cwd=cwd, interrupt=True)
