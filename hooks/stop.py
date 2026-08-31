@@ -41,16 +41,23 @@ def main():
         return
 
     if level == "narrator":
+        from voiceover.debuglog import log as _log
         from voiceover.prose import commit_offset, peek_new_prose
+        import os as _os
+        _log("stop", "enter size=%s" % _os.path.getsize(transcript_path), cwd)
         # The final assistant message is flushed to the transcript shortly
         # AFTER Stop fires (measured ~0.5s); poll briefly so the finale is
         # actually readable instead of always arriving one turn late.
         prose, offset = peek_new_prose(transcript_path)
+        retries = 0
         for _ in range(10):
             if prose:
                 break
             time.sleep(0.5)
             prose, offset = peek_new_prose(transcript_path)
+            retries += 1
+        _log("stop", "peek after %d retries: %d chars, size=%s" % (
+            retries, len(prose or ""), _os.path.getsize(transcript_path)), cwd)
         if prose:
             # The finale is Claude's own closing words; it outranks whatever
             # play-by-play is still in the air.

@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.7 - 2026-08-31
+
+### Added
+- Opt-in pipeline diagnostics: set debug_log true to trace every speak gate,
+  peek, and dispatch to data_dir()/voiceover.log.
+
 ## 1.1.6 - 2026-08-31
 
 ### Fixed

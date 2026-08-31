@@ -30,6 +30,7 @@ from .settings import (
     resolve_engine,
 )
 from .templates import truncate_to_words
+from .debuglog import log as _log
 
 _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 _TTS_DIR = _PLUGIN_ROOT / "tts"
@@ -56,7 +57,10 @@ def speak(text, min_level="concise", cwd=None, interrupt=False, full=False) -> b
     try:
         if not text or not str(text).strip():
             return False
+        _log("speak", "req min=%s int=%s chars=%d :: %.60s" % (
+            min_level, interrupt, len(str(text)), str(text).replace("\n", " ")), cwd)
         if not is_tts_enabled(cwd) or not level_at_least(min_level, cwd):
+            _log("speak", "gated by level/enabled", cwd)
             return False
         if full:
             message = str(text).strip()[:_FULL_TEXT_CAP]
@@ -68,8 +72,11 @@ def speak(text, min_level="concise", cwd=None, interrupt=False, full=False) -> b
         if interrupt:
             stop_speech()
         elif _is_locked():
+            _log("speak", "skipped: lock held", cwd)
             return False
-        return _dispatch(message, resolve_engine(cwd), cwd)
+        dispatched = _dispatch(message, resolve_engine(cwd), cwd)
+        _log("speak", "dispatch=%s engine=%s" % (dispatched, resolve_engine(cwd)), cwd)
+        return dispatched
     except Exception:
         return False
 

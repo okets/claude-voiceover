@@ -21,6 +21,7 @@ DEFAULTS = {
     "notification_sounds": True,        # quiet-mode mp3 pings
     "voice": None,                      # explicit kokoro voice id, else per-project hash
     "speak_subagent_completions": True, # verbose level only
+    "debug_log": False,                 # write pipeline diagnostics to data_dir()/voiceover.log
 }
 
 LEVELS = ["silent", "quiet", "concise", "verbose", "narrator"]  # numeric aliases 0..4 accepted
