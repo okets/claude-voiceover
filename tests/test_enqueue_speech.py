@@ -1,5 +1,7 @@
 """enqueue_speech gates like speak() but never loses to the lock."""
 
+import contextlib
+import io
 import json
 import os
 import sys
@@ -25,6 +27,15 @@ def texts():
     return out
 
 
+def spoken_text(*args, **kwargs):
+    """The message speak() actually dry-printed, without the prefix."""
+    buffer = io.StringIO()
+    with contextlib.redirect_stderr(buffer):
+        speech.speak(*args, **kwargs)
+    out = buffer.getvalue()
+    return out.split("[voiceover] ", 1)[1].strip() if "[voiceover] " in out else ""
+
+
 # --- speak() behavior preservation tests (behavior-preserving refactor guard) ---
 os.environ["VOICEOVER_DRY_RUN"] = "1"
 check("speak returns True at narrator level", speech.speak("hello") is True)
@@ -33,8 +44,12 @@ check("speak returns False when level is silent", speech.speak("hello") is False
 set_setting("interaction_level", "narrator")
 check("speak returns False for empty text", speech.speak("   ") is False)
 long_text = " ".join(["word"] * 400)
-check("speak with full=False truncates", speech.speak(long_text, full=False) is True)
-check("speak with full=True does not truncate", speech.speak(long_text, full=True) is True)
+truncated = spoken_text(long_text, full=False)
+whole = spoken_text(long_text, full=True)
+check("speak() truncates when full=False",
+      0 < len(truncated) < len(long_text), "len=%d of %d" % (len(truncated), len(long_text)))
+check("speak() keeps the whole text when full=True",
+      len(whole) > len(truncated), "len=%d vs truncated %d" % (len(whole), len(truncated)))
 del os.environ["VOICEOVER_DRY_RUN"]
 
 # --- the basic path ---------------------------------------------------------
