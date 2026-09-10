@@ -113,7 +113,11 @@ def enqueue_speech(text, min_level="concise", cwd=None, full=False, session=None
         engine = resolve_engine(cwd)
         if engine == "none":
             return False
-        queued = spool.enqueue(message, engine, get_voice(cwd), session=session)
+        # Resolve the voice for THIS engine, exactly as _dispatch does: the
+        # macOS engines take a `say -v <Name>` voice, and get_voice() only
+        # ever returns a kokoro id.
+        voice = _MACOS_VOICES.get(engine) or get_voice(cwd)
+        queued = spool.enqueue(message, engine, voice, session=session)
         _log("queue", "queued=%s pending=%d chars=%d :: %.60s" % (
             queued, spool.pending_count(), len(message),
             message.replace("\n", " ")), cwd)

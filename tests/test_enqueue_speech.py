@@ -61,6 +61,25 @@ item = json.loads(sorted(spool.queue_dir().glob("*.json"))[0].read_text())
 check("engine is resolved at enqueue time", item["engine"] == "kokoro", item)
 check("voice is resolved at enqueue time", item["voice"] == "bf_emma", item)
 
+# --- the voice is resolved PER ENGINE, not always as a kokoro id -----------
+# The macOS engines take a `say -v <Name>` voice; get_voice() only ever
+# returns a kokoro id. Queueing the kokoro id would make drain run
+# `say -v bf_emma` on the DEFAULT macOS path, and would also break the
+# process-kill patterns, which are anchored on "say -v Samantha"/"Daniel".
+for engine, expected in (("macos-female", "Samantha"), ("macos-male", "Daniel")):
+    spool.clear()
+    set_setting("tts_engine", engine)
+    speech.enqueue_speech("voice check", full=True)
+    item = json.loads(sorted(spool.queue_dir().glob("*.json"))[0].read_text())
+    check("%s queues the %s voice" % (engine, expected),
+          item["voice"] == expected, item)
+    check("%s queues its own engine name" % engine, item["engine"] == engine, item)
+set_setting("tts_engine", "kokoro")
+spool.clear()
+speech.enqueue_speech("kokoro still resolves its own voice", full=True)
+item = json.loads(sorted(spool.queue_dir().glob("*.json"))[0].read_text())
+check("kokoro keeps its configured voice", item["voice"] == "bf_emma", item)
+
 # --- THE POINT: a held lock does not stop queueing -------------------------
 spool.clear()
 speech.lock_path().write_text(json.dumps({"expiry": time.time() + 60, "pid": 1}))
