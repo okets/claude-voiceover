@@ -145,4 +145,70 @@ run_hook("post_tool_use", {"cwd": str(REPO_ROOT), "transcript_path": str(path),
 item = json.loads(sorted(spool.queue_dir().glob("*.json"))[0].read_text())
 check("the hook records its session id", item["session"] == "SESSION-XYZ", item)
 
+# --- the dialog branch announces and marks --------------------------------
+dialog_marker = Path(os.environ["VOICEOVER_DATA_DIR"]) / "dialog_alert.json"
+dialog_marker.unlink(missing_ok=True)
+spool.clear()
+path = write_transcript("dialog.jsonl", [USER])
+commit_offset(str(path), path.stat().st_size)
+with open(path, "a") as handle:
+    handle.write(json.dumps(assistant("Let me check the options first.")) + "\n")
+proc = run_hook("pre_tool_use", {
+    "cwd": str(REPO_ROOT), "transcript_path": str(path),
+    "tool_name": "AskUserQuestion",
+    "tool_input": {"questions": [{"question": "Which approach?",
+                                   "options": [{"label": "A"}, {"label": "B"}]}]},
+    "session_id": "S1"})
+check("pre_tool_use (dialog) exits 0", proc.returncode == 0, proc.stderr)
+texts = queued_texts()
+check("the dialog branch queues exactly one item", len(texts) == 1, texts)
+check("the queued text carries both the prose and the alert",
+      texts and "Let me check the options first." in texts[0]
+      and "I need your input" in texts[0] and "Which approach?" in texts[0],
+      texts)
+check("the dialog marker was written", dialog_marker.exists(), dialog_marker)
+
+# --- a failed enqueue must NOT write the marker (Finding A regression) ----
+dialog_marker.unlink(missing_ok=True)
+spool.clear()
+path = write_transcript("dialog_fail.jsonl", [USER])
+commit_offset(str(path), path.stat().st_size)
+with open(path, "a") as handle:
+    handle.write(json.dumps(assistant("Never mind, checking again.")) + "\n")
+set_setting("tts_engine", "none")
+proc = run_hook("pre_tool_use", {
+    "cwd": str(REPO_ROOT), "transcript_path": str(path),
+    "tool_name": "AskUserQuestion",
+    "tool_input": {"questions": [{"question": "Which one?", "options": []}]},
+    "session_id": "S1"})
+set_setting("tts_engine", "kokoro")
+check("pre_tool_use (failed dialog enqueue) exits 0", proc.returncode == 0, proc.stderr)
+check("nothing is queued when the enqueue fails", queued_texts() == [], queued_texts())
+check("the marker is NOT written when the enqueue fails",
+      not dialog_marker.exists(), dialog_marker.exists())
+
+# --- notification.py's narrator path queues rather than speaks ------------
+dialog_marker.unlink(missing_ok=True)
+spool.clear()
+path = write_transcript("notify.jsonl", [USER])
+commit_offset(str(path), path.stat().st_size)
+proc = run_hook("notification", {
+    "cwd": str(REPO_ROOT), "transcript_path": str(path),
+    "message": "Claude needs your permission to use Bash",
+    "session_id": "S1"})
+check("notification exits 0", proc.returncode == 0, proc.stderr)
+check("notification queued its permission text", len(queued_texts()) == 1, queued_texts())
+
+# ... and stays quiet when a fresh dialog marker says it was just announced
+spool.clear()
+dialog_marker.write_text(json.dumps({"ts": time.time()}))
+proc = run_hook("notification", {
+    "cwd": str(REPO_ROOT), "transcript_path": str(path),
+    "message": "Claude needs your permission to use Bash",
+    "session_id": "S1"})
+check("notification (echo-suppressed) exits 0", proc.returncode == 0, proc.stderr)
+check("notification queues nothing when the dialog was just announced",
+      queued_texts() == [], queued_texts())
+dialog_marker.unlink(missing_ok=True)
+
 report()
