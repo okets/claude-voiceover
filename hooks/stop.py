@@ -43,6 +43,7 @@ def main():
     if level == "narrator":
         from voiceover.debuglog import log as _log
         from voiceover.prose import commit_offset, peek_new_prose
+        from voiceover.speech import ensure_drainer, enqueue_speech
         import os as _os
         _log("stop", "enter size=%s" % _os.path.getsize(transcript_path), cwd)
         # The final assistant message is flushed to the transcript shortly
@@ -59,11 +60,15 @@ def main():
         _log("stop", "peek after %d retries: %d chars, size=%s" % (
             retries, len(prose or ""), _os.path.getsize(transcript_path)), cwd)
         if prose:
-            # The finale is Claude's own closing words; it outranks whatever
-            # play-by-play is still in the air.
-            if speak(prose, min_level="concise", cwd=cwd, interrupt=True, full=True):
+            # The finale is Claude's own closing words. It goes to the BACK of
+            # the queue: order is what makes narration followable, and the
+            # queue drains without waiting for another hook anyway.
+            if enqueue_speech(prose, cwd=cwd, full=True,
+                              session=payload.get("session_id")):
                 commit_offset(transcript_path, offset)
+            ensure_drainer(cwd)
             return
+        ensure_drainer(cwd)
         # Nothing unread (all prose narrated mid-turn): fall through to the
         # templated completion so the turn still audibly ends.
 
@@ -77,7 +82,13 @@ def main():
         stats = cycle_stats(transcript_path)
     text = completion_message(stats)
     if text:
-        speak(text, min_level="concise", cwd=cwd, interrupt=True)  # the completion always outranks leftover play-by-play
+        if get_interaction_level(cwd) == "narrator":
+            from voiceover.speech import ensure_drainer, enqueue_speech
+            enqueue_speech(text, min_level="concise", cwd=cwd,
+                           session=payload.get("session_id"))
+            ensure_drainer(cwd)
+        else:
+            speak(text, min_level="concise", cwd=cwd, interrupt=True)
 
 
 if __name__ == "__main__":

@@ -25,18 +25,20 @@ def main():
 
     cwd = payload.get("cwd")
     if get_interaction_level(cwd) == "narrator":
-        # Narrator mode: speak Claude's actual words written since the last
-        # narration; tool play-by-play stays silent and playing prose is
-        # never cut off by new activity.
+        # Narrator mode: queue Claude's actual words written since the last
+        # narration. Tool play-by-play stays silent, and nothing interrupts -
+        # the queue keeps order and the drainer plays it back to back.
+        from voiceover.speech import ensure_drainer, enqueue_speech
+
         transcript = payload.get("transcript_path", "")
         tool_name = payload.get("tool_name", "")
+        session = payload.get("session_id")
         text, offset = peek_new_prose(transcript)
         if tool_name in ("AskUserQuestion", "ExitPlanMode"):
             # A dialog is about to block the session with no further hooks.
             # Wait out the transcript flush race for the lead-in prose, then
-            # speak prose + an explicit 'I need your input' announcement of
-            # the actual question - interrupting any backlog, because a
-            # blocked session outranks old narration.
+            # queue prose + an explicit 'I need your input' announcement of
+            # the actual question.
             if not text:
                 for _ in range(3):
                     time.sleep(0.5)
@@ -46,23 +48,24 @@ def main():
             from voiceover.templates import blocking_dialog_message
             alert = blocking_dialog_message(tool_name, payload.get("tool_input") or {})
             combined = (text + "\n" + alert) if text else alert
-            if speak(combined, min_level="concise", cwd=cwd, interrupt=True, full=True):
-                if text:
-                    commit_offset(transcript, offset)
-                # Tell the notification hook this block was already announced,
-                # so its "needs permission" echo stays quiet (marker-based:
-                # message wording is not parseable reliably).
-                try:
-                    import json as _json
-                    import time as _time
-                    from voiceover.settings import data_dir
-                    with open(data_dir() / "dialog_alert.json", "w") as handle:
-                        _json.dump({"ts": _time.time()}, handle)
-                except Exception:
-                    pass
+            if enqueue_speech(combined, cwd=cwd, full=True, session=session) and text:
+                commit_offset(transcript, offset)
+            ensure_drainer(cwd)
+            # Tell the notification hook this block was already announced,
+            # so its "needs permission" echo stays quiet (marker-based:
+            # message wording is not parseable reliably).
+            try:
+                import json as _json
+                import time as _time
+                from voiceover.settings import data_dir
+                with open(data_dir() / "dialog_alert.json", "w") as handle:
+                    _json.dump({"ts": _time.time()}, handle)
+            except Exception:
+                pass
             return
-        if text and speak(text, min_level="concise", cwd=cwd, full=True):
+        if text and enqueue_speech(text, cwd=cwd, full=True, session=session):
             commit_offset(transcript, offset)
+        ensure_drainer(cwd)
         return
 
     # New activity always cuts off any narration still playing.

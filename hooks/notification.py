@@ -66,7 +66,13 @@ def main():
 
     text = permission_request_message(payload)
     if text:
-        speak(text, min_level="concise", cwd=cwd, interrupt=True)
+        if level == "narrator":
+            from voiceover.speech import ensure_drainer, enqueue_speech
+            enqueue_speech(text, min_level="concise", cwd=cwd,
+                           session=payload.get("session_id"))
+            ensure_drainer(cwd)
+        else:
+            speak(text, min_level="concise", cwd=cwd, interrupt=True)
 
 
 if __name__ == "__main__":
