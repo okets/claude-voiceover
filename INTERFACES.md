@@ -86,8 +86,12 @@ Level gating convention (callers pass min_level):
 - verbose: pre/post tool play-by-play, subagent completions (EXACTLY verbose)
 - narrator: Claude's actual prose via voiceover/prose.py (peek_new_prose/commit_offset,
   byte-offset cursor in data_dir()/prose_state.json); tool chatter silent.
-  Lock is engine-owned: atomic claim (temp file + os.link), JSON {expiry, pid};
-  stop kills the owner's process group via os.killpg(os.getpgid(pid)).
+  Prose is QUEUED via speech.enqueue_speech() into voiceover/spool.py and the cursor
+  advances on enqueue, so text is never lost to a busy speaker and never re-read.
+  ensure_drainer() starts one engine in --drain mode; it holds the lock, loads its
+  model once, and speaks the spool back to back. Nothing interrupts except the user's
+  own next message (hooks/user_prompt_submit.py), which clears that session's queue
+  and stops playback.
 
 ## voiceover/templates.py
 
@@ -127,6 +131,49 @@ def cycle_stats(transcript_path: str) -> CycleStats
 def last_user_message(transcript_path: str) -> str | None
 ```
 
+## voiceover/spool.py
+
+The narration queue: one directory, one file per pending utterance.
+Hooks WRITE here; engines READ through `tts/engine_common.py`. The two halves
+share only the directory path and the filename sort rule.
+
+```python
+QUEUE_MAX_AGE_SECONDS = 300                   # backlog cap, pruned on enqueue
+def queue_dir() -> Path                       # data_dir()/queue/
+def enqueue(text, engine, voice, session=None) -> bool
+def clear(session=None) -> int                # all pending items, or one session's
+def pending_count() -> int
+def prune(max_age_seconds=QUEUE_MAX_AGE_SECONDS) -> int
+```
+
+Item filename `<epoch_ms:013d>-<pid>-<seq:02d>.json` — lexicographic order is
+play order. Item content `{"text", "engine", "voice", "created", "session"}`.
+Writes are a temp file plus `os.rename`, so a reader never sees a partial item.
+`*.taken` is an item a reader has claimed; `*.tmp` is a write in flight. Only
+`*.json` counts as pending.
+
+## tts/engine_common.py
+
+Stdlib-only sibling imported by BOTH engines (they may not import `voiceover/`).
+The single copy of the data-dir and lock helpers, plus the spool reader and the
+drain loop.
+
+```python
+def data_dir() -> Path
+def tts_lock_path() -> Path
+def lock_is_live() -> bool
+def try_claim_lock(duration: float) -> bool
+def update_lock_expiry(duration: float) -> None
+def remove_tts_lock() -> None
+def queue_dir() -> Path
+def take_oldest() -> tuple           # (item, taken_path) | (None, None); atomic claim
+def finish(taken_path) -> None       # spoken: discard it
+def put_back(taken_path) -> None     # not ours: restore its original name and place
+def drain(speak_item, engine_names, lock_seconds=60.0) -> int
+```
+
+The `drain()` function tracks lock ownership with an internal flag and releases the lock only when it holds it — it must never delete a lock another engine owns.
+
 ## voiceover/audio_player.py, voiceover/process_utils.py
 
 Straight ports (cross-platform playback / TTS-process kill). One fix: make the Unix kill
@@ -146,7 +193,7 @@ never a bare `pkill -f say`.
 
 ## hooks/
 
-`hooks/hooks.json` registers all five events with command:
+`hooks/hooks.json` registers all six events with command:
 `bash "${CLAUDE_PLUGIN_ROOT}/hooks/run.sh" <hook_name>` (timeout 10 for all; Stop gets 30).
 
 `hooks/run.sh` — probe python3 → python → py -3 (Windows Store stub detection à la
@@ -162,6 +209,8 @@ Each hook: read JSON from stdin, `sys.path.insert(0, plugin_root)` then `from vo
 - `stop.py` — concise+ speaks completion_message(cycle_stats(transcript_path)); quiet plays
   'decide' sound. Detect stop_hook_active to avoid loops.
 - `subagent_stop.py` — verbose + speak_subagent_completions -> subagent_completion_message.
+- `user_prompt_submit.py` — a new user message ends the previous turn's narration:
+  spool.clear(session) then stop_speech(), in that order.
 
 ## scripts/ (used by slash commands; argparse CLIs, stdlib only)
 

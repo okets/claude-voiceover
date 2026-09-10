@@ -1,5 +1,43 @@
 # Changelog
 
+## 1.3.0 - 2026-09-10
+
+### Added
+- Narration queue: at the narrator level, prose is queued to a spool
+  (data_dir()/queue/) and one engine drains it back to back, loading its TTS
+  model once per turn instead of once per sentence. Narration no longer waits
+  for the next hook to resume, so the silence between sentences is a breath
+  rather than a process spawn.
+- New UserPromptSubmit hook: sending a new message clears that session's
+  pending narration and stops playback, so the answer to the question you just
+  asked is the next thing you hear. Requires one Claude Code restart to
+  register.
+
+### Changed
+- The transcript cursor now advances when prose is QUEUED, not when audio
+  starts. Text can no longer be lost to a busy speaker, re-read from a stale
+  cursor, or spoken as a merged blob that begins with an old sentence.
+- Narrator mode no longer interrupts itself: permission requests and the
+  end-of-turn summary join the queue in order. Only the user's next message
+  cuts narration off.
+- `tts/kokoro_voice.py` and `tts/macos_say.py` now share one copy of the
+  data-dir and lock helpers via `tts/engine_common.py` instead of carrying an
+  inline copy each.
+- A new message clears that session's queue at every interaction level (including silent),
+  while playback is stopped only when narration is audible, so a silenced session
+  cannot interrupt another session's live playback.
+
+### Fixed
+- Claude Code's own status notices are never narrated. A usage-limit pause is
+  recorded in the transcript as an assistant message with model "<synthetic>",
+  so "You've hit your session limit" was read out as if Claude had said it -
+  and, having sat unread across the pause, it was read at the FRONT of the next
+  turn's narration. Also covers "Not logged in" and "No response requested."
+
+### Added (dev)
+- First test suite: stdlib-only scripts under tests/, run with
+  `bash tests/run_all.sh`. No framework, matching the hook layer's constraint.
+
 ## 1.2.0 - 2026-08-31
 
 ### Added

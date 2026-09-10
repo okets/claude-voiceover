@@ -41,7 +41,7 @@ Set with `/voiceover:level` — per machine, or per project.
 | quiet | 1 | Sound pings only (permission needed, task done) |
 | concise | 2 | Speaks permission requests and task completions *(default)* |
 | verbose | 3 | Full play-by-play of every tool Claude uses, including subagent completions |
-| narrator | 4 | Claude's actual words, read aloud as it writes them — tool chatter stays quiet, code blocks become a spoken "…code snippet…" cue |
+| narrator | 4 | Claude's actual words read aloud as it works, with fluent speech between sentences (model loads once per turn, not per sentence) — tool chatter stays quiet, code blocks become a spoken "…code snippet…" cue |
 
 ## Voices
 
