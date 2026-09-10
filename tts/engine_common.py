@@ -217,13 +217,20 @@ def put_back(taken_path) -> None:
 QUEUE_MAX_AGE_SECONDS = 300  # must match voiceover/spool.py
 
 
-def drain(speak_item, engine_names, lock_seconds=60.0) -> int:
+def drain(speak_item, engine_names, lock_seconds=60.0, prepare=None) -> int:
     """Speak the spool dry, one item at a time. Returns a process exit code.
 
     speak_item(item) -> bool is called for each item this engine owns;
     engine_names is the set of item["engine"] values it can handle. Items
     belonging to any other engine are skipped and left in the spool with
     their ordering intact, so a foreign item never blocks this engine's own.
+
+    prepare() is the engine's one-time setup - loading a speech model, say.
+    It runs only AFTER the lock is ours, so the expensive part happens with
+    every other engine already locked out; doing it first would leave the
+    lock free for the whole spin-up, and every hook firing in that window
+    would spawn another engine that loads its model and then exits on the
+    lock. Returning falsy from prepare() releases the lock and exits 0.
 
     The loop holds the TTS lock for as long as it has work, so the model is
     loaded once per drain rather than once per utterance. When the spool runs
@@ -236,6 +243,8 @@ def drain(speak_item, engine_names, lock_seconds=60.0) -> int:
         return 0  # another engine is already draining
     owns_lock = True
     try:
+        if prepare is not None and not prepare():
+            return 0  # setup failed; the finally below hands the lock back
         while True:
             item, taken_path = take_oldest(engine_names)
             if item is None:

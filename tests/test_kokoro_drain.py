@@ -70,8 +70,17 @@ played = []
 kokoro_voice.play_audio_file = lambda path, timeout=30: played.append(path) or True
 kokoro_voice.ensure_models = lambda: True
 kokoro_voice.DRY_RUN = False
+load_saw_lock = []
+
+
+def _construct(*args, **kwargs):
+    # The lock must already be ours when the model starts loading.
+    load_saw_lock.append(engine_common.lock_is_live())
+    return fake
+
+
 sys.modules["kokoro_onnx"] = types.ModuleType("kokoro_onnx")
-sys.modules["kokoro_onnx"].Kokoro = lambda *args, **kwargs: fake
+sys.modules["kokoro_onnx"].Kokoro = _construct
 
 # --- drain streams each item, one chunk at a time ---------------------------
 spool.clear()
@@ -93,6 +102,10 @@ check("every item was streamed, in order",
 check("no item was rendered whole before playing", fake.whole == [], fake.whole)
 check("each chunk was played as it arrived", len(played) == 6, len(played))
 check("the spool is empty afterwards", spool.pending_count() == 0)
+check("the model is loaded exactly once for the whole drain",
+      len(load_saw_lock) == 1, load_saw_lock)
+check("the lock is claimed BEFORE the model is loaded",
+      load_saw_lock == [True], load_saw_lock)
 check("the lock is released when the drain ends",
       engine_common.lock_is_live() is False)
 

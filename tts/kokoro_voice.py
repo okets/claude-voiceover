@@ -401,15 +401,30 @@ def main():
                 return True
             return drain(speak_one, {"kokoro"})
 
-        if not ensure_models():
-            return 1
-        from kokoro_onnx import Kokoro
+        loaded = {}
 
-        # Loaded ONCE for the whole drain - this is where the per-sentence
-        # spawn and model-reload cost goes away.
-        kokoro = Kokoro(str(MODEL_FILE), str(VOICES_FILE))
+        def prepare():
+            """Load the model ONCE, and only after the lock is ours.
+
+            Loading first would leave the lock free for the multi-second
+            spin-up, so every hook firing in that window spawns another
+            `uv run` plus a full ONNX load - all but one of which then exit
+            on the lock. Paying that cost once per turn is the whole point
+            of the drain loop.
+            """
+            if not ensure_models():
+                return False
+            try:
+                from kokoro_onnx import Kokoro
+
+                loaded["kokoro"] = Kokoro(str(MODEL_FILE), str(VOICES_FILE))
+            except Exception as error:
+                log("[ERROR] Model load failed: " + str(error))
+                return False
+            return True
 
         def speak_one(item):
+            kokoro = loaded["kokoro"]
             text = item["text"]
             voice = item.get("voice") or DEFAULT_VOICE
             # Refresh the lock BEFORE synthesis starts, not after it returns:
@@ -430,7 +445,7 @@ def main():
                 log("[FALLBACK] Falling back to standard synthesis...")
                 return _speak_whole_keeping_lock(kokoro, text, voice)
 
-        return drain(speak_one, {"kokoro"})
+        return drain(speak_one, {"kokoro"}, prepare=prepare)
 
     parsed = parse_args(sys.argv[1:])
     if parsed is None:
