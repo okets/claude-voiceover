@@ -8,9 +8,10 @@ Spawned detached by voiceover/speech.py as:
 Direct usage:
     kokoro_voice.py '<text>' [--voice VOICE] [--stream]
 
-This file is fully self-contained: it runs inside the tts/ dependency world
-(kokoro-onnx, soundfile, numpy) and MUST NOT import from voiceover/. The
-data-dir/lock resolution and audio playback are therefore duplicated inline.
+This file runs inside the tts/ dependency world (kokoro-onnx, soundfile,
+numpy) and MUST NOT import from voiceover/. The data-dir, lock and spool
+helpers therefore come from tts/engine_common.py, a stdlib-only sibling
+shared with macos_say.py; audio playback stays duplicated inline.
 
 Honors VOICEOVER_DRY_RUN: prints '[voiceover] <text>' to stderr and exits
 without loading models, downloading anything, or producing audio.
@@ -24,6 +25,8 @@ import tempfile
 import time
 import urllib.request
 from pathlib import Path
+
+from engine_common import remove_tts_lock, try_claim_lock, update_lock_expiry
 
 DRY_RUN = bool(os.environ.get("VOICEOVER_DRY_RUN"))
 
@@ -64,94 +67,6 @@ VOICE_SETTINGS = {
 def log(message):
     """Diagnostics go to stderr; stdout stays silent for the hook protocol."""
     print(message, file=sys.stderr)
-
-
-# --- data dir / tts.lock (inline: may not import voiceover.settings) --------
-
-def data_dir():
-    """$VOICEOVER_DATA_DIR override if set, else ~/.claude-voiceover. Created on demand."""
-    root = os.environ.get("VOICEOVER_DATA_DIR")
-    path = Path(root) if root else Path.home() / ".claude-voiceover"
-    try:
-        path.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass
-    return path
-
-
-def tts_lock_path():
-    return data_dir() / "tts.lock"
-
-
-def _parse_lock_expiry(raw):
-    """Lock content is JSON {"expiry", "pid"}; older locks were a bare float."""
-    try:
-        return float(json.loads(raw).get("expiry"))
-    except Exception:
-        try:
-            return float(raw)
-        except Exception:
-            return None
-
-
-def try_claim_lock(duration):
-    """Atomically claim the TTS lock. True = we own it and may speak.
-
-    O_CREAT|O_EXCL guarantees that of two engines racing, exactly one wins;
-    the loser skips quietly. The lock stores our PID so stop_speech() can
-    kill this engine's whole process group (including its audio child)."""
-    lock_file = tts_lock_path()
-    payload = json.dumps({"expiry": time.time() + duration, "pid": os.getpid()})
-    # Write payload to a private temp file, then os.link() it into place:
-    # the lock appears WITH its content in one atomic step, so a racing
-    # claimer can never observe an empty lock and judge it stale.
-    tmp_file = lock_file.with_name("tts.lock.{}".format(os.getpid()))
-    try:
-        tmp_file.write_text(payload)
-    except OSError:
-        return False
-    try:
-        for _ in range(2):
-            try:
-                os.link(str(tmp_file), str(lock_file))
-                return True
-            except FileExistsError:
-                try:
-                    expiry = _parse_lock_expiry(lock_file.read_text().strip())
-                except OSError:
-                    expiry = None
-                if expiry is not None and time.time() < expiry:
-                    return False  # someone else is speaking
-                try:
-                    lock_file.unlink()  # stale - retry the atomic claim once
-                except OSError:
-                    return False
-            except OSError:
-                return False
-        return False
-    finally:
-        try:
-            tmp_file.unlink()
-        except OSError:
-            pass
-
-
-def update_lock_expiry(duration):
-    """Refresh our own lock with the real playback end time (keeps our PID)."""
-    try:
-        tts_lock_path().write_text(
-            json.dumps({"expiry": time.time() + duration, "pid": os.getpid()}))
-    except OSError:
-        pass
-
-
-def remove_tts_lock():
-    try:
-        lock_file = tts_lock_path()
-        if lock_file.exists():
-            lock_file.unlink()
-    except OSError:
-        pass
 
 
 # --- audio playback (inline port of the cross-platform player) --------------
