@@ -135,8 +135,30 @@ def queue_dir():
     return directory
 
 
-def take_oldest():
-    """Claim the oldest pending item. Returns (item, taken_path) or (None, None).
+def _peek_engine(path):
+    """The engine an item belongs to, read WITHOUT claiming it.
+
+    None when the item cannot be read or names no engine - such an item has
+    no owner, so the caller claims it and the corrupt-item handling drops it
+    rather than leaving it to wedge the head of the queue.
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            item = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    return item.get("engine") if isinstance(item, dict) else None
+
+
+def take_oldest(engine_names=None):
+    """Claim the oldest item this engine can speak. (item, taken_path) or (None, None).
+
+    With engine_names given, items belonging to ANOTHER engine are skipped -
+    left untouched, so they keep both their place and their order - and the
+    oldest item this engine owns is claimed instead. Skipping rather than
+    stopping is what keeps a foreign item from blocking the whole queue:
+    nothing ever starts the other engine on its behalf, because the hook
+    safety net only ever spawns the engine resolved for the current project.
 
     The claim is an atomic rename to <name>.taken, so of two engines reading
     at once exactly one gets any given item. Unreadable items are discarded
@@ -147,6 +169,10 @@ def take_oldest():
     except OSError:
         return None, None
     for path in candidates:
+        if engine_names is not None:
+            engine = _peek_engine(path)
+            if engine is not None and engine not in engine_names:
+                continue  # someone else's item: leave it exactly where it is
         taken_path = path.with_name(path.name + _TAKEN_SUFFIX)
         try:
             os.rename(str(path), str(taken_path))
@@ -195,7 +221,9 @@ def drain(speak_item, engine_names, lock_seconds=60.0) -> int:
     """Speak the spool dry, one item at a time. Returns a process exit code.
 
     speak_item(item) -> bool is called for each item this engine owns;
-    engine_names is the set of item["engine"] values it can handle.
+    engine_names is the set of item["engine"] values it can handle. Items
+    belonging to any other engine are skipped and left in the spool with
+    their ordering intact, so a foreign item never blocks this engine's own.
 
     The loop holds the TTS lock for as long as it has work, so the model is
     loaded once per drain rather than once per utterance. When the spool runs
@@ -209,11 +237,11 @@ def drain(speak_item, engine_names, lock_seconds=60.0) -> int:
     owns_lock = True
     try:
         while True:
-            item, taken_path = take_oldest()
+            item, taken_path = take_oldest(engine_names)
             if item is None:
                 remove_tts_lock()
                 owns_lock = False
-                item, taken_path = take_oldest()
+                item, taken_path = take_oldest(engine_names)
                 if item is None:
                     return 0
                 if not try_claim_lock(lock_seconds):
@@ -227,8 +255,12 @@ def drain(speak_item, engine_names, lock_seconds=60.0) -> int:
                 # renamed to .taken - invisible to that scan, so it would be
                 # silently lost.
             if item.get("engine") not in engine_names:
+                # Defensive only: take_oldest() already filters by engine, so
+                # reaching here needs the item to have been rewritten between
+                # the peek and the claim. Put it back and move ON - stopping
+                # here would silence this engine until the age cap.
                 put_back(taken_path)   # someone else's engine; keep its place
-                return 0
+                continue
             age = time.time() - float(item.get("created") or 0)
             if age > QUEUE_MAX_AGE_SECONDS:
                 finish(taken_path)     # too stale to be worth hearing

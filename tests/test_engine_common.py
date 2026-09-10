@@ -80,4 +80,28 @@ check("put_back keeps the item at the front of the queue",
       item is not None and item["text"] == "one", item)
 engine_common.finish(path)
 
+# --- take_oldest skips items it does not own -------------------------------
+# The filter is what keeps a foreign item at the head from blocking every
+# item behind it; a skipped item is left untouched, not claimed and restored.
+spool.clear()
+for text, engine in (("theirs", "macos-female"), ("mine", "kokoro"),
+                     ("theirs too", "macos-male")):
+    spool.enqueue(text, engine, "v")
+    time.sleep(0.002)
+item, path = engine_common.take_oldest({"kokoro"})
+check("take_oldest claims the oldest item it CAN speak",
+      item is not None and item["text"] == "mine", item)
+check("foreign items are left pending", spool.pending_count() == 2,
+      spool.pending_count())
+check("skipped items are never renamed to .taken",
+      list(spool.queue_dir().glob("*.taken")) == [Path(path)],
+      list(spool.queue_dir().glob("*.taken")))
+engine_common.finish(path)
+empty_item, _ = engine_common.take_oldest({"kokoro"})
+check("nothing is claimed when only foreign items remain",
+      empty_item is None, empty_item)
+check("and those foreign items are still there", spool.pending_count() == 2)
+check("an unfiltered read still sees them",
+      engine_common.take_oldest()[0] is not None)
+
 report()

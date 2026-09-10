@@ -60,13 +60,32 @@ check("it speaks nothing", "[voiceover] " not in stderr, stderr)
 check("the item is left for the lock holder", spool.pending_count() == 1)
 engine_common.remove_tts_lock()
 
-# --- items for another engine are left alone -------------------------------
+# --- a foreign-engine item is SKIPPED, never a roadblock -------------------
+# It keeps its place for its own engine, but it must not stop this engine
+# from reaching items behind it. Nothing ever starts the other engine on its
+# behalf - ensure_drainer() always spawns the one resolved for this cwd, the
+# very engine that would be stepping aside - so stopping here would freeze
+# every drainer until the 5-minute age cap.
 spool.clear()
 spool.enqueue("kokoro only", "kokoro", "bf_emma")
+time.sleep(0.002)
+spool.enqueue("mine to speak", "macos-female", "Samantha")
+time.sleep(0.002)
+spool.enqueue("mine as well", "macos-female", "Samantha")
 stderr, code = run_drain("macos")
-check("the macos drainer exits 0 on a kokoro item", code == 0, code)
-check("it does not speak another engine's item", "[voiceover] " not in stderr, stderr)
-check("the item is still pending for the right engine", spool.pending_count() == 1)
+spoken = [line.split("[voiceover] ", 1)[1].strip()
+          for line in stderr.splitlines() if "[voiceover] " in line]
+check("the macos drainer exits 0 with a kokoro item at the head", code == 0, code)
+check("it does not speak another engine's item", "kokoro only" not in spoken, spoken)
+check("own-engine items BEHIND the foreign one are still spoken, in order",
+      spoken == ["mine to speak", "mine as well"], spoken)
+check("the foreign item is still pending for the right engine",
+      spool.pending_count() == 1, spool.pending_count())
+check("the surviving item is the foreign one",
+      json.loads(sorted(spool.queue_dir().glob("*.json"))[0].read_text())["text"]
+      == "kokoro only")
+check("no .taken leftover from the skipped item",
+      list(spool.queue_dir().glob("*.taken")) == [])
 check("the lock is released so the right engine can claim it",
       engine_common.lock_is_live() is False)
 
@@ -113,11 +132,11 @@ spool.enqueue("the item that must still be spoken", "macos-female", "Samantha")
 real_take = engine_common.take_oldest
 looks = {"n": 0}
 
-def take_empty_first():
+def take_empty_first(*args):
     looks["n"] += 1
     if looks["n"] == 1:
         return None, None          # first look: appears empty
-    return real_take()             # second look: the item is there
+    return real_take(*args)        # second look: the item is there
 
 engine_common.take_oldest = take_empty_first
 spoken_items = []
@@ -149,14 +168,14 @@ foreign_payload = json.dumps({"expiry": time.time() + 300, "pid": 999999})
 real_take = engine_common.take_oldest
 looks = {"n": 0}
 
-def take_empty_first():
+def take_empty_first(*args):
     looks["n"] += 1
     if looks["n"] == 1:
         return None, None          # first look: spool appears empty
     # Simulate another engine winning the lock in the gap between our
     # release and our re-check.
     engine_common.tts_lock_path().write_text(foreign_payload)
-    return real_take()             # second look: the appended item is there
+    return real_take(*args)        # second look: the appended item is there
 
 engine_common.take_oldest = take_empty_first
 try:
