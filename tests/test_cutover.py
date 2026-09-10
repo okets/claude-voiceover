@@ -53,14 +53,65 @@ run_hook({"cwd": str(REPO_ROOT), "session_id": "S1", "prompt": "new question"})
 check("the tts lock is cleared so a new drainer can start now",
       not lock.exists(), "lock still present")
 
-# --- clearing happens before stopping, so no item can slip through -----
-# (order check: with items queued AND the lock held, both must end empty)
+# --- Ordering is a real invariant: clear must precede stop ---------------
+# Drive main() in-process so the two calls can be observed in order.
+import importlib.util
+import io
+
+import voiceover.speech
+import voiceover.spool
+
+spec = importlib.util.spec_from_file_location(
+    "ups_under_test", REPO_ROOT / "hooks" / "user_prompt_submit.py")
+ups = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ups)          # __main__ guard keeps main() from running
+
+order = []
+real_clear, real_stop = voiceover.spool.clear, voiceover.speech.stop_speech
+real_stdin = sys.stdin
+
+
+def record_clear(session=None):
+    order.append("clear")
+    return 0
+
+
+def record_stop():
+    order.append("stop")
+
+
+voiceover.spool.clear = record_clear
+voiceover.speech.stop_speech = record_stop
+sys.stdin = io.StringIO(json.dumps(
+    {"cwd": str(REPO_ROOT), "session_id": "S1", "prompt": "new question"}))
+try:
+    ups.main()
+finally:
+    voiceover.spool.clear = real_clear
+    voiceover.speech.stop_speech = real_stop
+    sys.stdin = real_stdin
+
+check("the clear runs before playback is stopped", order == ["clear", "stop"], order)
+
+# --- a queue stranded by a level change is cleared even at silent level ----
 spool.clear()
-spool.enqueue("doomed", "kokoro", "bf_emma", session="S1")
-lock.write_text(json.dumps({"expiry": time.time() + 300, "pid": 999999}))
-run_hook({"cwd": str(REPO_ROOT), "session_id": "S1", "prompt": "new question"})
-check("queue empty after cut-over", spool.pending_count() == 0)
-check("lock released after cut-over", not lock.exists())
+spool.enqueue("stranded", "kokoro", "bf_emma", session="S1")
+set_setting("interaction_level", "silent")
+proc = run_hook({"cwd": str(REPO_ROOT), "session_id": "S1", "prompt": "x"})
+check("silent level clears the queue anyway", spool.pending_count() == 0,
+      spool.pending_count())
+check("the hook exits 0 when silent", proc.returncode == 0, proc.stderr)
+set_setting("interaction_level", "narrator")
+
+# --- without a session_id, nothing is wiped (avoid unscoped clear) ---------
+spool.clear()
+spool.enqueue("item1", "kokoro", "bf_emma", session="S1")
+spool.enqueue("item2", "kokoro", "bf_emma", session="S2")
+run_hook({"cwd": str(REPO_ROOT), "prompt": "new question"})
+remaining = [json.loads(p.read_text())["text"]
+             for p in sorted(spool.queue_dir().glob("*.json"))]
+check("with no session_id, both sessions' items survive", remaining == ["item1", "item2"],
+      remaining)
 
 # --- a silent level still exits cleanly ---------------------------------
 set_setting("interaction_level", "silent")

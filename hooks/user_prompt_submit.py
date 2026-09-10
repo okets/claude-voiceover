@@ -26,14 +26,24 @@ def main():
     from voiceover.spool import clear
 
     cwd = payload.get("cwd")
-    if get_interaction_level(cwd) == "silent":
-        return
+    session = payload.get("session_id")
 
     # Clear BEFORE stopping: the other order leaves a window in which the
-    # drainer claims one more item and speaks it after the cut-over.
-    dropped = clear(session=payload.get("session_id"))
-    stop_speech()
+    # drainer claims one more item and speaks it after the cut-over. This
+    # runs at EVERY level, including silent - a queue stranded by a level
+    # change would otherwise be drained later and speak an abandoned turn.
+    dropped = 0
+    if session:
+        dropped = clear(session=session)
+    # With no session id we cannot tell which items are ours, and an
+    # unscoped clear would wipe every other session's pending narration.
     _log("cutover", "dropped=%d pending items on a new prompt" % dropped, cwd)
+
+    if get_interaction_level(cwd) == "silent":
+        # stop_speech() is global, not per-session: a silenced session must
+        # never be able to kill another session's live playback.
+        return
+    stop_speech()
 
 
 if __name__ == "__main__":
