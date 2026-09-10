@@ -17,12 +17,10 @@ Honors VOICEOVER_DRY_RUN: prints '[voiceover] <text>' to stderr and exits
 without loading models, downloading anything, or producing audio.
 """
 
-import json
 import os
 import subprocess
 import sys
 import tempfile
-import time
 import urllib.request
 from pathlib import Path
 

@@ -13,12 +13,9 @@ text never appears in the process command line and cannot be mistaken for a
 Honors VOICEOVER_DRY_RUN: prints '[voiceover] <text>' to stderr, no audio.
 """
 
-import json
 import os
 import subprocess
 import sys
-import time
-from pathlib import Path
 
 from engine_common import remove_tts_lock, try_claim_lock, update_lock_expiry
 
