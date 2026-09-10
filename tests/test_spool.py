@@ -96,4 +96,27 @@ for name in item_files():
     texts.add(json.loads((spool.queue_dir() / name).read_text())["text"])
 check("no item was overwritten by a racing writer", len(texts) == 80, len(texts))
 
+# --- regression: malformed 'created' field does not wedge the queue --------
+spool.clear()
+corrupt_path = spool.queue_dir() / "0000000000001-1-00.json"
+corrupt_item = {
+    "text": "corrupt",
+    "engine": "kokoro",
+    "voice": "bf_emma",
+    "created": "not-a-number",  # This should not crash prune()
+    "session": None,
+}
+corrupt_path.write_text(json.dumps(corrupt_item))
+check("prune does not raise on malformed 'created'",
+      spool.prune() >= 0, "prune() raised or returned invalid")
+remaining_after_prune = [json.loads((spool.queue_dir() / n).read_text())["text"]
+                         for n in item_files()]
+check("corrupt item is removed by prune", remaining_after_prune == [], remaining_after_prune)
+enqueued = spool.enqueue("recovery", "kokoro", "bf_emma")
+check("enqueue succeeds after pruning corrupt item", enqueued is True,
+      "enqueued=%s" % enqueued)
+final_texts = [json.loads((spool.queue_dir() / n).read_text())["text"]
+               for n in item_files()]
+check("new item lands after prune of corrupt item", final_texts == ["recovery"], final_texts)
+
 report()

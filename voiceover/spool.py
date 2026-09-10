@@ -44,6 +44,9 @@ def _item_name() -> str:
     and in the order they were enqueued.
     """
     global _seq
+    # Wraps at 100: one process would have to enqueue more than 100 items
+    # inside a single millisecond for names to repeat, which real per-item
+    # file I/O makes unreachable.
     _seq = (_seq + 1) % 100
     return "%013d-%d-%02d.json" % (int(time.time() * 1000), os.getpid(), _seq)
 
@@ -72,7 +75,7 @@ def enqueue(text, engine, voice, session=None) -> bool:
         # Rename is atomic: the item appears complete or not at all.
         os.rename(str(temp_path), str(directory / name))
         return True
-    except (OSError, TypeError, ValueError):
+    except OSError:
         return False
 
 
@@ -119,7 +122,17 @@ def prune(max_age_seconds=QUEUE_MAX_AGE_SECONDS) -> int:
     cutoff = time.time() - max_age_seconds
     for path in _items():
         item = _read(path)
-        if item is None or float(item.get("created") or 0) < cutoff:
+        # A malformed 'created' is corruption, not a young item: treat the
+        # item as stale and drop it. Letting the conversion raise here would
+        # wedge the queue - enqueue() prunes first, so one bad file would
+        # silently stop every future utterance.
+        created = None
+        if item is not None:
+            try:
+                created = float(item.get("created") or 0)
+            except (TypeError, ValueError):
+                created = None
+        if item is None or created is None or created < cutoff:
             try:
                 path.unlink()
                 removed += 1
