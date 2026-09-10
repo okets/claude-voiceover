@@ -19,7 +19,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import process_utils
+from . import process_utils, spool
 from .audio_player import play_audio_file
 from .settings import (
     data_dir,
@@ -77,6 +77,68 @@ def speak(text, min_level="concise", cwd=None, interrupt=False, full=False) -> b
         dispatched = _dispatch(message, resolve_engine(cwd), cwd)
         _log("speak", "dispatch=%s engine=%s" % (dispatched, resolve_engine(cwd)), cwd)
         return dispatched
+    except Exception:
+        return False
+
+
+def enqueue_speech(text, min_level="concise", cwd=None, full=False, session=None) -> bool:
+    """Queue text to be spoken. True when it was queued.
+
+    The queued counterpart of speak(): identical gating and identical
+    truncation, but it never fails because audio is already playing. That is
+    the whole point - a caller that tracks what has been narrated (the prose
+    tailer) can advance its cursor the moment this returns True, because a
+    queued utterance is guaranteed to be spoken.
+    """
+    try:
+        if not text or not str(text).strip():
+            return False
+        if not is_tts_enabled(cwd) or not level_at_least(min_level, cwd):
+            _log("queue", "gated by level/enabled", cwd)
+            return False
+        if full:
+            message = str(text).strip()[:_FULL_TEXT_CAP]
+        else:
+            message = truncate_for_speech(str(text).strip())
+        engine = resolve_engine(cwd)
+        if engine == "none":
+            return False
+        queued = spool.enqueue(message, engine, get_voice(cwd), session=session)
+        _log("queue", "queued=%s pending=%d chars=%d :: %.60s" % (
+            queued, spool.pending_count(), len(message),
+            message.replace("\n", " ")), cwd)
+        return queued
+    except Exception:
+        return False
+
+
+def ensure_drainer(cwd=None) -> bool:
+    """Start an engine draining the spool unless one is already speaking.
+
+    Called unconditionally by every narrator hook path, so a spool left
+    behind by a crashed engine is picked up by the next hook rather than
+    sitting there. Racing hooks are harmless: the engine's own atomic lock
+    claim admits exactly one drainer.
+    """
+    try:
+        if spool.pending_count() == 0:
+            return False
+        if _is_locked():
+            return False  # a drainer is already working through the queue
+        engine = resolve_engine(cwd)
+        if engine == "kokoro":
+            command = [
+                "uv", "run", "--project", str(_TTS_DIR),
+                str(_TTS_DIR / "kokoro_voice.py"), "--drain",
+            ]
+        elif engine in _MACOS_VOICES:
+            command = ["python3", str(_TTS_DIR / "macos_say.py"), "--drain"]
+        else:
+            return False
+        spawned = _spawn_detached(command)
+        _log("queue", "drainer spawned=%s engine=%s pending=%d" % (
+            spawned, engine, spool.pending_count()), cwd)
+        return spawned
     except Exception:
         return False
 
