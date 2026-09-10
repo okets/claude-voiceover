@@ -47,6 +47,22 @@ def lock_path() -> Path:
     return data_dir() / _LOCK_FILE_NAME
 
 
+def _gate_and_truncate(text, min_level, cwd, full):
+    """The message to speak, or None when it is empty or gated out.
+
+    Shared by speak() and enqueue_speech() so the gating rules and the
+    truncation contract have exactly one definition. Callers do their own
+    logging - they log under different tags - and their own downstream work.
+    """
+    if not text or not str(text).strip():
+        return None
+    if not is_tts_enabled(cwd) or not level_at_least(min_level, cwd):
+        return None
+    if full:
+        return str(text).strip()[:_FULL_TEXT_CAP]
+    return truncate_for_speech(str(text).strip())
+
+
 def speak(text, min_level="concise", cwd=None, interrupt=False, full=False) -> bool:
     """Say text aloud if settings allow. Never blocks, never raises.
 
@@ -59,13 +75,10 @@ def speak(text, min_level="concise", cwd=None, interrupt=False, full=False) -> b
             return False
         _log("speak", "req min=%s int=%s chars=%d :: %.60s" % (
             min_level, interrupt, len(str(text)), str(text).replace("\n", " ")), cwd)
-        if not is_tts_enabled(cwd) or not level_at_least(min_level, cwd):
+        message = _gate_and_truncate(text, min_level, cwd, full)
+        if message is None:
             _log("speak", "gated by level/enabled", cwd)
             return False
-        if full:
-            message = str(text).strip()[:_FULL_TEXT_CAP]
-        else:
-            message = truncate_for_speech(str(text).strip())
         if _dry_run():
             _dry_print(message)
             return True
@@ -91,15 +104,10 @@ def enqueue_speech(text, min_level="concise", cwd=None, full=False, session=None
     queued utterance is guaranteed to be spoken.
     """
     try:
-        if not text or not str(text).strip():
-            return False
-        if not is_tts_enabled(cwd) or not level_at_least(min_level, cwd):
+        message = _gate_and_truncate(text, min_level, cwd, full)
+        if message is None:
             _log("queue", "gated by level/enabled", cwd)
             return False
-        if full:
-            message = str(text).strip()[:_FULL_TEXT_CAP]
-        else:
-            message = truncate_for_speech(str(text).strip())
         engine = resolve_engine(cwd)
         if engine == "none":
             return False

@@ -1,6 +1,7 @@
 """enqueue_speech gates like speak() but never loses to the lock."""
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -23,6 +24,18 @@ def texts():
         out.append(json.loads(path.read_text())["text"])
     return out
 
+
+# --- speak() behavior preservation tests (behavior-preserving refactor guard) ---
+os.environ["VOICEOVER_DRY_RUN"] = "1"
+check("speak returns True at narrator level", speech.speak("hello") is True)
+set_setting("interaction_level", "silent")
+check("speak returns False when level is silent", speech.speak("hello") is False)
+set_setting("interaction_level", "narrator")
+check("speak returns False for empty text", speech.speak("   ") is False)
+long_text = " ".join(["word"] * 400)
+check("speak with full=False truncates", speech.speak(long_text, full=False) is True)
+check("speak with full=True does not truncate", speech.speak(long_text, full=True) is True)
+del os.environ["VOICEOVER_DRY_RUN"]
 
 # --- the basic path ---------------------------------------------------------
 check("enqueue_speech returns True", speech.enqueue_speech("hello there", full=True) is True)
