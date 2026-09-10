@@ -184,3 +184,51 @@ def put_back(taken_path) -> None:
         os.rename(str(path), str(original))
     except OSError:
         pass
+
+
+# --- the drain loop ---------------------------------------------------------
+
+QUEUE_MAX_AGE_SECONDS = 300  # must match voiceover/spool.py
+
+
+def drain(speak_item, engine_names, lock_seconds=60.0) -> int:
+    """Speak the spool dry, one item at a time. Returns a process exit code.
+
+    speak_item(item) -> bool is called for each item this engine owns;
+    engine_names is the set of item["engine"] values it can handle.
+
+    The loop holds the TTS lock for as long as it has work, so the model is
+    loaded once per drain rather than once per utterance. When the spool runs
+    dry it releases the lock and checks ONCE more before exiting: that closes
+    the race against a hook that appended an item a moment earlier and saw
+    the lock still held, which would otherwise strand that item until the
+    next hook fired.
+    """
+    if not try_claim_lock(lock_seconds):
+        return 0  # another engine is already draining
+    try:
+        while True:
+            item, taken_path = take_oldest()
+            if item is None:
+                remove_tts_lock()
+                item, taken_path = take_oldest()
+                if item is None:
+                    return 0
+                if not try_claim_lock(lock_seconds):
+                    put_back(taken_path)
+                    return 0
+            if item.get("engine") not in engine_names:
+                put_back(taken_path)   # someone else's engine; keep its place
+                return 0
+            age = time.time() - float(item.get("created") or 0)
+            if age > QUEUE_MAX_AGE_SECONDS:
+                finish(taken_path)     # too stale to be worth hearing
+                continue
+            update_lock_expiry(lock_seconds)
+            try:
+                speak_item(item)
+            except Exception:
+                pass
+            finish(taken_path)
+    finally:
+        remove_tts_lock()

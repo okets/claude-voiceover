@@ -205,6 +205,23 @@ def play_samples(samples, sample_rate):
             pass
 
 
+def _play_samples_keeping_lock(samples, sample_rate, duration):
+    """Play samples WITHOUT removing the tts lock - the drain loop owns it."""
+    import soundfile as sf
+
+    tmp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp_path = tmp_file.name
+    tmp_file.close()
+    try:
+        sf.write(tmp_path, samples, sample_rate)
+        return play_audio_file(tmp_path, timeout=max(30, int(duration) + 10))
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
 def speak_standard(kokoro, text, voice):
     """Standard non-streaming synthesis with lock coordination."""
     settings = get_voice_settings(voice)
@@ -340,6 +357,35 @@ def print_usage():
 
 
 def main():
+    if "--drain" in sys.argv[1:]:
+        from engine_common import drain
+
+        if DRY_RUN:
+            def speak_one(item):
+                print("[voiceover] " + item["text"], file=sys.stderr)
+                return True
+            return drain(speak_one, {"kokoro"})
+
+        if not ensure_models():
+            return 1
+        from kokoro_onnx import Kokoro
+
+        # Loaded ONCE for the whole drain - this is where the per-sentence
+        # spawn and model-reload cost goes away.
+        kokoro = Kokoro(str(MODEL_FILE), str(VOICES_FILE))
+
+        def speak_one(item):
+            voice = item.get("voice") or DEFAULT_VOICE
+            settings = get_voice_settings(voice)
+            samples, sample_rate = kokoro.create(
+                text=item["text"], voice=voice, speed=settings["speed"],
+                lang=settings["lang"], trim=settings["trim"])
+            duration = len(samples) / float(sample_rate) if sample_rate else 0.0
+            update_lock_expiry(duration + 20.0)
+            return _play_samples_keeping_lock(samples, sample_rate, duration)
+
+        return drain(speak_one, {"kokoro"})
+
     parsed = parse_args(sys.argv[1:])
     if parsed is None:
         print_usage()
