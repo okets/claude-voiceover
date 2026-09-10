@@ -236,15 +236,33 @@ def speak_standard(kokoro, text, voice):
     return play_samples(samples, sample_rate)
 
 
-def speak_streaming(kokoro, text, voice):
-    """Streamed synthesis with INCREMENTAL playback.
+def _speak_whole_keeping_lock(kokoro, text, voice):
+    """Synthesize the whole text, then play it, WITHOUT removing the lock.
 
-    Each chunk plays as soon as it is synthesized, so long narration starts
-    speaking within seconds instead of staying silent while the whole text
-    renders (the silence used to outlive the narration: the next turn's
-    interrupt killed the engine before a single word was heard). Chunks are
-    sequential - a short breath between sentences, like a human narrator.
-    Falls back to standard synthesis on any failure."""
+    The non-streaming fallback for a caller that owns the lock across several
+    utterances (the drain loop).
+    """
+    settings = get_voice_settings(voice)
+    samples, sample_rate = kokoro.create(
+        text=text,
+        voice=voice,
+        speed=settings["speed"],
+        lang=settings["lang"],
+        trim=settings["trim"],
+    )
+    duration = len(samples) / float(sample_rate) if sample_rate else 0.0
+    update_lock_expiry(duration + 20.0)
+    return _play_samples_keeping_lock(samples, sample_rate, duration)
+
+
+def stream_chunks(kokoro, text, voice) -> bool:
+    """Synthesize in chunks and play each one as it arrives. True if any played.
+
+    Owns no lock lifecycle: play_chunk() refreshes the expiry per chunk and
+    never removes it, so this is safe both for the single-utterance path and
+    inside the drain loop, which holds one lock across many items. Raises on
+    a synthesis failure - the caller chooses its own fallback.
+    """
     import asyncio
     import numpy as np
 
@@ -274,8 +292,25 @@ def speak_streaming(kokoro, text, voice):
         return played
 
     log("[STREAM] Streaming with " + voice + "...")
+    return asyncio.run(synth_and_play())
+
+
+def speak_streaming(kokoro, text, voice):
+    """Streamed synthesis with INCREMENTAL playback, for a single utterance.
+
+    Each chunk plays as soon as it is synthesized, so long narration starts
+    speaking within seconds instead of staying silent while the whole text
+    renders (the silence used to outlive the narration: the next turn's
+    interrupt killed the engine before a single word was heard). Chunks are
+    sequential - a short breath between sentences, like a human narrator.
+    Falls back to standard synthesis on any failure.
+
+    This path OWNS the lock for exactly one utterance, so it releases it at
+    the end. The drain loop must not use it: it holds one lock across many
+    items and would end after the first.
+    """
     try:
-        return asyncio.run(synth_and_play())
+        return stream_chunks(kokoro, text, voice)
     except Exception as error:
         log("[ERROR] Streaming failed: " + str(error))
         log("[FALLBACK] Falling back to standard synthesis...")
@@ -375,14 +410,25 @@ def main():
         kokoro = Kokoro(str(MODEL_FILE), str(VOICES_FILE))
 
         def speak_one(item):
+            text = item["text"]
             voice = item.get("voice") or DEFAULT_VOICE
-            settings = get_voice_settings(voice)
-            samples, sample_rate = kokoro.create(
-                text=item["text"], voice=voice, speed=settings["speed"],
-                lang=settings["lang"], trim=settings["trim"])
-            duration = len(samples) / float(sample_rate) if sample_rate else 0.0
-            update_lock_expiry(duration + 20.0)
-            return _play_samples_keeping_lock(samples, sample_rate, duration)
+            # Refresh the lock BEFORE synthesis starts, not after it returns:
+            # drain() set the expiry to its own lock_seconds, and a full prose
+            # item (up to 6000 chars) can take longer than that to render. An
+            # expiry inside the synthesis window reads as "free" to the next
+            # hook, which starts a second drainer - two voices on one speaker.
+            # Same length-proportional estimate speak_text() uses.
+            update_lock_expiry(10.0 + 0.4 * len(text.split()))
+            try:
+                # Stream: each chunk plays as it is synthesized, and play_chunk
+                # keeps extending the lock. Without this the whole item renders
+                # before a single word is heard - the dead air this queue
+                # exists to remove.
+                return stream_chunks(kokoro, text, voice)
+            except Exception as error:
+                log("[ERROR] Streaming failed: " + str(error))
+                log("[FALLBACK] Falling back to standard synthesis...")
+                return _speak_whole_keeping_lock(kokoro, text, voice)
 
         return drain(speak_one, {"kokoro"})
 
