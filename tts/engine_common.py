@@ -206,17 +206,23 @@ def drain(speak_item, engine_names, lock_seconds=60.0) -> int:
     """
     if not try_claim_lock(lock_seconds):
         return 0  # another engine is already draining
+    owns_lock = True
     try:
         while True:
             item, taken_path = take_oldest()
             if item is None:
                 remove_tts_lock()
+                owns_lock = False
                 item, taken_path = take_oldest()
                 if item is None:
                     return 0
                 if not try_claim_lock(lock_seconds):
+                    # Another engine claimed the lock in the gap - it will
+                    # drain this item. Never delete a lock we do not own.
                     put_back(taken_path)
                     return 0
+                owns_lock = True
+                continue
             if item.get("engine") not in engine_names:
                 put_back(taken_path)   # someone else's engine; keep its place
                 return 0
@@ -231,4 +237,5 @@ def drain(speak_item, engine_names, lock_seconds=60.0) -> int:
                 pass
             finish(taken_path)
     finally:
-        remove_tts_lock()
+        if owns_lock:
+            remove_tts_lock()

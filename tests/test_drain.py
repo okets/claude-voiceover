@@ -105,4 +105,41 @@ check("an item appended mid-drain is never lost",
       "after" in spoken or spool.pending_count() == 1,
       "spoken=%s pending=%d" % (spoken, spool.pending_count()))
 
+# --- the end-of-drain race: never delete a lock we do not own -------------
+# The spool looks empty, so drain releases the lock; a hook appends an item
+# AND another engine claims the lock in that gap, before we can re-claim it.
+# drain must put the item back and leave the winner's lock alone. The real
+# try_claim_lock is left in place (not mocked) so the second claim fails for
+# a genuine reason - a live foreign lock - rather than trivially returning
+# early from drain()'s very first claim at the top, before the buggy path
+# is ever reached.
+spool.clear()
+spool.enqueue("appended in the gap", "macos-female", "Samantha")
+foreign_payload = json.dumps({"expiry": time.time() + 300, "pid": 999999})
+
+real_take = engine_common.take_oldest
+looks = {"n": 0}
+
+def take_empty_first():
+    looks["n"] += 1
+    if looks["n"] == 1:
+        return None, None          # first look: spool appears empty
+    # Simulate another engine winning the lock in the gap between our
+    # release and our re-check.
+    engine_common.tts_lock_path().write_text(foreign_payload)
+    return real_take()             # second look: the appended item is there
+
+engine_common.take_oldest = take_empty_first
+try:
+    code = engine_common.drain(lambda item: True, {"macos-female"})
+finally:
+    engine_common.take_oldest = real_take
+
+check("drain exits 0 when it loses the lock race", code == 0, code)
+check("drain does NOT delete a lock it does not own",
+      engine_common.tts_lock_path().read_text() == foreign_payload,
+      "lock was deleted or overwritten")
+check("the item is put back, not lost", spool.pending_count() == 1,
+      spool.pending_count())
+
 report()
