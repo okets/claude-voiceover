@@ -22,7 +22,7 @@ def main():
 
     from voiceover.debuglog import log as _log
     from voiceover.settings import get_interaction_level
-    from voiceover.speech import stop_speech
+    from voiceover.speech import ensure_drainer, stop_speech
     from voiceover.spool import clear
 
     cwd = payload.get("cwd")
@@ -44,6 +44,13 @@ def main():
         # never be able to kill another session's live playback.
         return
     stop_speech()
+    # ...and because it is global, it may have killed a drainer part-way
+    # through ANOTHER session's items. Nothing else would restart it: their
+    # narration would sit until one of this session's later hooks happened to
+    # call ensure_drainer, or be dropped at the age cap - and whenever it did
+    # restart, their stale backlog would be spoken ahead of the answer to the
+    # message just sent. This turns an unbounded stall into a sub-second gap.
+    ensure_drainer(cwd)
 
 
 if __name__ == "__main__":

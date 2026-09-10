@@ -68,6 +68,7 @@ spec.loader.exec_module(ups)          # __main__ guard keeps main() from running
 
 order = []
 real_clear, real_stop = voiceover.spool.clear, voiceover.speech.stop_speech
+real_ensure = voiceover.speech.ensure_drainer
 real_stdin = sys.stdin
 
 
@@ -80,18 +81,48 @@ def record_stop():
     order.append("stop")
 
 
-voiceover.spool.clear = record_clear
-voiceover.speech.stop_speech = record_stop
-sys.stdin = io.StringIO(json.dumps(
-    {"cwd": str(REPO_ROOT), "session_id": "S1", "prompt": "new question"}))
-try:
-    ups.main()
-finally:
-    voiceover.spool.clear = real_clear
-    voiceover.speech.stop_speech = real_stop
-    sys.stdin = real_stdin
+def record_ensure(cwd=None):
+    order.append("restart")
+    return True
 
-check("the clear runs before playback is stopped", order == ["clear", "stop"], order)
+
+def run_main_recording(level):
+    """Drive main() in-process at one level; return the calls it made, in order."""
+    del order[:]
+    set_setting("interaction_level", level)
+    voiceover.spool.clear = record_clear
+    voiceover.speech.stop_speech = record_stop
+    voiceover.speech.ensure_drainer = record_ensure
+    global_stdin = sys.stdin
+    sys.stdin = io.StringIO(json.dumps(
+        {"cwd": str(REPO_ROOT), "session_id": "S1", "prompt": "new question"}))
+    try:
+        ups.main()
+    finally:
+        voiceover.spool.clear = real_clear
+        voiceover.speech.stop_speech = real_stop
+        voiceover.speech.ensure_drainer = real_ensure
+        sys.stdin = global_stdin
+    return list(order)
+
+
+calls = run_main_recording("narrator")
+check("the clear runs before playback is stopped",
+      calls[:2] == ["clear", "stop"], calls)
+
+# --- stop_speech() is global, so the drainer must be restarted ------------
+# It kills the shared drainer, which may be part-way through ANOTHER
+# session's items. Nothing else restarts it: their narration would sit until
+# this session's next hook happened to call ensure_drainer, or be dropped at
+# the age cap - and when it did restart, their stale backlog would be spoken
+# ahead of the answer to the message just sent.
+check("a drainer is restarted after the global stop",
+      calls == ["clear", "stop", "restart"], calls)
+
+calls = run_main_recording("silent")
+check("a silenced session neither stops nor restarts anything",
+      calls == ["clear"], calls)
+set_setting("interaction_level", "narrator")
 
 # --- a queue stranded by a level change is cleared even at silent level ----
 spool.clear()
