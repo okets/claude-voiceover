@@ -16,6 +16,7 @@ import re
 from pathlib import Path
 
 from .settings import data_dir
+from .transcript import is_status_notice
 
 _STATE_FILE_NAME = "prose_state.json"
 _MAX_TRACKED_TRANSCRIPTS = 20
@@ -104,6 +105,8 @@ def _assistant_text(line):
     if not isinstance(entry, dict) or entry.get("type") != "assistant":
         return None
     if entry.get("isSidechain") or entry.get("isMeta"):
+        return None
+    if is_status_notice(entry):
         return None
     message = entry.get("message") or {}
     content = message.get("content")

@@ -38,6 +38,14 @@ _META_CONTENT_PREFIXES = (
 
 _SUBAGENT_PROMPT_PREFIX = "You are a subagent"
 
+# Claude Code records its own status notices - usage-limit pauses, login
+# prompts, "No response requested." - as ordinary assistant messages, marked
+# only by a "<synthetic>" model (and, for API errors, an error status). They
+# are not Claude's words and must never be narrated: a limit notice sits
+# unread in the transcript across the pause and would otherwise be spoken at
+# the front of the next turn's narration.
+_SYNTHETIC_MODEL = "<synthetic>"
+
 
 @dataclass
 class CycleStats:
@@ -112,9 +120,19 @@ def _flatten_user_content(content) -> Optional[str]:
     return None
 
 
+def is_status_notice(entry) -> bool:
+    """True when an assistant envelope is a Claude Code status notice."""
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("isApiErrorMessage") or entry.get("apiErrorStatus") is not None:
+        return True
+    message = entry.get("message")
+    return isinstance(message, dict) and message.get("model") == _SYNTHETIC_MODEL
+
+
 def _assistant_blocks(entry) -> list:
     """Content blocks of an assistant envelope (empty list otherwise)."""
-    if entry.get("type") != "assistant":
+    if entry.get("type") != "assistant" or is_status_notice(entry):
         return []
     message = entry.get("message")
     if not isinstance(message, dict):
