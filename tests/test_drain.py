@@ -105,6 +105,35 @@ check("an item appended mid-drain is never lost",
       "after" in spoken or spool.pending_count() == 1,
       "spoken=%s pending=%d" % (spoken, spool.pending_count()))
 
+# --- the success side of the same race: a re-claimed item must be spoken --
+# The spool looks empty, the lock is released, the re-check finds an item
+# AND the re-claim succeeds. The item must be spoken, not orphaned.
+spool.clear()
+spool.enqueue("the item that must still be spoken", "macos-female", "Samantha")
+real_take = engine_common.take_oldest
+looks = {"n": 0}
+
+def take_empty_first():
+    looks["n"] += 1
+    if looks["n"] == 1:
+        return None, None          # first look: appears empty
+    return real_take()             # second look: the item is there
+
+engine_common.take_oldest = take_empty_first
+spoken_items = []
+try:
+    code = engine_common.drain(
+        lambda item: spoken_items.append(item["text"]) or True, {"macos-female"})
+finally:
+    engine_common.take_oldest = real_take
+
+check("drain exits 0 after a successful re-claim", code == 0, code)
+check("the re-claimed item is actually spoken",
+      spoken_items == ["the item that must still be spoken"], spoken_items)
+check("no orphaned .taken file is left behind",
+      list(spool.queue_dir().glob("*.taken")) == [],
+      list(spool.queue_dir().glob("*.taken")))
+
 # --- the end-of-drain race: never delete a lock we do not own -------------
 # The spool looks empty, so drain releases the lock; a hook appends an item
 # AND another engine claims the lock in that gap, before we can re-claim it.

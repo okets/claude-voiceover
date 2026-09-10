@@ -222,7 +222,10 @@ def drain(speak_item, engine_names, lock_seconds=60.0) -> int:
                     put_back(taken_path)
                     return 0
                 owns_lock = True
-                continue
+                # Fall through and speak the item we just claimed. A continue
+                # here would re-scan the spool, and this item is already
+                # renamed to .taken - invisible to that scan, so it would be
+                # silently lost.
             if item.get("engine") not in engine_names:
                 put_back(taken_path)   # someone else's engine; keep its place
                 return 0
