@@ -161,8 +161,14 @@ def take_oldest(engine_names=None):
     safety net only ever spawns the engine resolved for the current project.
 
     The claim is an atomic rename to <name>.taken, so of two engines reading
-    at once exactly one gets any given item. Unreadable items are discarded
-    and the next one is tried.
+    at once exactly one gets any given item. Unreadable items are discarded,
+    and so - when engine_names is given - is an item with no "engine" at
+    all: it is unattributable, no engine will ever claim it, so returning it
+    would only have the caller put it back and reclaim the very same item
+    next time round, forever. An item that names a real but different
+    engine is not discarded; it is left for its own engine to claim, in
+    both the pre-claim skip below and the post-claim check that catches one
+    rewritten between the peek and the claim.
     """
     try:
         candidates = sorted(queue_dir().glob("*.json"))
@@ -186,6 +192,22 @@ def take_oldest(engine_names=None):
         if not isinstance(item, dict) or not item.get("text"):
             finish(taken_path)  # corrupt: drop it and move on
             continue
+        if engine_names is not None:
+            engine = item.get("engine")
+            if not engine:
+                # Unattributable: no engine will ever claim it, so putting
+                # it back would spin the caller's loop forever. Drop it
+                # like corruption instead.
+                finish(taken_path)
+                continue
+            if engine not in engine_names:
+                # Rewritten between the peek above and this claim (or the
+                # peek raced) - it belongs to a real, different engine.
+                # Put it back keeping its place; that engine will pick it
+                # up, and stopping here would silence this one until the
+                # age cap.
+                put_back(taken_path)
+                continue
         return item, taken_path
     return None, None
 
@@ -263,13 +285,9 @@ def drain(speak_item, engine_names, lock_seconds=60.0, prepare=None) -> int:
                 # here would re-scan the spool, and this item is already
                 # renamed to .taken - invisible to that scan, so it would be
                 # silently lost.
-            if item.get("engine") not in engine_names:
-                # Defensive only: take_oldest() already filters by engine, so
-                # reaching here needs the item to have been rewritten between
-                # the peek and the claim. Put it back and move ON - stopping
-                # here would silence this engine until the age cap.
-                put_back(taken_path)   # someone else's engine; keep its place
-                continue
+            # No engine re-check here: take_oldest() already guarantees any
+            # item it returns is either ours or gets put back / dropped
+            # itself, so every item reaching this point is ours to speak.
             age = time.time() - float(item.get("created") or 0)
             if age > QUEUE_MAX_AGE_SECONDS:
                 finish(taken_path)     # too stale to be worth hearing

@@ -17,15 +17,22 @@ sys.path.insert(0, str(REPO_ROOT / "tts"))
 import engine_common
 
 
-def run_drain(engine="macos"):
-    """Run an engine in drain mode under dry-run; return (stderr, returncode)."""
+def run_drain(engine="macos", timeout=None):
+    """Run an engine in drain mode under dry-run; return (stderr, returncode).
+
+    With a timeout, a drain() that never returns (a livelock) raises
+    subprocess.TimeoutExpired instead of hanging this call forever - the
+    caller is expected to catch that itself when the whole point of the
+    test is to bound a suspected hang.
+    """
     if engine == "macos":
         command = [sys.executable, str(REPO_ROOT / "tts" / "macos_say.py"), "--drain"]
     else:
         command = ["uv", "run", "--project", str(REPO_ROOT / "tts"),
                    str(REPO_ROOT / "tts" / "kokoro_voice.py"), "--drain"]
     proc = subprocess.run(command, capture_output=True, text=True,
-                          env=os.environ.copy(), cwd=str(REPO_ROOT / "tts"))
+                          env=os.environ.copy(), cwd=str(REPO_ROOT / "tts"),
+                          timeout=timeout)
     return proc.stderr, proc.returncode
 
 
@@ -189,5 +196,46 @@ check("drain does NOT delete a lock it does not own",
       "lock was deleted or overwritten")
 check("the item is put back, not lost", spool.pending_count() == 1,
       spool.pending_count())
+
+# --- an item with no "engine" at all is unattributable, not a livelock ----
+# take_oldest() only ever rejected items missing "text"; one with valid text
+# but no engine field used to be claimed, found to match no engine, put
+# back, and claimed again next loop - forever, holding the TTS lock the
+# whole time. Run this under a hard timeout: against the unfixed code
+# drain() never returns, and a naive in-process call here would hang the
+# whole suite rather than fail this one test.
+engine_common.remove_tts_lock()  # clear the foreign lock the previous test left
+spool.clear()
+spool.enqueue("no engine at all", "macos-female", "Samantha")
+path = sorted(spool.queue_dir().glob("*.json"))[0]
+item = json.loads(path.read_text())
+del item["engine"]
+path.write_text(json.dumps(item))
+time.sleep(0.002)
+spool.enqueue("kokoro only, must survive", "kokoro", "bf_emma")
+time.sleep(0.002)
+spool.enqueue("mine to speak", "macos-female", "Samantha")
+try:
+    stderr, code = run_drain("macos", timeout=10)
+    timed_out = False
+except subprocess.TimeoutExpired:
+    timed_out = True
+    engine_common.remove_tts_lock()  # the killed process never released it
+
+check("drain does not livelock on an item with no engine field",
+      not timed_out, "drain() never returned within 10s")
+if not timed_out:
+    spoken = [line.split("[voiceover] ", 1)[1].strip()
+              for line in stderr.splitlines() if "[voiceover] " in line]
+    check("the unattributable item is dropped, not spoken",
+          "no engine at all" not in spoken, spoken)
+    check("own-engine items behind it are still spoken",
+          "mine to speak" in spoken, spoken)
+    check("a foreign but VALID engine item is still put back, not dropped",
+          spool.pending_count() == 1, spool.pending_count())
+    check("the surviving item is the kokoro one",
+          json.loads(sorted(spool.queue_dir().glob("*.json"))[0].read_text())["text"]
+          == "kokoro only, must survive")
+    check("the lock is released afterwards", engine_common.lock_is_live() is False)
 
 report()
