@@ -179,22 +179,48 @@ spoken):
 claim lock (atomic; exit quietly if another engine holds it)
 load model once
 loop:
-    item = take_oldest()
+    item = take_oldest(engine_names)   # engine-aware: see below
     if item is None:
         release lock
-        item = take_oldest()        # close the race with a hook that just appended
+        item = take_oldest(engine_names) # close the race with a hook that just appended
         if item is None: exit 0
         if not claim lock: exit 0   # another engine got there first
         # fall through and speak THIS item - a continue would re-scan and
         # the item, already renamed to .taken, would be invisible and lost
     if item["created"] older than cap: drop it, continue
-    if item["engine"] is not ours:
-        rename it back to its ORIGINAL name (order preserved), release lock, exit 0
     refresh lock expiry generously, then speak the item
 ```
 
-The engine-mismatch branch handles a voice or engine change mid-queue: the
-wrong-engine drainer steps aside and the hook safety net starts the right one.
+`take_oldest(engine_names)` is engine-aware: scanning the spool in order, it
+SKIPS any item whose `engine` is not in `engine_names`, leaving it exactly
+where it is (both its place and its ordering intact), and claims the oldest
+item this engine *can* speak. This is not the mismatch handling an earlier
+version of this design described - a version where the wrong-engine drainer
+stepped aside and "the hook safety net starts the right one" was tried and
+found false: `ensure_drainer()` always spawns `resolve_engine(cwd)`, the very
+engine that just stepped aside, so nothing ever started the other one and a
+foreign item at the head froze the whole queue. Skipping instead of stopping
+means the drainer always speaks the oldest item it CAN speak, and a foreign
+item only leaves the queue by being spoken (once its own engine drains it) or
+by aging out at the cap.
+
+Two further changes to the kokoro drainer beyond this loop, both about
+keeping exactly one voice on the speaker at a time:
+
+- **Streaming, not synthesize-then-play.** `speak_one` calls
+  `stream_chunks()`, which plays each synthesized chunk as it becomes
+  available instead of rendering the whole item first - so a long prose item
+  (up to `_FULL_TEXT_CAP` characters) starts speaking within seconds rather
+  than after full synthesis. It refreshes the lock's expiry once per chunk
+  (`update_lock_expiry`, same length-proportional estimate `speak_text()`
+  uses), so a synthesis window longer than `lock_seconds` never reads as
+  "free" to a concurrent hook.
+- **Claim the lock before loading the model.** `prepare()` - passed to
+  `drain()` and invoked only after `try_claim_lock()` succeeds - is what
+  loads the ONNX model. Loading it up front would leave the lock free for
+  the multi-second load, during which every hook that fires spawns another
+  `uv run` that also loads the model and then exits on the lock; claiming
+  first means only the drainer that will actually speak pays that cost.
 
 ### 3a. Concurrent sessions
 
@@ -283,8 +309,11 @@ makes sound.
    the directory ends empty, and exit status is 0.
 7. **Drain-end race** — append an item at the moment the drainer finds the
    spool empty; assert it is still spoken.
-8. **Engine mismatch** — a macOS item in the spool while the kokoro drainer
-   runs; assert the item survives and the drainer exits cleanly.
+8. **Engine mismatch** — a macOS item at the head of the spool with a kokoro
+   item queued behind it, while the kokoro drainer runs; assert the macOS
+   item survives untouched AND the kokoro item behind it is still spoken -
+   a foreign item at the head must never block an engine from reaching its
+   own items further back.
 9. **Cut over on new prompt** — `user_prompt_submit.py` empties that session's
    spool items, leaves another session's items alone, and clears the TTS lock so
    the next turn starts speaking immediately.
