@@ -239,7 +239,10 @@ All commands invoke scripts with `"${CLAUDE_PLUGIN_ROOT}/scripts/<script>.py"` p
 - `plugin.json` — name "voiceover", displayName "Claude Voiceover", version 1.0.0,
   description packed with search terms (voice, text-to-speech, TTS, narration, notification
   sounds, Kokoro, offline, local), author Hanan (okets), homepage/repository
-  https://github.com/okets/claude-voiceover, license MIT, hooks "./hooks/hooks.json",
-  commands "./commands".
+  https://github.com/okets/claude-voiceover, license MIT.
+  It must NOT declare "hooks" or "commands" paths: Claude Code auto-discovers
+  hooks/hooks.json and commands/, and naming either one makes it load the file
+  twice and refuse the plugin ("Duplicate hooks file detected"). Declaring
+  manifest.hooks is only for ADDITIONAL hook files beyond the standard one.
 - `marketplace.json` — marketplace name "claude-voiceover", owner okets, one plugin entry
   with source "./" so `/plugin marketplace add okets/claude-voiceover` works directly.

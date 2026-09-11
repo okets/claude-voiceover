@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.3.1 - 2026-09-11
+
+### Fixed
+- The plugin failed to load its hooks on install: "Duplicate hooks file
+  detected". .claude-plugin/plugin.json declared hooks "./hooks/hooks.json"
+  and commands "./commands", but Claude Code auto-discovers both, so naming
+  them made it load hooks/hooks.json twice and refuse the whole hook set -
+  no narration at all. Both keys are removed; the conventional locations are
+  unchanged. Present since 1.0.0 and only surfaced once Claude Code began
+  rejecting the duplicate. A manifest test now guards it, since nothing in
+  the Python suite can see a defect that lives in the manifest.
+
 ## 1.3.0 - 2026-09-10
 
 ### Added
