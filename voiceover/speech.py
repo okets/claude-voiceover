@@ -106,6 +106,8 @@ def enqueue_speech(text, min_level="concise", cwd=None, full=False, session=None
     try:
         if not text or not str(text).strip():
             return False
+        _log("queue", "req min=%s chars=%d :: %.60s" % (
+            min_level, len(str(text)), str(text).replace("\n", " ")), cwd)
         message = _gate_and_truncate(text, min_level, cwd, full)
         if message is None:
             _log("queue", "gated by level/enabled", cwd)
