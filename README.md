@@ -43,6 +43,8 @@ Set with `/voiceover:level` — per machine, or per project.
 | verbose | 3 | Full play-by-play of every tool Claude uses, including subagent completions |
 | narrator | 4 | Claude's actual words read aloud as it works, with fluent speech between sentences (model loads once per turn, not per sentence) — tool chatter stays quiet, code blocks become a spoken "…code snippet…" cue |
 
+Upgrading to narrator's queued narration also needs one Claude Code restart to fully take effect (the hook that clears an abandoned turn's narration only registers after a restart). Until then, if you send a new message before Claude finishes speaking the last one, you'll hear the old turn's narration all the way through before the new answer starts — the opposite of what this feature is for. Restart once after upgrading and it goes away.
+
 ## Voices
 
 Set with `/voiceover:voice <name>`. Kokoro voices are local neural TTS; the default voices use macOS system speech and work instantly.

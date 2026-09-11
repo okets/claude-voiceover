@@ -11,7 +11,12 @@
 - New UserPromptSubmit hook: sending a new message clears that session's
   pending narration and stops playback, so the answer to the question you just
   asked is the next thing you hear. Requires one Claude Code restart to
-  register.
+  register. Until that restart, the other five hooks are already queuing
+  narration but nothing clears an abandoned turn's queue on your next
+  message - so for that one window, an old turn's narration is GUARANTEED to
+  finish playing before the answer to your new question, where 1.2.0 would
+  have dropped most of it on lock contention instead. Restart once after
+  upgrading to get the intended behavior.
 
 ### Changed
 - The transcript cursor now advances when prose is QUEUED, not when audio
