@@ -137,7 +137,7 @@ def ensure_drainer(cwd=None) -> bool:
     try:
         if spool.pending_count() == 0:
             return False
-        if _is_locked():
+        if lock_is_live():
             return False  # a drainer is already working through the queue
         engine = resolve_engine(cwd)
         if engine == "kokoro":
@@ -240,22 +240,45 @@ def _spawn_detached(command) -> bool:
 # Lock file (read/clear only - the engine subprocess creates and removes it)
 # ---------------------------------------------------------------------------
 
-def _is_locked() -> bool:
-    """True while a previous speak()'s expiry timestamp is in the future."""
-    lock = lock_path()
+def _lock_expiry():
+    """The lock's expiry timestamp, or None when there is no readable lock.
+
+    Lock content is JSON {"expiry", "pid"}; pre-1.1 locks were a bare float.
+    """
     try:
-        if not lock.exists():
-            return False
-        with open(lock, "r", encoding="utf-8") as handle:
-            raw = handle.read().strip()
+        raw = lock_path().read_text().strip()
+    except OSError:
+        return None
+    try:
+        return float(json.loads(raw).get("expiry"))
+    except Exception:
         try:
-            expiry = float(json.loads(raw).get("expiry"))
-        except Exception:
-            expiry = float(raw)  # pre-1.1 locks were a bare float
-        if time.time() < expiry:
-            return True
-    except (OSError, ValueError):
-        pass
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+
+def lock_is_live() -> bool:
+    """True while an unexpired lock exists. Read-only: never deletes anything.
+
+    ensure_drainer() asks this from a HOOK, about a lock a live engine holds.
+    The engine side already established the rule - drain() never removes a
+    lock it does not own - and it applies just as much from outside: a hook
+    that deletes a working drainer's lock lets a rival start beside it.
+    """
+    expiry = _lock_expiry()
+    return expiry is not None and time.time() < expiry
+
+
+def _is_locked() -> bool:
+    """True while a previous speak()'s expiry timestamp is in the future.
+
+    Clears an expired or unreadable lock as a side effect. That is
+    pre-existing behaviour on speak()'s non-narrator path, where the caller
+    IS the only speaker; the queue path uses the read-only lock_is_live().
+    """
+    if lock_is_live():
+        return True
     _clear_lock()  # expired or unreadable
     return False
 

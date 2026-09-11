@@ -9,23 +9,28 @@ by a crashed speech process. Never blocks, no stdout, always exits 0.
 
 import json
 import sys
-import time
 from pathlib import Path
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PLUGIN_ROOT))
 
-STALE_LOCK_SECONDS = 30
 IDLE_MESSAGE = "Claude is waiting for your input"
 
 
 def clear_stale_lock():
-    """Remove a tts.lock older than STALE_LOCK_SECONDS (crash leftover)."""
+    """Remove a tts.lock whose owning engine has died (a crash leftover).
+
+    Liveness is the pid recorded in the lock, never its mtime: the drain
+    loop rewrites the lock once per ITEM, so one long utterance goes stale by
+    mtime while it is still playing, and clearing it there would let a second
+    drainer start and speak over the first.
+    """
     try:
+        from voiceover.process_utils import lock_owner_is_running
         from voiceover.speech import lock_path
 
         lock = lock_path()
-        if lock.exists() and time.time() - lock.stat().st_mtime > STALE_LOCK_SECONDS:
+        if lock.exists() and not lock_owner_is_running(lock):
             lock.unlink()
     except Exception:
         pass
