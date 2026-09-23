@@ -64,11 +64,14 @@ def commit_offset(transcript_path, offset) -> None:
     """Remember that everything before offset has been narrated."""
     try:
         state = _load_state()
+        # Re-insert so dict order is least -> most recently narrated; the
+        # cap below then evicts the stalest transcript, never this one.
+        state.pop(str(transcript_path), None)
         state[str(transcript_path)] = int(offset)
         # Keep the state file from growing without bound across sessions.
-        if len(state) > _MAX_TRACKED_TRANSCRIPTS:
-            for key in sorted(state)[: len(state) - _MAX_TRACKED_TRANSCRIPTS]:
-                del state[key]
+        excess = len(state) - _MAX_TRACKED_TRANSCRIPTS
+        for key in list(state)[:excess] if excess > 0 else ():
+            del state[key]
         state_path = data_dir() / _STATE_FILE_NAME
         with open(state_path, "w", encoding="utf-8") as handle:
             json.dump(state, handle)

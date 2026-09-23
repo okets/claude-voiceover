@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.3.2 - 2026-09-23
+
+### Fixed
+- Narrator mode never spoke a word in some projects and fell back to the
+  templated "You instructed me to: ... Done!" completion on every turn. The
+  prose offset store (data_dir()/prose_state.json) is capped at 20
+  transcripts, and the cap evicted by sorted path rather than by recency.
+  A project whose transcript path sorts before the 20 already tracked (for
+  example ~/Documents/... next to twenty ~/Projects/... sessions) had its
+  offset evicted on the very commit that wrote it, so every hook treated the
+  transcript as brand new, started "from now", and found nothing to read.
+  Eviction is now least-recently-narrated, so the transcript just committed
+  always survives. Present since narrator mode shipped in 1.2.0.
+
 ## 1.3.1 - 2026-09-11
 
 ### Fixed
