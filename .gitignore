@@ -6,3 +6,4 @@ uv.lock
 .venv/
 .superpowers/
 .claude/voiceover.json
+/tsconfig.json
