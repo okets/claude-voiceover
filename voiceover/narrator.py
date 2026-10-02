@@ -91,6 +91,17 @@ def pin_cwd(session, cwd) -> None:
         _write_record("pins", session, str(cwd))
 
 
+def repin(session, cwd) -> None:
+    """A prompt starts a turn in cwd's project: let go of any lease the
+    session still holds under a previously pinned cwd (an interrupted turn
+    never reached Stop), then pin cwd. Every prompt re-pins, at every level,
+    so a stale pin never decides another project's narration."""
+    previous = pinned_cwd(session, None)
+    if previous and previous != cwd:
+        lease.release(previous, session)
+    pin_cwd(session, cwd)
+
+
 def pinned_cwd(session, cwd):
     """The session's pinned cwd, else cwd."""
     return _read_record("pins", session) or cwd

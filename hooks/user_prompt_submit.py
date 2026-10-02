@@ -29,12 +29,12 @@ def main():
 
     cwd = payload.get("cwd")
     session = payload.get("session_id")
+    narrator.repin(session, cwd)  # this turn's project, whatever it cds to
     level = get_interaction_level(cwd)
 
     if level == "narrator":
         if narrator.headless():
             return
-        narrator.pin_cwd(session, cwd)  # this turn's project, whatever it cds to
         if narrator.is_users_prompt(payload.get("prompt")):
             narrator.cutover(cwd, session, ttl=lease.FALLBACK_LEASE_TTL)
         elif narrator.narrates(cwd):

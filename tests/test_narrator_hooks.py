@@ -322,4 +322,32 @@ run_hook("stop", {"cwd": str(REPO_ROOT), "transcript_path": str(path), "session_
 set_setting("interaction_level", "narrator")
 check("a stop after narration was turned off still releases the engine", not lease_held())
 
+# --- every prompt re-pins its session, at any level ---------------------------------------
+spool.clear()
+set_setting("interaction_level", "silent", scope="project", cwd=str(elsewhere))
+run_hook("user_prompt_submit", {"cwd": str(REPO_ROOT), "session_id": "S1", "prompt": "go"})
+run_hook("user_prompt_submit", {"cwd": str(elsewhere), "session_id": "S1", "prompt": "go"})
+check("a prompt from another project re-pins the session, at any level",
+      narrator.pinned_cwd("S1", None) == str(elsewhere), narrator.pinned_cwd("S1", None))
+path = write_transcript("repin.jsonl", [USER])
+commit_offset(str(path), path.stat().st_size)
+with open(path, "a") as handle:
+    handle.write(json.dumps(assistant("Nobody asked.")) + "\n")
+run_hook("pre_tool_use", {"cwd": str(elsewhere), "transcript_path": str(path),
+                          "session_id": "S1", "tool_name": "Bash", "tool_input": {}})
+check("a silent project's session is not narrated by a stale pin",
+      spool.pending_count() == 0 and spool.pending_count(cwd=str(elsewhere)) == 0)
+(elsewhere / ".claude" / "voiceover.json").unlink()
+narrator.unpin("S1")
+lease.release(None, "S1")
+
+# --- re-pinning releases the lease an interrupted turn left behind --------------------------
+run_hook("user_prompt_submit", {"cwd": str(REPO_ROOT), "session_id": "S1", "prompt": "go"})
+check("a prompt warms the engine in its project", lease_held())
+run_hook("user_prompt_submit", {"cwd": str(elsewhere), "session_id": "S1", "prompt": "go"})
+check("re-pinning releases the lease an interrupted turn left behind", not lease_held())
+narrator.unpin("S1")
+lease.release(None, "S1")
+lease.release(str(elsewhere), "S1")
+
 report()
