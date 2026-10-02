@@ -353,11 +353,11 @@ first step.
 |---|---|
 | `session.start` | `start` op (its reply sets the gate, so a reloaded module resumes). |
 | `session.end` | `end-session` op, awaited. |
-| `prompt.submit` | `prompt` op with `cutover` = the origin is not automated (Decisions). Not awaited. The reply is this turn's `narrate` gate. |
+| `prompt.submit` | `prompt` op with `cutover` = the origin is not automated (Decisions). Not awaited. A prompt asked to wait its turn (`wait`, ctrl+x enter) does not cut over. The reply is this turn's `narrate` gate. |
 | `turn.start` | `hold` op (the pre-warm); resets the dialog lead-in. |
 | `turn.step` (main loop only) | Yields every chunk of `next(e)` unchanged, then feeds text chunks to the segmenter; every block of one response shares the utterance `<turnId>:<index>`; complete segments become `say` ops. A block is flushed when the next block starts or the response completed (`stopReason` set, not aborted); an interrupted stream is closed beneath and its open block is not flushed. |
 | `tool.call` AskUserQuestion, ExitPlanMode | `dialog` op under the last utterance, awaited before `next(e)` so the permission echo finds the marker; then `hold`. |
-| `turn.complete` (main loop only) | `turn-end` op with `spoken` = the last step queued speakable text. |
+| `turn.complete` (main loop only) | `turn-end` op with `spoken` = the last step queued speakable text, or `true` for an interrupted turn, so no chime plays over a turn the user stopped. |
 
 **The `$` rule.** The engine refuses a module that stores `$`, puts it in an
 object, or hands it to a function in another file. `narrator.ts` keeps every
@@ -369,8 +369,9 @@ module state (the op queue, the gate, the last utterance) holds no `$`;
 `hooks/run.sh mod_bridge` in order; ops queued while a call runs go together
 in the next call. Each call reads the session id and root afresh (a `/clear`
 or resume changes the id with no `session.start`) and sends `cwd` =
-`$.session.root()`, which a shell `cd` does not move. A failed call settles
-its ops as "not narrating".
+`$.session.root()`, which a shell `cd` does not move. Each bridge call runs on the newest sender's `$`, because an interrupted
+hook's `$` calls abort with it. A failed call settles its ops as "not
+narrating"; an unknown gate is asked once more with the same op.
 
 **The bridge** (`hooks/mod_bridge.py`, stdlib) executes the ops through
 `voiceover/narrator.py`. Every batch marks the session (`mod_sessions/`), so

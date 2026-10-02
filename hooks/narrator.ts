@@ -86,13 +86,13 @@ function send($: EngineInterface, op: Op): Promise<boolean | null> {
 
 /**
  * Asks the bridge for this turn's gate with op. An unknown answer is asked
- * once more with status on the same promise, so the sentences already
+ * once more with the same op on the same promise, so the sentences already
  * waiting keep their order; still unknown, it reads as off and leaves no
  * gate, so the next op asks again. One failed call never silences a turn.
  */
 function openGate($: EngineInterface, op: Op): Promise<boolean> {
   const asked: Promise<boolean> = send($, op)
-    .then(narrate => (narrate === null ? send($, { op: 'status' }) : narrate))
+    .then(narrate => (narrate === null ? send($, op) : narrate))
     .then(narrate => {
       if (narrate === null && gate === asked) gate = undefined
       return narrate === true

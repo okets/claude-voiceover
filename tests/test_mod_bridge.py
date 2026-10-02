@@ -187,6 +187,18 @@ try:
 finally:
     set_setting("tts_enabled", True)
 
+# --- a move out of a project below the narrator level: the gate is the root's -------------
+from voiceover.settings import _project_settings_path
+set_setting("interaction_level", "concise", scope="project", cwd=str(other))
+try:
+    bridge_from(other, "S9", {"op": "start"})
+    proc = bridge(stdin=json.dumps({"session": "S9", "cwd": str(REPO_ROOT),
+                                    "ops": [{"op": "prompt", "cutover": True}]}))
+    check("a prompt that moves into a narrating project reports the root's gate",
+          reply(proc) == {"narrate": True}, proc.stdout)
+finally:
+    _project_settings_path(str(other)).unlink(missing_ok=True)
+
 # --- SessionEnd drops the mark even when the mod never says so -----------------------------
 narrator.mark_mod_session("S3")
 proc = subprocess.run(["bash", str(REPO_ROOT / "hooks" / "run.sh"), "session_end"],

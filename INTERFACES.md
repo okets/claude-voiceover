@@ -447,7 +447,7 @@ root has moved mid-turn; only `prompt` re-pins, to the root.
 
 Every batch first calls `narrator.mark_mod_session(session)` (`/clear` and resume change the id
 with no `session.start`, and the classic hooks must stand down from the new session's first op),
-then reads the gate `narrator.narrates(cwd)` once. The gate decides per op:
+then reads the gate `narrator.narrates(cwd)` once, in the pinned project (the `prompt` op reads it again at the root, after the move). The gate decides per op:
 `start` and `status` pin a session without a pin, whatever the gate says; `end-session` always releases and unmarks;
 `prompt` acts only when `narrator.mod_owns_prompt` is true, and its cutover does not depend on the gate (headless runs skip it); `turn-end` and `dialog` act when the gate is on and only release the lease when it is
 off; `hold` and `say` run only when the gate is on. `speakable` cleans markdown with `prose.clean_for_speech` and strips any `*`
@@ -477,7 +477,7 @@ it and the classic hooks narrate. TypeScript tests sit beside the sources (`*.te
   sender's `$`, so a batch never rides an interrupted dispatch.
   Deferred: in a mod session, a level or TTS switched ON mid-turn takes effect at the next prompt.
   - The gate: `openGate` sends an op; if the answer is unknown (`null`) it asks once more with
-    `status`, and if still unknown it reads as off and leaves no gate, so the next op asks again.
+    the same op, and if still unknown it reads as off and leaves no gate, so the next op asks again.
     `currentGate` reuses the turn's gate or opens one with `status`. One failed bridge call never
     silences a turn.
   - The `$` rule: the engine refuses a module that stores the engine handle `$`, puts it in an

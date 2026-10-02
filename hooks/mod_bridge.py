@@ -73,10 +73,11 @@ def run(payload):
             if narrator.pinned_cwd(session, None) is None:
                 narrator.pin_cwd(session, root)  # a reload or a gate retry keeps the turn's pin
         elif kind == "prompt":
-            if not narrator.mod_owns_prompt(session, root):
+            owns = narrator.mod_owns_prompt(session, root)
+            cwd, narrate = root, narrator.narrates(root)  # whichever hook owns it re-pins to the root
+            if not owns:
                 continue  # below the narrator level the classic prompt hook re-pins and clears
             previous = narrator.repin(session, root)
-            cwd, narrate = root, narrator.narrates(root)
             if op.get("cutover") and not narrator.headless():
                 # The user's own prompt stops the old turn, whatever narrates() says now.
                 if previous:

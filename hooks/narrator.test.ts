@@ -184,7 +184,7 @@ test('one failed bridge call is asked again, and the sentences waiting keep thei
   await $.prompt.submit(prompt())
   await collect($.turn.step(step()))
   await engine.until(sent => sent.filter(o => o.op === 'say').length === 2)
-  expect(opsOf(engine.ops)).toEqual(['status', 'hold', 'say', 'say'])
+  expect(opsOf(engine.ops)).toEqual(['prompt', 'hold', 'say', 'say'])
   expect(engine.ops.filter(o => o.op === 'say').map(o => o.text)).toEqual(['One. ', 'Two. '])
 })
 
