@@ -519,6 +519,10 @@ def _clear_spawned(root):
 class Playback:
     """A sentence that is already over - what a dry run plays."""
 
+    def started(self) -> bool:
+        """True once sound is actually coming out."""
+        return True
+
     def poll(self) -> bool:
         return True
 
@@ -527,14 +531,21 @@ class Playback:
 
 
 class ProcessPlayback(Playback):
-    """A sentence playing in a child process; cleanup is a file to delete."""
+    """A sentence playing in a child process; cleanup is a file to delete.
 
-    def __init__(self, process, cleanup=None):
+    deadline (seconds, optional): a player still running after that long is
+    killed and reported done, so a hung player cannot stall the engine."""
+
+    def __init__(self, process, cleanup=None, deadline=None):
         self._process = process
         self._cleanup = cleanup
+        self._deadline = time.time() + deadline if deadline else None
 
     def poll(self) -> bool:
         if self._process.poll() is None:
+            if self._deadline is not None and time.time() > self._deadline:
+                self.kill()
+                return True
             return False
         self._remove()
         return True
@@ -591,8 +602,8 @@ def _log_first_sound(item):
     now = time.time()
     shown = item.get("shown")
     text = item.get("text") or ""
-    engine_log("sound", "source=%s lag_created=%.2f lag_shown=%s chars=%d :: %.60s" % (
-        item.get("source") or "-", now - float(item.get("created") or now),
+    engine_log("sound", "source=%s utterance=%s lag_created=%.2f lag_shown=%s chars=%d :: %.60s" % (
+        item.get("source") or "-", item.get("utterance") or "-", now - float(item.get("created") or now),
         ("%.2f" % (now - float(shown))) if isinstance(shown, (int, float)) else "-",
         len(text), text.replace("\n", " ")))
 
@@ -620,10 +631,12 @@ def _speak_item(root, speaker, item, engine_names, keeper, poll_seconds):
     for index, sentence in enumerate(sentences):
         last = index == len(sentences) - 1
         playback = speaker.begin(sentence, item.get("voice"), None if last else sentences[index + 1])
-        if index == 0:
-            _log_first_sound(item)
+        logged = index != 0  # the item's first sound is logged once, when it starts
         prefetched = not last  # within the item, begin() already prefetched
         while not playback.poll():
+            if not logged and playback.started():
+                logged = True
+                _log_first_sound(item)
             keeper.keep()
             if stop_requested(root, item):
                 playback.kill()
@@ -632,6 +645,8 @@ def _speak_item(root, speaker, item, engine_names, keeper, poll_seconds):
             if not prefetched:
                 prefetched = _prefetch_next(root, speaker, engine_names)
             time.sleep(poll_seconds)
+        if not logged:  # a playback that finished before it was seen to start
+            _log_first_sound(item)
         keeper.keep()
         if stop_requested(root, item):
             return
@@ -726,8 +741,9 @@ def drain(root, open_speaker, engine_names, lock_seconds=60.0,
             keeper.keep()
             try:
                 _speak_item(root, speaker, item, engine_names, keeper, poll_seconds)
-            except Exception:
-                pass  # a failed sentence skips the rest of its item
+            except Exception as error:
+                # A failed sentence skips the rest of its item; say why.
+                engine_log("error", "%s: %s" % (type(error).__name__, error))
             finish(taken_path)
     finally:
         if owns_lock:

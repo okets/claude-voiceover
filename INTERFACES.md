@@ -137,7 +137,7 @@ def speak(text, min_level="concise", cwd=None, interrupt=False, full=False) -> b
     # gates: is_tts_enabled + level_at_least(min_level); truncates via truncate_for_speech;
     # honors tts lock (skip if locked & not interrupt; interrupt -> stop_speech first);
     # engine dispatch:
-    #   kokoro       -> subprocess: uv run --project <plugin>/tts <plugin>/tts/kokoro_voice.py <voice> <text>
+    #   kokoro       -> subprocess: uv run --project <plugin>/tts <plugin>/tts/kokoro_voice.py --voice <voice> --stream <text>
     #   macos-female -> subprocess: python3 <plugin>/tts/macos_say.py --voice Samantha <text>
     #   macos-male   -> subprocess: python3 <plugin>/tts/macos_say.py --voice Daniel <text>
     #   none         -> no-op
@@ -333,7 +333,7 @@ the lock-owner liveness check hooks use.
   `open_speaker` loads the model once and warms it up; its speaker synthesizes the next
   sentence on a worker thread while one plays. macOS speaks each sentence with
   `say --voice=<Name>` (text on stdin).
-- `tts/kokoro_voice.py <voice_id> <text>` — the one-shot speaker, port as-is (13 voices, per-voice speed, model
+- `tts/kokoro_voice.py --voice <voice_id> [--stream] <text>` — the one-shot speaker, port as-is (13 voices, per-voice speed, model
   auto-download to ~/.kokoro-tts/models, plays via voiceover/audio_player logic duplicated
   locally or inline — this file may NOT import voiceover/ (different process/venv); it stays
   self-contained like today).
@@ -410,7 +410,7 @@ Lease table (narrator level; `FALLBACK_LEASE_TTL` unless noted):
 ## commands/ (plugin slash commands, markdown)
 
 - `voice.md` (/voiceover:voice) — set voice by friendly name via manage_voices.py
-- `level.md` (/voiceover:level) — silent|quiet|concise|verbose or 0-3 via manage_settings.py
+- `level.md` (/voiceover:level) — silent|quiet|concise|verbose|narrator or 0-4 via manage_settings.py
 - `setup.md` (/voiceover:setup) — run setup_tts.py, guide model download + voice pick
 - `migrate.md` (/voiceover:migrate) — run migrate_legacy.py flow with confirmation
 All commands invoke scripts with `"${CLAUDE_PLUGIN_ROOT}/scripts/<script>.py"` paths.

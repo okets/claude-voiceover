@@ -51,7 +51,8 @@ def main():
                                      lead_in=text, shown=shown) and text:
                 commit_offset(transcript, offset)
             return
-        lease.hold(cwd, session, ttl=lease.FALLBACK_LEASE_TTL)
+        if narrator.narrates(cwd):  # TTS off or no engine: never hold one
+            lease.hold(cwd, session, ttl=lease.FALLBACK_LEASE_TTL)
         if text and enqueue_speech(text, cwd=cwd, full=True, session=session,
                                    shown=shown, source="pre_tool_use"):
             commit_offset(transcript, offset)

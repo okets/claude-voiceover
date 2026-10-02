@@ -39,7 +39,7 @@ def main():
         spool.clear_sticky(session, cwd=cwd)
         if payload.get("tool_name") in narrator.DIALOG_TOOLS:
             narrator.dialog_answered(cwd, session, ttl=lease.FALLBACK_LEASE_TTL)
-        else:
+        elif narrator.narrates(cwd):  # TTS off or no engine: never hold one
             lease.hold(cwd, session, ttl=lease.FALLBACK_LEASE_TTL)
         transcript = payload.get("transcript_path", "")
         text, offset, shown = peek_new_prose_stamped(transcript)

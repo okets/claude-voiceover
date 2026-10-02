@@ -155,4 +155,64 @@ kokoro_voice.speak_streaming(FakeKokoro(), "one shot", "af_sarah")
 check("speak_streaming still releases the one-shot lock",
       engine_common.tts_lock_path(engine_common.data_dir()).exists() is False)
 
+# --- a discarded prefetch is cancelled, so it never occupies the worker ----------
+cancel_speaker = kokoro_voice.KokoroSpeaker(FakeKokoro(delay=0.3), PLAY)
+cancel_speaker.prefetch("Busy.", "af_sarah")  # holds the single worker
+cancel_speaker.prefetch("Queued.", "af_sarah")  # waits behind it
+queued = cancel_speaker._ahead[("Queued.", "af_sarah")]
+cancel_speaker.begin("Elsewhere.", "af_sarah", None)
+check("a discarded queued render is cancelled", queued.cancelled())
+
+# --- a player past its deadline is killed and reported done ----------------------
+import subprocess
+hung = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+late = engine_common.ProcessPlayback(hung, deadline=0.2)
+check("a player inside its deadline is still playing", late.poll() is False)
+time.sleep(0.3)
+check("past its deadline it is reported done", late.poll() is True)
+check("and its process was killed", hung.poll() is not None)
+
+# --- the first sound is logged when it starts, not when it is begun --------------
+(engine_common.data_dir() / "settings.json").write_text('{"debug_log": true}')
+engine_common._debug = None
+log_path = engine_common.data_dir() / "voiceover.log"
+if log_path.exists():
+    log_path.unlink()
+started_at = []
+
+
+class SlowStart(engine_common.Playback):
+    def __init__(self):
+        self._polls = 0
+
+    def started(self):
+        if self._polls >= 5 and not started_at:
+            started_at.append(time.time())
+        return self._polls >= 5
+
+    def poll(self):
+        self._polls += 1
+        time.sleep(0.02)
+        return self._polls >= 8
+
+
+class SlowStartSpeaker:
+    def prefetch(self, sentence, voice):
+        pass
+
+    def begin(self, sentence, voice, upcoming=None):
+        return SlowStart()
+
+
+spool.clear()
+spool.enqueue("Starts late.", "kokoro", "af_sarah", utterance="U9", source="pre_tool_use")
+engine_common.drain(ROOT, SlowStartSpeaker, {"kokoro"}, poll_seconds=0.001)
+sound = [line for line in log_path.read_text().splitlines() if " sound " in line]
+check("the first sound is logged once", len(sound) == 1, sound)
+check("and not before the playback started",
+      sound and started_at and float(sound[0].split()[0]) >= started_at[0] - 0.01,
+      (sound, started_at))
+check("the line names the item's utterance", sound and "utterance=U9" in sound[0], sound)
+engine_common._debug = None
+
 report()

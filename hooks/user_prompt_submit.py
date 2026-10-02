@@ -29,13 +29,16 @@ def main():
 
     cwd = payload.get("cwd")
     session = payload.get("session_id")
-    narrator.repin(session, cwd)  # this turn's project, whatever it cds to
+    # This turn's project, whatever it cds to; the old one when it moved.
+    previous = narrator.repin(session, cwd)
     level = get_interaction_level(cwd)
 
     if level == "narrator":
         if narrator.headless():
             return
         if narrator.is_users_prompt(payload.get("prompt")):
+            if previous:
+                narrator.abandon(previous, session)  # the old turn, in its own project
             narrator.cutover(cwd, session, ttl=lease.FALLBACK_LEASE_TTL)
         elif narrator.narrates(cwd):
             # A background task's turn: warm the engine, cut nothing off.
@@ -46,6 +49,8 @@ def main():
     # change would otherwise be drained later and speak an abandoned turn.
     # With no session id we cannot tell which items are ours.
     dropped = clear(session=session, cwd=cwd) if session else 0
+    if previous and session:
+        clear(session=session, cwd=previous)  # the old turn's queue, in its own project
     _log("cutover", "dropped=%d pending items on a new prompt" % dropped, cwd)
     if level == "silent":
         return

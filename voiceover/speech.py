@@ -3,7 +3,7 @@
 speak() gates on settings, truncates, honors the TTS lock, then spawns the
 resolved engine as a DETACHED subprocess (never waits):
 
-    kokoro       -> uv run --project <plugin>/tts <plugin>/tts/kokoro_voice.py <voice> <text>
+    kokoro       -> uv run --project <plugin>/tts <plugin>/tts/kokoro_voice.py --voice <voice> --stream <text>
     macos-female -> python3 <plugin>/tts/macos_say.py --voice Samantha <text>
     macos-male   -> python3 <plugin>/tts/macos_say.py --voice Daniel <text>
     none         -> no-op

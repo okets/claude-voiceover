@@ -350,4 +350,41 @@ narrator.unpin("S1")
 lease.release(None, "S1")
 lease.release(str(elsewhere), "S1")
 
+# --- the user's prompt stops the old turn even after the session moved project -------------
+other = temp_dir("vo-moved-")
+(other / ".git").mkdir()
+spool.clear()
+run_hook("user_prompt_submit", {"cwd": str(REPO_ROOT), "session_id": "S1", "prompt": "go"})
+spool.enqueue("Old turn, still talking.", "kokoro", "bf_emma", session="S1", cwd=str(REPO_ROOT))
+check("a cd within the same project is no move",
+      narrator.repin("S1", str(REPO_ROOT / "tests")) is None)
+narrator.pin_cwd("S1", str(REPO_ROOT))
+spool.enqueue("Old turn, still talking.", "kokoro", "bf_emma", session="S1", cwd=str(REPO_ROOT))
+old_stop = spool.queue_dir(cwd=str(REPO_ROOT)).parent / "stop" / "S1.json"
+if old_stop.exists():
+    old_stop.unlink()
+run_hook("user_prompt_submit", {"cwd": str(other), "session_id": "S1", "prompt": "new question"})
+check("a prompt from another project drops the old project's pending items",
+      spool.pending_count(cwd=str(REPO_ROOT)) == 0, spool.pending_count(cwd=str(REPO_ROOT)))
+check("and files the stop request in the old project too", old_stop.exists())
+narrator.unpin("S1")
+lease.release(None, "S1")
+lease.release(str(other), "S1")
+
+# --- a narrator-level stop always lets the engine go ---------------------------------------
+lease.hold(None, "S1")
+run_hook("stop", {"cwd": str(REPO_ROOT), "session_id": "S1"})
+check("a stop with no transcript path still releases the engine", not lease_held())
+lease.hold(None, "S1")
+run_hook("stop", {"cwd": str(REPO_ROOT), "transcript_path": str(transcripts / "missing.jsonl"),
+                  "session_id": "S1"})
+check("a stop whose transcript cannot be read still releases the engine", not lease_held())
+
+# --- tool hooks never hold an engine for a project that does not narrate ----------------------
+set_setting("tts_enabled", False)
+for hook_name in ("pre_tool_use", "post_tool_use"):
+    run_hook(hook_name, dict(base, tool_name="Bash", tool_input={}, tool_response={}))
+    check(hook_name + " holds no lease while TTS is off", not lease_held())
+set_setting("tts_enabled", True)
+
 report()

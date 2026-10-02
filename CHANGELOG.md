@@ -27,6 +27,13 @@ new SessionEnd hook only registers after a restart.
   queue and voice.
 - The one-shot interrupt only matches the one-shot speaker's processes.
 - The machine-wide 1.3 queue directory is removed.
+- Settings written with `/voiceover:voice ... --project` (or
+  `/voiceover:level ... --project`) in a repo with no `.claude` of its own
+  went to `~/.claude/voiceover.json` and applied to every such repo. 1.4 no
+  longer reads that file as a project setting: move them into the repo's own
+  `.claude/voiceover.json`, or into the global settings.
+- Windows: the dead-engine takeover works on macOS and Linux. On Windows a
+  crashed engine's project waits for its lock to expire (up to 60s).
 - `tts_controller.py stop` stops every project's engine and clears every
   project's state.
 

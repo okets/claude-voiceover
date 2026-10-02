@@ -14,7 +14,7 @@ import time
 
 from . import lease, spool
 from .debuglog import log as _log
-from .projects import session_slug
+from .projects import project_key, session_slug
 from .settings import data_dir, get_interaction_level, is_tts_enabled, resolve_engine
 from .speech import enqueue_speech, ensure_drainer, play_sound, prewarm, request_stop
 from .templates import blocking_dialog_message
@@ -91,15 +91,22 @@ def pin_cwd(session, cwd) -> None:
         _write_record("pins", session, str(cwd))
 
 
-def repin(session, cwd) -> None:
+def repin(session, cwd):
     """A prompt starts a turn in cwd's project: let go of any lease the
-    session still holds under a previously pinned cwd (an interrupted turn
+    session still holds in a previously pinned project (an interrupted turn
     never reached Stop), then pin cwd. Every prompt re-pins, at every level,
-    so a stale pin never decides another project's narration."""
+    so a stale pin never decides another project's narration.
+
+    Returns the previously pinned cwd when its PROJECT differs from cwd's -
+    the caller then abandons the old turn there too - else None. A cd into
+    a subdirectory of the same project moves nothing."""
     previous = pinned_cwd(session, None)
-    if previous and previous != cwd:
+    moved = None
+    if previous and project_key(previous) != project_key(cwd):
         lease.release(previous, session)
+        moved = previous
     pin_cwd(session, cwd)
+    return moved
 
 
 def pinned_cwd(session, cwd):
@@ -118,19 +125,25 @@ def is_users_prompt(prompt_text) -> bool:
 
 # --- the actions -----------------------------------------------------------------
 
+def abandon(cwd, session) -> int:
+    """Drop this session's pending text in cwd's project and ask its engine
+    to stop the sentence mid-word. Clear before stop, so the engine cannot
+    claim one more item of the abandoned turn in between. Without a session
+    id nothing is cleared or stopped - an unscoped clear or stop would cut
+    other sessions off. Returns how many pending items were dropped."""
+    if not session:
+        return 0
+    dropped = spool.clear(session=session, cwd=cwd)
+    _log("cutover", "dropped=%d pending items on a new prompt" % dropped, cwd)
+    request_stop(cwd, session)
+    return dropped
+
+
 def cutover(cwd, session, ttl=lease.LEASE_TTL) -> None:
     """The user's own new prompt: drop this session's pending text, stop its
-    sentence mid-word, and warm the engine for the reply.
-
-    Clear before stop, so the engine cannot claim one more item of the
-    abandoned turn in between. No process is killed: the engine stays loaded
-    and the reply starts warm. Without a session id nothing is cleared or
-    stopped - an unscoped clear or stop would cut other sessions off.
-    """
-    if session:
-        dropped = spool.clear(session=session, cwd=cwd)
-        _log("cutover", "dropped=%d pending items on a new prompt" % dropped, cwd)
-        request_stop(cwd, session)
+    sentence mid-word, and warm the engine for the reply. No process is
+    killed: the engine stays loaded and the reply starts warm."""
+    abandon(cwd, session)
     if narrates(cwd):
         prewarm(cwd, session, ttl=ttl)
 

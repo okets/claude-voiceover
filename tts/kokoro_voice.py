@@ -3,7 +3,7 @@
 Kokoro TTS engine for the claude-voiceover plugin.
 
 Spawned detached by voiceover/speech.py as:
-    uv run --project <plugin>/tts <plugin>/tts/kokoro_voice.py <voice_id> <text>
+    uv run --project <plugin>/tts <plugin>/tts/kokoro_voice.py --voice <voice_id> --stream <text>
 
 Direct usage:
     kokoro_voice.py '<text>' [--voice VOICE] [--stream]
@@ -44,6 +44,7 @@ VOICES_URL = (
 )
 
 DEFAULT_VOICE = "am_echo"
+PLAYBACK_GRACE_SECONDS = 10  # a clip's player may run this much past its length
 DEFAULT_SAMPLE_RATE = 24000  # Kokoro default
 DEFAULT_VOICE_SETTINGS = {"speed": 1.0, "lang": "en-us", "trim": True}
 
@@ -282,6 +283,9 @@ class WinsoundPlayback(Playback):
     no player process can outlive the engine. Done once the clip's length
     has passed."""
 
+    def started(self) -> bool:
+        return True
+
     def __init__(self, path, duration):
         import winsound
 
@@ -315,7 +319,7 @@ def play_file(path, duration):
         return WinsoundPlayback(path, duration)
     process = subprocess.Popen(playback_command(str(path)),
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return ProcessPlayback(process, cleanup=path)
+    return ProcessPlayback(process, cleanup=path, deadline=duration + PLAYBACK_GRACE_SECONDS)
 
 
 class KokoroPlayback(Playback):
@@ -331,6 +335,9 @@ class KokoroPlayback(Playback):
         self._speaker, self._future, self._path = speaker, future, path
         self._voice, self._upcoming = voice, upcoming
         self._player = None
+
+    def started(self) -> bool:
+        return self._player is not None
 
     def poll(self) -> bool:
         if self._player is None:
@@ -385,6 +392,8 @@ class KokoroSpeaker:
     def begin(self, sentence, voice, upcoming=None):
         voice = voice or DEFAULT_VOICE
         future = self._ahead.pop((sentence, voice), None) or self._render(sentence, voice)
+        for abandoned in self._ahead.values():
+            abandoned.cancel()  # a queued render never occupies the worker
         self._ahead.clear()  # anything else rendered ahead belongs to an abandoned item
         self._count += 1
         path = self._play_dir / ("%d-%d.wav" % (os.getpid(), self._count))
@@ -445,7 +454,8 @@ def parse_args(argv):
         return None
     first = normalize_voice(argv[0])
     if first in VOICE_SETTINGS:
-        # Hook call: kokoro_voice.py <voice_id> <text...>  (standard synthesis)
+        # Legacy bare form, kept working but no longer documented or spawned:
+        # kokoro_voice.py <voice_id> <text...>  (standard synthesis)
         return first, " ".join(argv[1:]).strip(), False
     # Direct call: kokoro_voice.py <text...> [--voice VOICE] [--stream]
     voice = DEFAULT_VOICE
@@ -469,8 +479,7 @@ def parse_args(argv):
 def print_usage():
     log("Kokoro TTS Voice Engine")
     log("Usage:")
-    log("  Hook call:   kokoro_voice.py <voice_id> <text>")
-    log("  Direct call: kokoro_voice.py '<text>' [--voice VOICE] [--stream]")
+    log("  kokoro_voice.py '<text>' [--voice VOICE] [--stream]")
     log("")
     log("Available voices:")
     for voice_id in VOICE_SETTINGS:

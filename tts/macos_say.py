@@ -87,7 +87,7 @@ class SaySpeaker:
             process.stdin.close()
         except OSError:
             pass
-        return ProcessPlayback(process)
+        return ProcessPlayback(process, deadline=estimate_duration(sentence) + 10)
 
 
 def main():
