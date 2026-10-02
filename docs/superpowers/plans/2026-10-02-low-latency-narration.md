@@ -2,24 +2,24 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Cut mid-turn narration lag from a median 7.3s / p90 23s to ≤ 2.5s / ≤ 8s by giving every project its own queue, voice and turn-scoped engine, preempting at sentence boundaries, and capturing Claude's text as it streams through a Claude Code mod.
+**Goal:** Cut mid-turn narration lag from a median 7.3s / p90 23s to ≤ 2.5s / ≤ 8s by giving every project its own queue, voice and turn-scoped engine, preempting at sentence boundaries, prefetching the next sentence, and capturing Claude's text as it streams through a Claude Code mod.
 
-**Architecture:** The Python hook layer keeps all narration policy. A new per-project directory (`data_dir()/projects/<key>/`) holds that project's queue, engine lock, leases and stop requests. The drainer engine plays one sentence at a time, applies the jump-to-newest rule between sentences, and stays loaded only while a session holds a lease. A thin TypeScript mod taps `turn.step` text chunks, cuts them into sentences and hands them to `hooks/mod_bridge.py`; the classic hooks stand down for sessions the mod has marked, and remain the fallback.
+**Architecture:** The Python hook layer keeps all narration policy. A per-project directory (`data_dir()/projects/<key>/`) holds that project's queue, engine lock, leases and stop requests. The drainer engine plays one sentence at a time, synthesizes the next one while the current one plays, applies the jump-to-newest rule between sentences, and stays loaded only while a session holds a lease. A thin TypeScript mod (declared in its own `hooks/mod.json`) taps `turn.step` text chunks, cuts them into sentences and hands them to `hooks/mod_bridge.py`; the classic hooks stand down for sessions the bridge has marked, and remain the fallback.
 
 **Tech Stack:** Python 3.9+ stdlib (hook layer, `tts/engine_common.py`), kokoro-onnx in the `tts/` uv venv, macOS `say`, TypeScript ES modules against the Claude Code 2.1.287 function-hooks API (`claude-code`, `claude-code/testing`).
 
-**Spec:** `docs/superpowers/specs/2026-10-02-low-latency-narration-design.md` (read it first; it carries the measurements and the user's decisions). It builds on `docs/superpowers/specs/2026-09-10-narration-queue-design.md`.
+**Spec:** `docs/superpowers/specs/2026-10-02-low-latency-narration-design.md` (read it first: it carries the measurements, the user's decisions, the review-round defaults, and §12, the adversarial findings this plan answers). It builds on `docs/superpowers/specs/2026-09-10-narration-queue-design.md`.
 
 ## Global Constraints
 
 - Branch: `feature/low-latency-narration` (already created, based on `fix/completion-no-parrot`).
 - Hook layer (`hooks/*.py`, `voiceover/*.py`) imports only the Python standard library; Python ≥ 3.9.
-- Engines (`tts/*.py`) never import `voiceover/`; `tts/engine_common.py` is stdlib only.
+- Engines (`tts/*.py`) never import `voiceover/`; `tts/engine_common.py` is stdlib only. Where the two sides share a rule (a session's file name), each side carries it and its docstring names the other.
 - Every hook and `hooks/mod_bridge.py` always exits 0. Hooks print nothing to stdout. The bridge prints exactly one JSON line.
 - Never write into a user's project, except the user-run `/voiceover:voice <name> --project` (existing behaviour).
-- Tests: the stdlib harness in `tests/_harness.py`, run by `bash tests/run_all.sh`; every test runs under `VOICEOVER_DATA_DIR` (a temp dir) and `VOICEOVER_DRY_RUN=1`; from Task 4 on also `VOICEOVER_NO_SPAWN=1`. Never run anything that plays audio or touches `~/.claude-voiceover`.
+- Tests: the stdlib harness in `tests/_harness.py`, run by `bash tests/run_all.sh`; every test runs under `VOICEOVER_DATA_DIR` (a temp dir) and `VOICEOVER_DRY_RUN=1`; from Task 4 on also `VOICEOVER_NO_SPAWN=1`. Never run anything that plays audio, kills a process by pattern, or touches `~/.claude-voiceover`.
 - Mod tests: `claude plugin test .` from the repo root; validation: `claude plugin validate .`.
-- Constants, verbatim from the spec: `QUEUE_MAX_AGE_SECONDS = 300`; `LEASE_TTL = 600.0`; `POLL_SECONDS = 0.05`; drainer lock expiry 60s, refreshed once half of it has passed; bridge `timeoutMs: 5000`; project key = `sha1(str(resolved project root))[:12]`.
+- Constants, verbatim from the spec: `QUEUE_MAX_AGE_SECONDS = 300`; `LEASE_TTL = 600.0`; `FALLBACK_LEASE_TTL = 120.0`; `POLL_SECONDS = 0.05`; `MAX_ENGINES = 2`; spawn backoff 3s; drainer lock expiry 60s, refreshed once half of it has passed; bridge `timeoutMs: 5000`; project key = `sha1(str(resolved project root))[:12]`; session file names: `[^A-Za-z0-9_-]` → `_`, no session → `_all`; the user's own prompt origins: `composer`, `bridge`, `sdk`.
 - Target version: 1.4.0.
 - macOS `sed -i ''` syntax is used in mechanical edit steps (this machine is macOS).
 - Every commit message ends with:
@@ -27,11 +27,11 @@
 
 ## Review Focus
 
-1. **A project with no `.claude` of its own, under a home directory that has `~/.claude`** — it must resolve to its own git root, not to home (today it resolves to home: measured). Pinned by Task 1's tests.
-2. **Two engines' items in one project's queue** (the user switched `tts_engine` mid-session) — the jump rule must neither drop nor be blocked by another engine's items. Pinned by Task 3 ("foreign items").
-3. **A session id that changes mid-session** (`/clear` starts a new transcript with no `session.start`) — the mod must still mark the new session so the classic hooks stand down instead of narrating twice. Pinned by Task 7 ("prompt marks the session").
-4. **A very long message** (2,700 characters, ~140s of speech) — the drainer's 60s lock must stay live through every sentence so no second engine starts beside it. Pinned by Task 3 ("long message keeps the lock").
-5. **A prompt submitted while Kokoro is mid-synthesis** — the stop must still land as soon as synthesis returns, not after the sentence plays. Pinned by Task 3 (Kokoro "stop during synthesis").
+1. **A project with no `.claude` of its own, under a home directory that has `~/.claude`** — it must resolve to its own git root (today: home). Pinned by Task 1.
+2. **A session whose working directory moves mid-turn** (`cd` into another repo) — its lease, queue and voice must stay with the project the turn started in. Pinned by Task 5 ("the pin survives a cd").
+3. **A session id that changes mid-process** (`/clear`, a resume; no `session.start` fires) — the new id must be marked by its first bridge op, so the classic hooks stand down instead of narrating twice. Pinned by Task 7 ("any op marks") and Task 9 ("/clear").
+4. **A background task's notification arriving while Claude speaks** — it must not cut the sentence or drop the queue. Pinned by Task 5 (fallback) and Task 9 (origin).
+5. **An engine killed mid-sentence** (out of memory, or a still-running 1.3 session's interrupt during rollout) — its project must not stay silent until the lock expires. Pinned by Task 3 ("a dead engine's lock is taken over") and Task 4 (`ensure_drainer` on a dead owner).
 
 ---
 
@@ -44,7 +44,7 @@ This task runs in the MAIN session, not a subagent: it needs the user to answer 
 
 - [ ] **Step 1: Load the plugin-authoring skill**
 
-Invoke the `plugin-authoring` skill. Its text names this session's dev-mods folder (`/Users/hanan/.claude/dev-mods/<session id>`) and the types file path. Use them below as `<dev-mods folder>` and `<TYPES>`. Let `<SCRATCH>` be this session's scratchpad directory.
+Invoke the `plugin-authoring` skill. Its text names this session's dev-mods folder and the types file path; use them below as `<dev-mods folder>` and `<TYPES>`. Let `<SCRATCH>` be this session's scratchpad directory.
 
 - [ ] **Step 2: Write the probe**
 
@@ -72,13 +72,23 @@ const note = (event: string, data: Record<string, unknown> = {}): void => {
 }
 
 export const register: Register = on => {
+  on('session.start', async ($, e, next) => {
+    note('session.start', { surface: e.surface, isInteractive: e.isInteractive })
+    return next(e)
+  })
+
   on('prompt.submit', ($, e, next) => {
-    note('prompt.submit')
+    note('prompt.submit', { origin: e.origin?.kind ?? null })
     // Fire-and-forget: does a $.process.run outlive the hook that started it?
     void $.process
       .run(['/bin/sh', '-c', `date +%s > "${OUT}.fire"`])
       .then(() => note('fire-and-forget resolved'))
       .catch(error => note('fire-and-forget failed', { error: String(error) }))
+    return next(e)
+  })
+
+  on('turn.start', async ($, e, next) => {
+    note('turn.start', { turnId: e.turnId })
     return next(e)
   })
 
@@ -116,7 +126,7 @@ export const register: Register = on => {
 - [ ] **Step 3: Validate it**
 
 Run: `claude plugin validate "<dev-mods folder>/vo-probe"`
-Expected: `✔ Validation passed` listing hooks `prompt.submit, turn.step, turn.complete`.
+Expected: `✔ Validation passed`, listing hooks `session.start, prompt.submit, turn.start, turn.step, turn.complete`.
 
 - [ ] **Step 4: Ask the user to enable hot reloading, then end the turn**
 
@@ -132,16 +142,17 @@ Run:
 cat "<SCRATCH>/vo-probe.jsonl"; ls -la "<SCRATCH>/vo-probe.jsonl.fire"
 ```
 
-Then compare with the transcript (`~/.claude/projects/<project>/<session id>.jsonl`): for the paragraphs' text block, find its assistant row timestamp.
+Compare with the transcript (`~/.claude/projects/<project>/<session id>.jsonl`): find the paragraphs' text block's assistant row timestamp.
 
 Pass criteria — ALL must hold:
 1. Several `text` notes for that block, spread over ≥ 0.2s, the first one earlier than the transcript row's timestamp.
-2. `vo-probe.jsonl.fire` exists and `fire-and-forget resolved` was noted (a `$.process.run` started and not awaited completes after its hook returned).
+2. `vo-probe.jsonl.fire` exists and `fire-and-forget resolved` was noted.
 3. `session` equals the transcript file's name (without `.jsonl`).
 4. The subagent's `step.start` / `turn.complete` notes carry a non-null `agentId`.
-5. This ran in the VS Code extension session (the user's main surface).
+5. In this VS Code session, `session.start`'s `surface` is not null, and the user's prompt's `origin` is one of `composer`, `bridge`, `sdk`.
+6. `turn.start` is noted before the first `step.start`.
 
-If 1 or 2 fails, STOP and report to the user: the mod's fire-and-forget bridge design (Task 9) does not hold and needs redesign. If 3–5 fail, report which and stop.
+If 1 or 2 fails, STOP and report to the user: the fire-and-forget bridge (Task 9) does not hold. If 5 fails, STOP and report: the headless rule or the cutover origins (spec §8) must change before Task 9. If 3, 4 or 6 fails, report which and stop.
 
 - [ ] **Step 6: Remove the probe**
 
@@ -164,6 +175,7 @@ rm -rf "<dev-mods folder>/vo-probe" "<SCRATCH>/vo-probe.jsonl" "<SCRATCH>/vo-pro
   - `projects.project_root(cwd=None) -> Path` — resolved project root
   - `projects.project_key(cwd=None) -> str` — 12 lowercase hex chars
   - `projects.project_dir(cwd=None) -> Path` — `data_dir()/projects/<key>/`, created, with `root.txt`
+  - `projects.session_slug(session) -> str | None` — `[^A-Za-z0-9_-]` → `_`; `None`/`""` → `None`
   - `detect_project_root` never returns the home directory because of `~/.claude`
 
 - [ ] **Step 1: Write the failing test**
@@ -225,13 +237,21 @@ check("root.txt names the resolved project root",
       (a / "root.txt").read_text().strip() == str(git_project.resolve()),
       (a / "root.txt").read_text())
 
+# --- session file names ------------------------------------------------------
+check("a session id keeps its safe characters",
+      projects.session_slug("e0e70ee4-5f95_X") == "e0e70ee4-5f95_X")
+check("anything else becomes an underscore",
+      projects.session_slug("../a b") == "___a_b", projects.session_slug("../a b"))
+check("no session has no slug",
+      projects.session_slug(None) is None and projects.session_slug("") is None)
+
 report()
 ```
 
 - [ ] **Step 2: Run it to verify it fails**
 
 Run: `python3 tests/test_projects.py`
-Expected: FAIL with `ModuleNotFoundError: No module named 'voiceover.projects'` (import error before any check).
+Expected: FAIL with `ModuleNotFoundError: No module named 'voiceover.projects'`.
 
 - [ ] **Step 3: Fix `_search_up_for` in `voiceover/settings.py`**
 
@@ -277,12 +297,14 @@ and never compute a key themselves. Stdlib only.
 """
 
 import hashlib
+import re
 from pathlib import Path
 
 from .settings import data_dir, detect_project_root
 
 _PROJECTS_DIR_NAME = "projects"
 _ROOT_FILE_NAME = "root.txt"
+_UNSAFE = re.compile(r"[^A-Za-z0-9_-]")
 
 
 def project_root(cwd=None) -> Path:
@@ -313,6 +335,16 @@ def project_dir(cwd=None) -> Path:
     return directory
 
 
+def session_slug(session):
+    """A session id made safe for a file name, or None for no session.
+
+    Names every per-session state file (leases, stop requests, markers).
+    tts/engine_common.py applies the same rule to the stop files it reads.
+    """
+    slug = _UNSAFE.sub("_", str(session or ""))
+    return slug or None
+
+
 def _key_for(root: Path) -> str:
     return hashlib.sha1(str(root).encode("utf-8")).hexdigest()[:12]
 ```
@@ -320,7 +352,7 @@ def _key_for(root: Path) -> str:
 - [ ] **Step 5: Run the test to verify it passes**
 
 Run: `python3 tests/test_projects.py`
-Expected: `10/10 checks passed in test_projects.py`
+Expected: `13/13 checks passed in test_projects.py`
 
 - [ ] **Step 6: Run the whole suite**
 
@@ -426,8 +458,9 @@ observes a half-written item.
 Items: {"text", "engine", "voice", "created", "session", "utterance",
 "sticky", "shown"}. Items sharing an "utterance" are one message: the engine
 plays a message's items in order and lets a newer message preempt it at a
-sentence boundary. "sticky" items (dialog alerts) are never skipped.
-"shown" is when the text appeared on screen, for latency logging, or None.
+sentence boundary. "sticky" items (dialog alerts, permission requests) are
+never skipped and play whole. "shown" is when the text appeared on screen,
+for latency logging, or None.
 
 This module is the WRITE half, used by the stdlib hook layer. Engines cannot
 import voiceover/, so they carry the read half in tts/engine_common.py; the
@@ -610,7 +643,7 @@ Expected: all checks pass (the existing checks use the process cwd's project, wh
 
 - [ ] **Step 5: Thread `root` through `tts/engine_common.py`**
 
-In `tts/engine_common.py`, replace everything from `def tts_lock_path():` down to (but not including) `# --- the drain loop` with the code below, and update the module docstring's second paragraph to say every helper takes `root`, the directory its state lives in: a project's directory for a drainer, `data_dir()` for the one-shot speaker's lock.
+In `tts/engine_common.py`, replace everything from `def tts_lock_path():` down to (but not including) `# --- the drain loop` with the code below, and update the module docstring's second paragraph: every helper takes `root`, the directory its state lives in — a project's directory for a drainer, `data_dir()` for the one-shot speaker's lock.
 
 ```python
 def drain_root(argv):
@@ -738,7 +771,7 @@ In `tts/kokoro_voice.py`:
 - in `_speak_whole_keeping_lock` add a fourth parameter `root` and call `update_lock_expiry(root, duration + 20.0)`;
 - in `speak_streaming` call `stream_chunks(kokoro, text, voice, data_dir())` and `remove_tts_lock(data_dir())`;
 - in `speak_text` call `try_claim_lock(data_dir(), 10.0 + 0.4 * len(text.split()))` and `remove_tts_lock(data_dir())`;
-- in `main()`'s `--drain` branch, first resolve the root and pass it everywhere:
+- in `main()`'s `--drain` branch, resolve the root first:
 
 ```python
     if "--drain" in sys.argv[1:]:
@@ -750,7 +783,7 @@ In `tts/kokoro_voice.py`:
             return 0
 ```
 
-then `return drain(root, speak_one, {"kokoro"})` in the dry-run case, `update_lock_expiry(root, 10.0 + 0.4 * len(text.split()))`, `stream_chunks(kokoro, text, voice, root)`, `_speak_whole_keeping_lock(kokoro, text, voice, root)` in `speak_one`, and `return drain(root, speak_one, {"kokoro"}, prepare=prepare)`.
+then `return drain(root, speak_one, {"kokoro"})` in the dry-run case; in `speak_one` call `update_lock_expiry(root, 10.0 + 0.4 * len(text.split()))`, `stream_chunks(kokoro, text, voice, root)` and `_speak_whole_keeping_lock(kokoro, text, voice, root)`; finish with `return drain(root, speak_one, {"kokoro"}, prepare=prepare)`.
 
 In `tts/macos_say.py`:
 - change the import to `from engine_common import data_dir, remove_tts_lock, try_claim_lock, update_lock_expiry`;
@@ -935,36 +968,36 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ---
 
-### Task 3: The engine plays sentences: jump rule, stop requests, speakers
+### Task 3: The engine plays sentences: jump rule, stop requests, prefetch, speakers
 
 **Files:**
-- Modify: `tts/engine_common.py` (new drain loop and helpers)
+- Modify: `tts/engine_common.py` (new drain loop and helpers; dead-pid locks)
 - Modify: `tts/macos_say.py` (`SaySpeaker`, `--drain` wiring)
-- Modify: `tts/kokoro_voice.py` (`playback_command`, `KokoroSpeaker`, `--drain` wiring; delete `_speak_whole_keeping_lock`, `_play_samples_keeping_lock`)
+- Modify: `tts/kokoro_voice.py` (`playback_command`, `play_file`, `WinsoundPlayback`, `KokoroSpeaker`, `--drain` wiring; delete `_speak_whole_keeping_lock`, `_play_samples_keeping_lock`; one-shot temp wavs prefixed `voiceover-oneshot-`)
 - Modify: `voiceover/speech.py` (`request_stop`)
-- Test: `tests/test_jump_rule.py` (new), `tests/test_kokoro_drain.py` (rewritten), `tests/test_drain.py` (updated)
+- Test: `tests/test_jump_rule.py` (new), `tests/test_kokoro_drain.py` (rewritten), `tests/test_drain.py`, `tests/test_engine_common.py`
 
 **Interfaces:**
-- Consumes: Task 2's root-parameterized helpers; `spool.enqueue(..., utterance=, sticky=)`
+- Consumes: Task 2's root-parameterized helpers; `spool.enqueue(..., utterance=, sticky=)`; `projects.session_slug`
 - Produces:
   - `engine_common.POLL_SECONDS = 0.05`
   - `engine_common.split_sentences(text) -> list[str]`
-  - `engine_common.drop_superseded(root, engine_names=None) -> int`, `next_item(root, engine_names=None) -> (item, taken_path)`, `newer_utterance_pending(root, utterance, engine_names=None) -> bool`
-  - `engine_common.stop_request(root) -> dict | None` (reads `root/stop.json`)
-  - `engine_common.Playback` (`poll() -> bool`, `kill() -> None`), `ProcessPlayback(process, cleanup=None)`, `DryRunSpeaker` (`begin(sentence, voice, upcoming=None) -> Playback`)
+  - `engine_common.drop_superseded(root, engine_names=None) -> int`, `next_item(root, engine_names=None) -> (item, taken_path)`, `peek_next(root, engine_names=None) -> dict | None`, `newer_utterance_pending(root, utterance, engine_names=None) -> bool`
+  - `engine_common.stop_requested(root, item) -> bool` — reads `root/stop/<slug>.json` and `root/stop/_all.json`; true when a request's `ts` is newer than `item["created"]`
+  - `engine_common.Playback` (`poll() -> bool`, `kill() -> None`), `ProcessPlayback(process, cleanup=None)`, `DryRunSpeaker`. Speaker protocol: `begin(sentence, voice, upcoming=None) -> Playback`, `prefetch(sentence, voice) -> None`
   - `engine_common.engine_log(tag, message) -> None` (same line format as `voiceover/debuglog.py`, gated on the global `debug_log` setting)
-  - `engine_common.drain(root, open_speaker, engine_names, lock_seconds=60.0, poll_seconds=POLL_SECONDS) -> int` — `open_speaker()` runs after the lock is claimed and returns a speaker or a falsy value
-  - `speech.request_stop(cwd=None, session=None) -> None` writes `project_dir(cwd)/stop.json` `{"ts": float, "session": str | None}`
-  - `macos_say.SaySpeaker`, `kokoro_voice.playback_command(path) -> list`, `kokoro_voice.KokoroSpeaker(kokoro, play_dir)`
+  - `engine_common.drain(root, open_speaker, engine_names, lock_seconds=60.0, poll_seconds=POLL_SECONDS) -> int` — `open_speaker()` runs after the lock is claimed
+  - `engine_common.lock_is_live(root)` and `try_claim_lock` treat a lock whose pid is dead as stale (POSIX; Windows answers "alive")
+  - `speech.request_stop(cwd=None, session=None) -> None` writes `project_dir(cwd)/stop/<slug or _all>.json` `{"ts": float}`
+  - `macos_say.SaySpeaker`; `kokoro_voice.playback_command(path)`, `play_file(path, duration) -> Playback`, `WinsoundPlayback(path, duration)`, `KokoroSpeaker(kokoro, play_dir)` with `warm_up()`, `prefetch()`, `begin()`
 
 - [ ] **Step 1: Write the failing jump-rule test**
 
 Create `tests/test_jump_rule.py`:
 
 ```python
-"""The engine loop: sentences, the jump rule, sticky alerts, stop requests."""
+"""The engine loop: sentences, the jump rule, sticky items, stops, prefetch."""
 
-import json
 import sys
 import time
 from pathlib import Path
@@ -983,12 +1016,15 @@ OWN = {"kokoro"}
 
 
 class Recorder:
-    """Records sentences; each plays for `polls` polls. on_begin(sentence)
-    may act mid-drain: enqueue a newer message, request a stop."""
+    """Records sentences and prefetches; each sentence plays for `polls`
+    polls. on_begin(sentence) may act mid-drain: enqueue, request a stop."""
 
     def __init__(self, polls=0, on_begin=None):
-        self.spoken, self.killed = [], []
+        self.spoken, self.killed, self.prefetched = [], [], []
         self._polls, self._on_begin = polls, on_begin
+
+    def prefetch(self, sentence, voice):
+        self.prefetched.append(sentence)
 
     def begin(self, sentence, voice, upcoming=None):
         self.spoken.append(sentence)
@@ -1047,20 +1083,13 @@ check("the skipped items are gone", spool.pending_count() == 0, spool.pending_co
 # --- a newer message arriving mid-item preempts at the sentence boundary -------
 spool.clear()
 put("One. Two. Three.", utterance="A")
-
-
-def news_arrives(sentence):
-    if sentence == "One.":
-        put("Fresh news.", utterance="B")
-
-
-speaker = Recorder(polls=3, on_begin=news_arrives)
+speaker = Recorder(polls=3, on_begin=lambda s: s == "One." and put("Fresh news.", utterance="B"))
 run(speaker)
 check("the current sentence finishes, the rest of its message is dropped",
       speaker.spoken == ["One.", "Fresh news."], speaker.spoken)
 check("nothing was cut mid-sentence", speaker.killed == [], speaker.killed)
 
-# --- sticky alerts are never skipped -------------------------------------------
+# --- sticky items survive the jump and play whole --------------------------------
 spool.clear()
 put("Lead-in.", utterance="A")
 put("I need your input.", utterance="D", sticky=True)
@@ -1069,6 +1098,13 @@ speaker = Recorder()
 run(speaker)
 check("a sticky alert plays before the newest message",
       speaker.spoken == ["I need your input.", "Later text."], speaker.spoken)
+spool.clear()
+put("I need your input. Which approach? Options: A, B.", utterance="D", sticky=True)
+speaker = Recorder(polls=2, on_begin=lambda s: s == "I need your input." and put("Newer.", utterance="F"))
+run(speaker)
+check("a sticky alert is not cut by a newer message",
+      speaker.spoken == ["I need your input.", "Which approach?", "Options: A, B.", "Newer."],
+      speaker.spoken)
 
 # --- two sessions in one project: newest wins ----------------------------------
 spool.clear()
@@ -1079,7 +1115,7 @@ run(speaker)
 check("the newest message wins across sessions",
       speaker.spoken == ["From session two."], speaker.spoken)
 
-# --- foreign items are neither dropped nor in the way (Review Focus 2) ----------
+# --- foreign items are neither dropped nor in the way ---------------------------
 spool.clear()
 put("Theirs.", utterance="X", engine="macos-female")
 put("Mine old.", utterance="A")
@@ -1090,47 +1126,57 @@ check("own items obey the jump rule", speaker.spoken == ["Mine new."], speaker.s
 check("a foreign item keeps its place", spool.pending_count() == 1, spool.pending_count())
 spool.clear()
 
-# --- a stop request for the item's session kills the sentence ------------------
+# --- stop requests -----------------------------------------------------------------
 put("Long one. Never heard.", utterance="A", session="S1")
-
-
-def stop_s1(sentence):
-    if sentence == "Long one.":
-        speech.request_stop(None, "S1")
-
-
-speaker = Recorder(polls=50, on_begin=stop_s1)
+speaker = Recorder(polls=50, on_begin=lambda s: s == "Long one." and speech.request_stop(None, "S1"))
 run(speaker)
-check("the playing sentence is killed", speaker.killed == ["Long one."], speaker.killed)
-check("the rest of the item is abandoned", speaker.spoken == ["Long one."], speaker.spoken)
+check("a stop for the item's session kills the playing sentence",
+      speaker.killed == ["Long one."], speaker.killed)
+check("and abandons the rest of the item", speaker.spoken == ["Long one."], speaker.spoken)
 
-# --- ... one for another session does not -----------------------------------
 spool.clear()
 put("Keep going. To the end.", utterance="A", session="S1")
-
-
-def stop_s2(sentence):
-    if sentence == "Keep going.":
-        speech.request_stop(None, "S2")
-
-
-speaker = Recorder(polls=5, on_begin=stop_s2)
+speaker = Recorder(polls=5, on_begin=lambda s: s == "Keep going." and speech.request_stop(None, "S2"))
 run(speaker)
 check("another session's stop leaves this item alone",
       speaker.spoken == ["Keep going.", "To the end."] and speaker.killed == [],
       (speaker.spoken, speaker.killed))
 
-# --- a stop request older than the engine is ignored ---------------------------
+spool.clear()
+put("Anyone's sentence.", utterance="A", session="S3")
+speaker = Recorder(polls=50, on_begin=lambda s: speech.request_stop(None, None))
+run(speaker)
+check("a stop naming no session stops any item", speaker.killed == ["Anyone's sentence."],
+      speaker.killed)
+
 spool.clear()
 speech.request_stop(None, "S1")
 time.sleep(0.01)
-put("Spoken despite an old stop.", utterance="A", session="S1")
+put("Queued after the stop.", utterance="A", session="S1")
 speaker = Recorder(polls=3)
 run(speaker)
-check("an old stop request is ignored",
-      speaker.spoken == ["Spoken despite an old stop."], speaker.spoken)
+check("a stop older than an item never stops it",
+      speaker.spoken == ["Queued after the stop."] and speaker.killed == [], speaker.spoken)
 
-# --- a long message keeps the lock live (Review Focus 4) -----------------------
+spool.clear()
+put("Queued before the stop.", utterance="A", session="S1")
+time.sleep(0.01)
+speech.request_stop(None, "S1")
+speaker = Recorder()
+run(speaker)
+check("an item queued before its session's stop is dropped unplayed",
+      speaker.spoken == [], speaker.spoken)
+
+# --- prefetch across items ------------------------------------------------------------
+spool.clear()
+put("Only one.", utterance="U")
+put("Next up. More.", utterance="U")
+speaker = Recorder(polls=3)
+run(speaker)
+check("on an item's last sentence the next item's first sentence is prefetched",
+      speaker.prefetched == ["Next up."], speaker.prefetched)
+
+# --- a long message keeps the lock live -------------------------------------------
 spool.clear()
 put("A. B. C. D.", utterance="A")
 alive = []
@@ -1138,12 +1184,6 @@ speaker = Recorder(polls=40, on_begin=lambda s: alive.append(engine_common.lock_
 run(speaker, lock_seconds=0.2, poll_seconds=0.005)
 check("the lock stays live through playback longer than its expiry",
       alive == [True, True, True, True], alive)
-
-# --- request_stop writes the contract file -------------------------------------
-speech.request_stop(None, "S9")
-stop = json.loads((ROOT / "stop.json").read_text())
-check("request_stop records the session and a fresh timestamp",
-      stop["session"] == "S9" and time.time() - stop["ts"] < 5, stop)
 
 report()
 ```
@@ -1153,12 +1193,68 @@ report()
 Run: `python3 tests/test_jump_rule.py`
 Expected: FAIL — `AttributeError: module 'engine_common' has no attribute 'split_sentences'`.
 
-- [ ] **Step 3: Write the new engine loop in `tts/engine_common.py`**
+- [ ] **Step 3: Dead-pid locks in `tts/engine_common.py`**
 
-Add `import re` and `import sys` to the imports, and add after `_TAKEN_SUFFIX = ".taken"`:
+Add `import re` and `import sys` to the imports. Add after `_parse_lock_expiry`:
 
 ```python
-_STOP_FILE_NAME = "stop.json"
+def _parse_lock_pid(raw):
+    try:
+        return int(json.loads(raw).get("pid"))
+    except Exception:
+        return None
+
+
+def _pid_alive(pid) -> bool:
+    """True unless pid is known to have exited.
+
+    Unknown answers are True: taking over a live engine's lock would put two
+    voices on the speaker. Windows always answers unknown - os.kill(pid, 0)
+    there would signal the process instead of probing it.
+    """
+    if pid is None or sys.platform == "win32":
+        return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+
+
+def _lock_held(raw) -> bool:
+    """True when a lock's content is unexpired AND its engine still runs."""
+    expiry = _parse_lock_expiry(raw)
+    if expiry is None or time.time() >= expiry:
+        return False
+    return _pid_alive(_parse_lock_pid(raw))
+```
+
+Change `lock_is_live(root)` to `return _lock_held(raw)` after reading `raw`, and update its docstring: "True while an unexpired lock held by a running engine exists." In `try_claim_lock`, replace the `FileExistsError` branch's expiry check with:
+
+```python
+            except FileExistsError:
+                try:
+                    raw = lock_file.read_text().strip()
+                except OSError:
+                    raw = ""
+                if _lock_held(raw):
+                    return False  # a live engine is speaking
+                try:
+                    lock_file.unlink()  # expired, or its engine has died
+                except OSError:
+                    return False
+```
+
+- [ ] **Step 4: Write the new engine loop in `tts/engine_common.py`**
+
+Add after `_TAKEN_SUFFIX = ".taken"`:
+
+```python
+_STOP_DIR_NAME = "stop"
+_ALL_SESSIONS = "_all"
+_UNSAFE = re.compile(r"[^A-Za-z0-9_-]")
 POLL_SECONDS = 0.05
 _SENTENCE_BREAK = re.compile(r"(?<=[.!?])\s+|\n+")
 _LOG_MAX_BYTES = 200_000
@@ -1200,7 +1296,7 @@ def engine_log(tag, message):
         pass
 
 
-# --- sentences, the jump rule, stop requests --------------------------------
+# --- sentences and the jump rule --------------------------------------------
 
 def split_sentences(text):
     """Text -> its sentences: split after . ! ? + whitespace and at newlines."""
@@ -1223,25 +1319,38 @@ def _owned(item, engine_names):
     return engine_names is None or not engine or engine in engine_names
 
 
-def drop_superseded(root, engine_names=None) -> int:
-    """The jump rule: finish unspoken every own item a newer message supersedes.
-
-    The newest pending own item's utterance is the message to speak; every
-    older own item of a different utterance is dropped unless it is sticky
-    (a dialog alert). Foreign items are not this engine's to judge and keep
-    their place. Returns how many items were dropped.
-    """
+def _own_pending(root, engine_names):
+    """(path, item) for this engine's readable pending items, oldest first."""
     own = []
     for path in sorted(queue_dir(root).glob("*.json")):
         item = _read_json(path)
         if item is not None and _owned(item, engine_names):
             own.append((path, item))
+    return own
+
+
+def _survives(item, newest):
+    """Whether the jump rule keeps item, given the newest own pending item."""
+    if item is newest or item.get("sticky"):
+        return True
+    utterance = newest.get("utterance")
+    return utterance is not None and item.get("utterance") == utterance
+
+
+def drop_superseded(root, engine_names=None) -> int:
+    """The jump rule: finish unspoken every own item a newer message supersedes.
+
+    The newest own pending item's message is the one to speak; every older
+    own item of another message is dropped unless it is sticky. Foreign items
+    are not this engine's to judge and keep their place. Returns how many.
+    """
+    own = _own_pending(root, engine_names)
     if len(own) < 2:
         return 0
-    newest = own[-1][1].get("utterance")
+    newest = own[-1][1]
     dropped = 0
     for path, item in own[:-1]:
-        if item.get("sticky") or (newest is not None and item.get("utterance") == newest):
+        if _survives(item, newest):
             continue
         try:
             path.unlink()
@@ -1259,20 +1368,54 @@ def next_item(root, engine_names=None):
     return take_oldest(root, engine_names)
 
 
+def peek_next(root, engine_names=None):
+    """The item next_item() would play, read WITHOUT claiming it.
+
+    Never claim ahead: a .taken item is invisible to spool.clear() and would
+    survive the user's cutover."""
+    own = _own_pending(root, engine_names)
+    if not own:
+        return None
+    newest = own[-1][1]
+    for _path, item in own:
+        if _survives(item, newest):
+            return item
+    return None
+
+
 def newer_utterance_pending(root, utterance, engine_names=None) -> bool:
     """True when an own pending item belongs to a different message."""
-    for path in queue_dir(root).glob("*.json"):
-        item = _read_json(path)
-        if item is None or not _owned(item, engine_names):
-            continue
+    for _path, item in _own_pending(root, engine_names):
         if utterance is None or item.get("utterance") != utterance:
             return True
     return False
 
 
-def stop_request(root):
-    """The project's latest stop request {"ts", "session"}, or None."""
-    return _read_json(Path(root) / _STOP_FILE_NAME)
+# --- stop requests ------------------------------------------------------------
+
+def _stop_file_name(session):
+    """voiceover/projects.session_slug's rule; '_all' for no session."""
+    slug = _UNSAFE.sub("_", str(session or ""))
+    return (slug or _ALL_SESSIONS) + ".json"
+
+
+def stop_requested(root, item) -> bool:
+    """True when a stop for item's session - or for every session - was
+    requested after item was queued. A stop can therefore never cut a reply
+    queued after it, and each session's request is a file of its own."""
+    try:
+        created = float(item.get("created") or 0)
+    except (TypeError, ValueError):
+        created = 0.0
+    directory = Path(root) / _STOP_DIR_NAME
+    for name in {_stop_file_name(item.get("session")), _stop_file_name(None)}:
+        request = _read_json(directory / name)
+        try:
+            if request and float(request.get("ts")) > created:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
 
 
 # --- playback ---------------------------------------------------------------
@@ -1323,6 +1466,9 @@ class ProcessPlayback(Playback):
 class DryRunSpeaker:
     """Prints each sentence as '[voiceover] <sentence>' instead of playing it."""
 
+    def prefetch(self, sentence, voice):
+        pass
+
     def begin(self, sentence, voice, upcoming=None):
         print("[voiceover] " + sentence, file=sys.stderr, flush=True)
         return Playback()
@@ -1345,35 +1491,6 @@ class _LockKeeper:
         self._last = time.time()
 
 
-class _StopWatch:
-    """Reports each stop request newer than the last one seen, once.
-
-    Requests older than this engine belong to an earlier engine's turn.
-    """
-
-    def __init__(self, root):
-        self._root = root
-        self._seen = time.time()
-
-    def poll(self):
-        """(True, session named) for a new request, else (False, None)."""
-        request = stop_request(self._root)
-        try:
-            ts = float(request.get("ts")) if request else 0.0
-        except (TypeError, ValueError):
-            return False, None
-        if ts <= self._seen:
-            return False, None
-        self._seen = ts
-        return True, request.get("session")
-
-
-def _stops(watch, session):
-    """True when a new stop request names this session, or names none."""
-    fresh, named = watch.poll()
-    return fresh and (named is None or named == session)
-
-
 def _log_first_sound(item):
     now = time.time()
     shown = item.get("shown")
@@ -1382,34 +1499,53 @@ def _log_first_sound(item):
         now - float(item.get("created") or now),
         ("%.2f" % (now - float(shown))) if isinstance(shown, (int, float)) else "-",
         len(text), text.replace("\n", " ")))
+
+
+def _prefetch_next(root, speaker, engine_names) -> bool:
+    """Have the speaker synthesize the next item's first sentence now.
+    True once there was a next item to prefetch."""
+    upcoming = peek_next(root, engine_names)
+    if upcoming is None:
+        return False
+    first = split_sentences(upcoming.get("text"))
+    if first:
+        speaker.prefetch(first[0], upcoming.get("voice"))
+    return True
+
+
+def _speak_item(root, speaker, item, engine_names, keeper, poll_seconds):
+    """Play item sentence by sentence until it ends, is stopped or superseded.
+
+    A sticky item (a dialog alert, a permission request) plays whole: only a
+    stop request - the user's own prompt - ends it early.
+    """
+    utterance, sticky = item.get("utterance"), bool(item.get("sticky"))
+    sentences = split_sentences(item.get("text"))
+    for index, sentence in enumerate(sentences):
+        last = index == len(sentences) - 1
+        playback = speaker.begin(sentence, item.get("voice"), None if last else sentences[index + 1])
+        if index == 0:
+            _log_first_sound(item)
+        prefetched = not last  # within the item, begin() already prefetched
+        while not playback.poll():
+            keeper.keep()
+            if stop_requested(root, item):
+                playback.kill()
+                engine_log("stop", "session=%s" % item.get("session"))
+                return
+            if not prefetched:
+                prefetched = _prefetch_next(root, speaker, engine_names)
+            time.sleep(poll_seconds)
+        keeper.keep()
+        if stop_requested(root, item):
+            return
+        if not sticky and newer_utterance_pending(root, utterance, engine_names):
+            return
 ```
 
 Replace the whole `drain` function (and its docstring) with:
 
 ```python
-def _speak_item(root, speaker, item, engine_names, keeper, watch, poll_seconds):
-    """Play item sentence by sentence until it ends, is stopped or superseded."""
-    session, utterance = item.get("session"), item.get("utterance")
-    sentences = split_sentences(item.get("text"))
-    for index, sentence in enumerate(sentences):
-        upcoming = sentences[index + 1] if index + 1 < len(sentences) else None
-        playback = speaker.begin(sentence, item.get("voice"), upcoming)
-        if index == 0:
-            _log_first_sound(item)
-        while not playback.poll():
-            keeper.keep()
-            if _stops(watch, session):
-                playback.kill()
-                engine_log("stop", "session=%s" % session)
-                return
-            time.sleep(poll_seconds)
-        keeper.keep()
-        if _stops(watch, session):
-            return
-        if newer_utterance_pending(root, utterance, engine_names):
-            return
-
-
 def drain(root, open_speaker, engine_names, lock_seconds=60.0,
           poll_seconds=POLL_SECONDS) -> int:
     """Speak root's spool one sentence at a time. Returns a process exit code.
@@ -1418,14 +1554,13 @@ def drain(root, open_speaker, engine_names, lock_seconds=60.0,
     a speech model). It runs only AFTER the lock is ours: opening first would
     leave the lock free for the whole spin-up, and every hook firing in that
     window would spawn another engine that loads its model and then exits on
-    the lock. A falsy speaker releases the lock and exits 0. A speaker has
-    begin(sentence, voice, upcoming) -> Playback.
+    the lock. A falsy speaker releases the lock and exits 0.
 
-    Between sentences the jump rule applies (next_item, newer_utterance_
-    pending): a different message ends the current one at its next sentence
-    boundary and everything queued between is dropped, sticky alerts excepted.
-    A stop request naming the item's session kills the sentence mid-word -
-    only the user's own new prompt sends one.
+    Between sentences the jump rule applies: a different message ends the
+    current one at its next sentence boundary and everything queued between
+    is dropped, sticky items excepted. A stop request newer than the item
+    kills its sentence mid-word - only the user's own prompt sends one. On an
+    item's last sentence the next item's first sentence is prefetched.
 
     When the spool runs dry the lock is released and the spool checked ONCE
     more before exiting: that closes the race against a hook that appended an
@@ -1437,13 +1572,11 @@ def drain(root, open_speaker, engine_names, lock_seconds=60.0,
         return 0  # another engine is already draining this project
     owns_lock = True
     keeper = _LockKeeper(root, lock_seconds)
-    watch = _StopWatch(root)
     try:
         speaker = open_speaker()
         if not speaker:
             return 0  # setup failed; the finally below hands the lock back
         while True:
-            watch.poll()  # nothing is playing: the hook already dropped the items
             item, taken_path = next_item(root, engine_names)
             if item is None:
                 remove_tts_lock(root)
@@ -1461,12 +1594,12 @@ def drain(root, open_speaker, engine_names, lock_seconds=60.0,
                 # Fall through and speak the item just claimed: it is renamed
                 # to .taken, invisible to a re-scan, and would be lost.
             age = time.time() - float(item.get("created") or 0)
-            if age > QUEUE_MAX_AGE_SECONDS:
-                finish(taken_path)     # too stale to be worth hearing
+            if age > QUEUE_MAX_AGE_SECONDS or stop_requested(root, item):
+                finish(taken_path)  # too stale, or queued before the user's prompt
                 continue
             keeper.keep()
             try:
-                _speak_item(root, speaker, item, engine_names, keeper, watch, poll_seconds)
+                _speak_item(root, speaker, item, engine_names, keeper, poll_seconds)
             except Exception:
                 pass  # a failed sentence skips the rest of its item
             finish(taken_path)
@@ -1475,30 +1608,32 @@ def drain(root, open_speaker, engine_names, lock_seconds=60.0,
             remove_tts_lock(root)
 ```
 
-Also replace the module docstring's description of the drain loop (it describes 1.3's item-at-a-time loop) with one paragraph: the drainer plays sentences, applies the jump rule between them, honours stop requests, and claims its lock before `open_speaker()` loads anything.
+Replace the module docstring's description of the drain loop (it describes 1.3's item-at-a-time loop) with one paragraph: the drainer plays sentences, applies the jump rule between them, honours per-session stop requests, prefetches the next sentence, and claims its lock before `open_speaker()` loads anything.
 
-- [ ] **Step 4: `request_stop` in `voiceover/speech.py`**
+- [ ] **Step 5: `request_stop` in `voiceover/speech.py`**
 
-Add after `ensure_drainer`:
+Change the projects import to `from .projects import project_dir, session_slug` and add after `ensure_drainer`:
 
 ```python
 def request_stop(cwd=None, session=None) -> None:
-    """Ask the project's engine to stop the sentence it is playing now.
+    """Ask the project's engine to stop session's sentence now (None: any).
 
-    The engine stops it only when it belongs to `session` (None: any), and
-    ignores requests older than itself. Written atomically: a temp file
-    renamed over project_dir(cwd)/stop.json, {"ts", "session"}.
+    The engine stops only items queued before this request, so a stale
+    request can never cut the reply that follows. One file per session -
+    <project>/stop/<slug or _all>.json, {"ts"} - written atomically.
     """
     try:
-        path = project_dir(cwd) / "stop.json"
-        temp = path.with_name("stop.json.%d.tmp" % os.getpid())
-        temp.write_text(json.dumps({"ts": time.time(), "session": session}))
+        directory = project_dir(cwd) / "stop"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / ((session_slug(session) or "_all") + ".json")
+        temp = path.with_name("%s.%d.tmp" % (path.name, os.getpid()))
+        temp.write_text(json.dumps({"ts": time.time()}))
         os.replace(str(temp), str(path))
     except OSError:
         pass
 ```
 
-- [ ] **Step 5: The macOS speaker**
+- [ ] **Step 6: The macOS speaker**
 
 In `tts/macos_say.py` add `from engine_common import ProcessPlayback` beside the other import and add:
 
@@ -1509,6 +1644,9 @@ class SaySpeaker:
     The --voice= spelling is deliberate: the one-shot interrupt matches
     `say -v <Name>`, and must never reach a drainer's sentence.
     """
+
+    def prefetch(self, sentence, voice):
+        pass  # `say` starts speaking within ~0.1s: nothing to win
 
     def begin(self, sentence, voice, upcoming=None):
         process = subprocess.Popen(["say", "--voice=" + (voice or DEFAULT_VOICE)],
@@ -1539,34 +1677,71 @@ Replace `main()`'s `--drain` branch with:
         return drain(root, SaySpeaker, engines)
 ```
 
-- [ ] **Step 6: The Kokoro speaker**
+- [ ] **Step 7: The Kokoro speaker**
 
-In `tts/kokoro_voice.py`: add `import concurrent.futures` and `import shutil`; change the engine_common import to
-`from engine_common import ProcessPlayback, data_dir, remove_tts_lock, try_claim_lock, update_lock_expiry`;
+In `tts/kokoro_voice.py`: add `import concurrent.futures`, `import shutil` and `import time`; change the engine_common import to
+`from engine_common import Playback, ProcessPlayback, data_dir, remove_tts_lock, try_claim_lock, update_lock_expiry`;
 delete `_play_samples_keeping_lock` and `_speak_whole_keeping_lock`; in `play_chunk` and `play_samples` create the temp file with `tempfile.NamedTemporaryFile(prefix="voiceover-oneshot-", suffix=".wav", delete=False)`; add:
 
 ```python
 def playback_command(path):
-    """The player for one sentence's wav, as an argv Popen can poll and kill."""
+    """The player for one sentence's wav (macOS/Linux), as an argv Popen can
+    poll and kill."""
     if sys.platform == "darwin":
         return ["afplay", path]
-    if sys.platform == "win32":
-        escaped = path.replace("'", "''")
-        return ["powershell", "-NoProfile", "-Command",
-                "(New-Object Media.SoundPlayer '" + escaped + "').PlaySync()"]
     if shutil.which("aplay"):
         return ["aplay", "-q", path]
     return ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", path]
 
 
-class KokoroSpeaker:
-    """Plays sentences through a loaded Kokoro model, one synthesized ahead.
+class WinsoundPlayback(Playback):
+    """Windows: play in-process and asynchronously, so a stop is instant and
+    no player process can outlive the engine. Done once the clip's length
+    has passed."""
 
-    begin() waits for its sentence's samples (already rendering when it was
-    the previous call's `upcoming`), starts rendering the next one in a
-    worker thread - onnxruntime releases the GIL, so it overlaps playback -
-    and plays the wav from the project's play/ directory through a child
-    process the drain loop polls and can kill.
+    def __init__(self, path, duration):
+        import winsound
+
+        self._winsound, self._path = winsound, Path(path)
+        winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_ASYNC)
+        self._ends = time.time() + duration
+
+    def poll(self) -> bool:
+        if time.time() < self._ends:
+            return False
+        self._remove()
+        return True
+
+    def kill(self) -> None:
+        try:
+            self._winsound.PlaySound(None, 0)
+        except Exception:
+            pass
+        self._remove()
+
+    def _remove(self):
+        try:
+            self._path.unlink()
+        except OSError:
+            pass
+
+
+def play_file(path, duration):
+    """Start playing one sentence's wav; the Playback polls and kills it."""
+    if sys.platform == "win32":
+        return WinsoundPlayback(path, duration)
+    process = subprocess.Popen(playback_command(str(path)),
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return ProcessPlayback(process, cleanup=path)
+
+
+class KokoroSpeaker:
+    """Plays sentences through a loaded Kokoro model, synthesizing ahead.
+
+    A worker thread renders the next sentence while the current one plays
+    (onnxruntime releases the GIL): within an item through begin()'s
+    `upcoming`, across items through prefetch(). A rendering that does not
+    match the sentence actually begun next is discarded.
     """
 
     def __init__(self, kokoro, play_dir):
@@ -1577,6 +1752,16 @@ class KokoroSpeaker:
         self._ahead = {}
         self._count = 0
 
+    def warm_up(self):
+        """Pay the first synthesis' one-time cost now, not on a real sentence."""
+        self._render("Ready.", DEFAULT_VOICE).result()
+
+    def prefetch(self, sentence, voice):
+        """Start rendering a sentence the next item will begin with."""
+        voice = voice or DEFAULT_VOICE
+        if (sentence, voice) not in self._ahead:
+            self._ahead[(sentence, voice)] = self._render(sentence, voice)
+
     def begin(self, sentence, voice, upcoming=None):
         import soundfile as sf
 
@@ -1585,13 +1770,12 @@ class KokoroSpeaker:
         self._ahead.clear()  # anything else rendered ahead belongs to an abandoned item
         samples, sample_rate = future.result()
         if upcoming:
-            self._ahead[(upcoming, voice)] = self._render(upcoming, voice)
+            self.prefetch(upcoming, voice)
         self._count += 1
         path = self._play_dir / ("%d-%d.wav" % (os.getpid(), self._count))
         sf.write(str(path), samples, sample_rate)
-        process = subprocess.Popen(playback_command(str(path)),
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return ProcessPlayback(process, cleanup=path)
+        duration = len(samples) / float(sample_rate) if sample_rate else 0.0
+        return play_file(path, duration)
 
     def _render(self, sentence, voice):
         settings = get_voice_settings(voice)
@@ -1600,7 +1784,7 @@ class KokoroSpeaker:
             lang=settings["lang"], trim=settings["trim"])
 ```
 
-Replace `main()`'s `--drain` branch with:
+Delete `_play_windows_powershell` and its use in `_play_windows` (the one-shot Windows path keeps `winsound.PlaySound(file_path, winsound.SND_FILENAME)`). Replace `main()`'s `--drain` branch with:
 
 ```python
     if "--drain" in sys.argv[1:]:
@@ -1620,7 +1804,9 @@ Replace `main()`'s `--drain` branch with:
             try:
                 from kokoro_onnx import Kokoro
 
-                return KokoroSpeaker(Kokoro(str(MODEL_FILE), str(VOICES_FILE)), root / "play")
+                speaker = KokoroSpeaker(Kokoro(str(MODEL_FILE), str(VOICES_FILE)), root / "play")
+                speaker.warm_up()
+                return speaker
             except Exception as error:
                 log("[ERROR] Model load failed: " + str(error))
                 return None
@@ -1628,15 +1814,16 @@ Replace `main()`'s `--drain` branch with:
         return drain(root, open_speaker, {"kokoro"})
 ```
 
-- [ ] **Step 7: Rewrite `tests/test_kokoro_drain.py`**
+- [ ] **Step 8: Rewrite `tests/test_kokoro_drain.py`**
 
 ```python
-"""The kokoro drainer: sentence by sentence, one sentence synthesized ahead.
+"""The kokoro drainer: sentence by sentence, synthesizing ahead.
 
 Kokoro's own dependencies (kokoro-onnx, numpy, soundfile) live in the tts/
 venv and are not importable from the stdlib-only suite, so they are stubbed:
-what is under test is OUR wiring - per-sentence synthesis, the prefetch, the
-lock claimed before the model loads, and stops that land during synthesis.
+what is under test is OUR wiring - per-sentence synthesis, the warm-up, both
+prefetches, the lock claimed before the model loads, stops that land during
+synthesis, and the Windows player.
 """
 
 import sys
@@ -1697,7 +1884,7 @@ def _construct(*args, **kwargs):
 sys.modules["kokoro_onnx"] = types.ModuleType("kokoro_onnx")
 sys.modules["kokoro_onnx"].Kokoro = _construct
 
-# --- drain speaks sentence by sentence -----------------------------------------
+# --- drain speaks sentence by sentence, after a warm-up -------------------------
 spool.clear()
 spool.enqueue("One. Two. Three.", "kokoro", "af_sarah", utterance="U")
 argv = sys.argv
@@ -1707,28 +1894,47 @@ try:
 finally:
     sys.argv = argv
 check("the kokoro drain exits 0", code == 0, code)
-check("each sentence is synthesized once, in order",
-      fake.created == ["One.", "Two.", "Three."], fake.created)
+check("a warm-up, then each sentence synthesized once, in order",
+      fake.created == ["Ready.", "One.", "Two.", "Three."], fake.created)
 check("the model is loaded exactly once", len(load_saw_lock) == 1, load_saw_lock)
 check("the lock is claimed BEFORE the model is loaded", load_saw_lock == [True], load_saw_lock)
 check("the lock is released when the drain ends", engine_common.lock_is_live(ROOT) is False)
 check("no wav file is left behind", list(PLAY.glob("*.wav")) == [], list(PLAY.glob("*.wav")))
 
-# --- the next sentence is synthesized while this one plays ---------------------
+# --- within an item: the next sentence renders while this one plays ------------
 speaker = kokoro_voice.KokoroSpeaker(FakeKokoro(), PLAY)
 playback = speaker.begin("Alpha.", "af_sarah", "Beta.")
-check("begin starts synthesizing the upcoming sentence", ("Beta.", "af_sarah") in speaker._ahead)
+check("begin starts rendering the upcoming sentence", ("Beta.", "af_sarah") in speaker._ahead)
 while not playback.poll():
     time.sleep(0.01)
 speaker.begin("Beta.", "af_sarah", None)
-check("the prefetched sentence is not synthesized twice",
+check("the prefetched sentence is not rendered twice",
       speaker._kokoro.created == ["Alpha.", "Beta."], speaker._kokoro.created)
 speaker.begin("Gamma.", "af_sarah", "Delta.")
 speaker.begin("Other.", "af_sarah", None)
 check("work rendered ahead for an abandoned sentence is discarded",
       speaker._ahead == {}, speaker._ahead)
 
-# --- a stop that lands during synthesis still stops promptly (Review Focus 5) ---
+# --- across items: the next item's first sentence renders during this one -------
+spool.clear()
+spool.enqueue("First item.", "kokoro", "af_sarah", utterance="U")
+spool.enqueue("Second item.", "kokoro", "af_sarah", utterance="U")
+kokoro_voice.playback_command = lambda path: [sys.executable, "-c", "import time; time.sleep(0.3)"]
+across = FakeKokoro()
+prefetches = []
+
+
+class Watched(kokoro_voice.KokoroSpeaker):
+    def prefetch(self, sentence, voice):
+        prefetches.append(sentence)
+        super().prefetch(sentence, voice)
+
+
+engine_common.drain(ROOT, lambda: Watched(across, PLAY), {"kokoro"})
+check("the next item's first sentence is prefetched", prefetches == ["Second item."], prefetches)
+check("and rendered only once", across.created == ["First item.", "Second item."], across.created)
+
+# --- a stop that lands during synthesis still stops promptly --------------------
 spool.clear()
 spool.enqueue("Slow one. Never played.", "kokoro", "af_sarah", session="S1", utterance="U")
 kokoro_voice.playback_command = lambda path: [sys.executable, "-c", "import time; time.sleep(5)"]
@@ -1740,7 +1946,23 @@ check("the 5-second sentence was killed right after synthesis",
       time.time() - started < 2.0, time.time() - started)
 check("its item is gone", spool.pending_count() == 0)
 
-# --- the one-shot path still owns and releases its own lock --------------------
+# --- Windows playback: in-process, asynchronous, stoppable -----------------------
+calls = []
+fake_winsound = types.ModuleType("winsound")
+fake_winsound.SND_FILENAME, fake_winsound.SND_ASYNC = 0x20000, 0x0001
+fake_winsound.PlaySound = lambda sound, flags: calls.append((sound, flags))
+sys.modules["winsound"] = fake_winsound
+wav = PLAY / "win.wav"
+wav.write_bytes(b"RIFF")
+playback = kokoro_voice.WinsoundPlayback(wav, 0.2)
+check("it starts the clip asynchronously from the file",
+      calls == [(str(wav), 0x20000 | 0x0001)], calls)
+check("it is still playing before the clip's length has passed", playback.poll() is False)
+playback.kill()
+check("kill stops all sound", calls[-1] == (None, 0), calls)
+check("and removes the clip", not wav.exists())
+
+# --- the one-shot path still owns and releases its own lock ----------------------
 kokoro_voice.speak_streaming(FakeKokoro(), "one shot", "af_sarah")
 check("speak_streaming still releases the one-shot lock",
       engine_common.tts_lock_path(engine_common.data_dir()).exists() is False)
@@ -1748,9 +1970,10 @@ check("speak_streaming still releases the one-shot lock",
 report()
 ```
 
-- [ ] **Step 8: Update `tests/test_drain.py` for the new loop**
+- [ ] **Step 9: Update `tests/test_drain.py` and `tests/test_engine_common.py`**
 
-- Every in-process `engine_common.drain(ROOT, <lambda item ...>, {...})` becomes `engine_common.drain(ROOT, lambda: Collect(spoken_items), {...})` (or `lambda: Collect([])` where nothing is recorded), with this helper added after `run_drain`:
+In `tests/test_drain.py`:
+- add this helper after `run_drain`, and turn every in-process `engine_common.drain(ROOT, <lambda item ...>, {...})` into `engine_common.drain(ROOT, lambda: Collect(spoken_items), {...})` (or `lambda: Collect([])` where nothing is recorded):
 
 ```python
 class Collect:
@@ -1759,13 +1982,17 @@ class Collect:
     def __init__(self, sink):
         self.sink = sink
 
+    def prefetch(self, sentence, voice):
+        pass
+
     def begin(self, sentence, voice, upcoming=None):
         self.sink.append(sentence)
         return engine_common.Playback()
 ```
 
-- Items that the old test expects to ALL be spoken must now be one message: give `utterance="U1"` to the three items of "drains the whole spool, in order", and `utterance="U2"` to "mine to speak" / "mine as well" in the foreign-item section.
-- Append before `report()`:
+- items the old test expects to ALL be spoken must now be one message: give `utterance="U1"` to the three items of "drains the whole spool, in order", and `utterance="U2"` to "mine to speak" / "mine as well" in the foreign-item section;
+- in the end-of-drain race test, the foreign lock must belong to a RUNNING process now that a dead pid is stale: change `foreign_payload` to `json.dumps({"expiry": time.time() + 300, "pid": os.getpid()})`;
+- append before `report()`:
 
 ```python
 # --- separate messages queued together: only the newest is heard ---------------
@@ -1779,16 +2006,30 @@ spoken = [line.split("[voiceover] ", 1)[1].strip()
 check("the jump rule holds end to end", spoken == ["the newest"], spoken)
 ```
 
-- [ ] **Step 9: Run the whole suite**
+In `tests/test_engine_common.py` append before `report()`:
+
+```python
+# --- a dead engine's lock is stale even before it expires (Review Focus 5) ------
+import subprocess
+gone = subprocess.Popen([sys.executable, "-c", "pass"])
+gone.wait()
+engine_common.tts_lock_path(ROOT).write_text(
+    json.dumps({"expiry": time.time() + 60, "pid": gone.pid}))
+check("a lock whose engine has exited is not live", engine_common.lock_is_live(ROOT) is False)
+check("and a new engine takes it over", engine_common.try_claim_lock(ROOT, 30.0) is True)
+engine_common.remove_tts_lock(ROOT)
+```
+
+- [ ] **Step 10: Run the whole suite**
 
 Run: `bash tests/run_all.sh 2>&1 | grep -E "^FAIL|ALL TESTS|SOME TESTS"`
 Expected: `ALL TESTS PASSED`
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 11: Commit**
 
 ```bash
 git add tts/ voiceover/speech.py tests/
-git commit -m "feat: the engine plays sentences and jumps to the newest message
+git commit -m "feat: the engine plays sentences, prefetches, and jumps to the newest message
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -1799,18 +2040,18 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 **Files:**
 - Create: `voiceover/lease.py`
-- Modify: `tts/engine_common.py` (`lease_is_live`; `drain`'s empty branch)
-- Modify: `voiceover/speech.py` (`ensure_drainer` lease condition, `prewarm`, `_spawn_detached` honours `VOICEOVER_NO_SPAWN`)
-- Modify: `tests/_harness.py` (sets `VOICEOVER_NO_SPAWN=1`)
+- Modify: `tts/engine_common.py` (`lease_is_live`; `MAX_ENGINES`; `drain`'s claim and empty branches)
+- Modify: `voiceover/speech.py` (`ensure_drainer`, `prewarm`, spawn backoff, `_spawn_detached` honours `VOICEOVER_NO_SPAWN`)
+- Modify: `tests/_harness.py` (sets `VOICEOVER_NO_SPAWN=1`), `tests/test_enqueue_speech.py`
 - Test: `tests/test_engine_lifecycle.py` (new)
 
 **Interfaces:**
-- Consumes: `projects.project_dir`, Task 3's `drain`, `DryRunSpeaker`
+- Consumes: `projects.project_dir`, `projects.session_slug`, Task 3's `drain`, `DryRunSpeaker`, `_lock_held`
 - Produces:
-  - `lease.LEASE_TTL = 600.0`; `lease.lease_dir(cwd=None) -> Path`; `lease.hold(cwd, session, ttl=LEASE_TTL) -> bool`; `lease.release(cwd, session) -> None`; `lease.any_live(cwd=None) -> bool`. File contract: `<project dir>/leases/<session, [A-Za-z0-9_-] only>.json` = `{"expiry": float}`
-  - `engine_common.lease_is_live(root) -> bool` (deletes expired lease files)
-  - `speech.prewarm(cwd=None, session=None) -> bool`
-  - `drain` waits (polling every `poll_seconds`) while a lease is live and the queue is empty; after releasing the lock it re-claims if a lease appeared in the gap
+  - `lease.LEASE_TTL = 600.0`, `lease.FALLBACK_LEASE_TTL = 120.0`; `lease.lease_dir(cwd=None) -> Path`; `lease.hold(cwd, session, ttl=LEASE_TTL) -> bool` (prunes other sessions' leases expired over an hour ago); `lease.release(cwd, session) -> None`; `lease.any_live(cwd=None) -> bool`. File contract: `<project dir>/leases/<slug>.json` = `{"expiry": float}`
+  - `engine_common.lease_is_live(root) -> bool` (never deletes); `engine_common.MAX_ENGINES = 2`
+  - `drain` waits (polling) while a lease is live and the queue is empty; re-claims if a lease appears in the exit gap; steps aside when `MAX_ENGINES` other projects' engines run; deletes `spawned.json` once it has claimed (and passed the cap)
+  - `speech.prewarm(cwd=None, session=None, ttl=LEASE_TTL) -> bool`; `ensure_drainer` also starts on a live lease, treats a dead owner's lock as free, and backs off 3s after a spawn until the engine claims
 
 - [ ] **Step 1: Write the failing lifecycle test**
 
@@ -1819,6 +2060,7 @@ Create `tests/test_engine_lifecycle.py`:
 ```python
 """The turn-scoped engine: warm while a session holds it, gone once released."""
 
+import json
 import os
 import subprocess
 import sys
@@ -1828,7 +2070,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _harness import check, isolate, report, REPO_ROOT
 
-isolate()
+data_dir = isolate()
 from voiceover import lease, spool, speech
 from voiceover.settings import set_setting
 
@@ -1862,13 +2104,14 @@ check("release ends it", lease.any_live() is False and engine_common.lease_is_li
 check("a lease needs a session", lease.hold(None, None) is False)
 lease.hold(None, "S1", ttl=-1)
 check("an expired lease is not live", engine_common.lease_is_live(ROOT) is False)
-check("the engine deletes expired leases", list((ROOT / "leases").glob("*.json")) == [])
-lease.hold(None, "../../escape")
-check("a hostile session id stays inside the lease dir",
-      all(p.parent == ROOT / "leases" for p in (ROOT / "leases").glob("*.json")))
-lease.release(None, "../../escape")
-lease.hold(None, "S1")
+check("the engine never deletes a lease file", (ROOT / "leases" / "S1.json").exists())
+lease.hold(None, "OLD", ttl=-7200)
 lease.hold(None, "S2")
+check("hold prunes another session's lease expired over an hour ago",
+      not (ROOT / "leases" / "OLD.json").exists())
+check("but keeps a recently expired one", (ROOT / "leases" / "S1.json").exists())
+lease.release(None, "S1")
+lease.hold(None, "S1")
 lease.release(None, "S1")
 check("one session's release leaves another's lease live", lease.any_live() is True)
 lease.release(None, "S2")
@@ -1906,13 +2149,52 @@ check("a lease that appears after the lock is released re-claims it", len(claims
 check("and the drain still ends cleanly",
       code == 0 and engine_common.lock_is_live(ROOT) is False, code)
 
-# --- ensure_drainer pre-warms on a lease alone -----------------------------------
+# --- at most MAX_ENGINES engines machine-wide ---------------------------------------
+others = []
+for key in ("aaaaaaaaaaaa", "bbbbbbbbbbbb"):
+    other = data_dir / "projects" / key
+    other.mkdir(parents=True, exist_ok=True)
+    (other / "tts.lock").write_text(json.dumps({"expiry": time.time() + 60, "pid": os.getpid()}))
+    others.append(other)
+spool.clear()
+spool.enqueue("Wait your turn.", "kokoro", "bf_emma")
+spoken = []
+
+
+class Collect:
+    def prefetch(self, sentence, voice):
+        pass
+
+    def begin(self, sentence, voice, upcoming=None):
+        spoken.append(sentence)
+        return engine_common.Playback()
+
+
+engine_common.drain(ROOT, Collect, {"kokoro"})
+check("a third engine steps aside while two others run", spoken == [], spoken)
+check("its item waits", spool.pending_count() == 1)
+check("it leaves a spawn marker so hooks back off", (ROOT / "spawned.json").exists())
+check("it releases its lock", engine_common.lock_is_live(ROOT) is False)
+for other in others:
+    (other / "tts.lock").unlink()
+engine_common.drain(ROOT, Collect, {"kokoro"})
+check("once they are gone it speaks", spoken == ["Wait your turn."], spoken)
+check("and clears the spawn marker on claiming", not (ROOT / "spawned.json").exists())
+
+# --- ensure_drainer: pre-warm, dead owners, backoff -----------------------------------
 set_setting("interaction_level", "narrator")
 set_setting("tts_engine", "macos-female")
 spool.clear()
 check("no queue, no lease: nothing to start", speech.ensure_drainer() is False)
 check("prewarm holds a lease and starts the engine", speech.prewarm(None, "S1") is True)
 check("the lease is there", lease.any_live() is True)
+check("a second start right after backs off", speech.ensure_drainer() is False)
+(ROOT / "spawned.json").unlink()   # what the engine does when it claims
+gone = subprocess.Popen([sys.executable, "-c", "pass"])
+gone.wait()
+speech.project_lock_path().write_text(json.dumps({"expiry": time.time() + 60, "pid": gone.pid}))
+check("a lock whose engine has died does not stop a new one", speech.ensure_drainer() is True)
+speech.project_lock_path().unlink()
 lease.release(None, "S1")
 
 report()
@@ -1931,24 +2213,25 @@ turn runs, so the model stays loaded for the next sentence and unloads once
 nobody needs it.
 
 Hooks and the mod bridge WRITE leases; the engine READS them through
-tts/engine_common.py (lease_is_live). The shared contract is only this:
-<project dir>/leases/<session>.json holding {"expiry": unix seconds}. The
-expiry is a crash backstop, not a timer: holders renew at every model step or
-tool hook and release at turn end. Stdlib only; every function fails soft.
+tts/engine_common.py (lease_is_live) and never deletes one. The shared
+contract is only this: <project dir>/leases/<session slug>.json holding
+{"expiry": unix seconds}. The expiry is a crash backstop, not a timer:
+holders renew at every model step or tool hook and release at turn end.
+Stdlib only; every function fails soft.
 """
 
 import json
 import os
-import re
 import time
 from pathlib import Path
 
-from .projects import project_dir
+from .projects import project_dir, session_slug
 
-LEASE_TTL = 600.0
+LEASE_TTL = 600.0            # the mod: turn.complete releases reliably
+FALLBACK_LEASE_TTL = 120.0   # classic hooks: Stop does not fire on an interrupt
 
 _LEASE_DIR_NAME = "leases"
-_UNSAFE = re.compile(r"[^A-Za-z0-9_-]")
+_PRUNE_AFTER_SECONDS = 3600.0
 
 
 def lease_dir(cwd=None) -> Path:
@@ -1962,15 +2245,34 @@ def lease_dir(cwd=None) -> Path:
 
 
 def _lease_path(cwd, session):
-    name = _UNSAFE.sub("_", str(session or ""))
-    return lease_dir(cwd) / (name + ".json") if name else None
+    slug = session_slug(session)
+    return lease_dir(cwd) / (slug + ".json") if slug else None
+
+
+def _expiry(path):
+    try:
+        return float(json.loads(path.read_text()).get("expiry"))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
 
 
 def hold(cwd, session, ttl=LEASE_TTL) -> bool:
-    """Hold (or renew) session's lease on the project's engine."""
+    """Hold (or renew) session's lease on the project's engine.
+
+    Also deletes other sessions' leases that expired over an hour ago: they
+    are long dead, and nobody else deletes them (the engine must not - it
+    could race a renewal)."""
     path = _lease_path(cwd, session)
     if path is None:
         return False
+    cutoff = time.time() - _PRUNE_AFTER_SECONDS
+    for other in path.parent.glob("*.json"):
+        expiry = _expiry(other) if other != path else None
+        if expiry is not None and expiry < cutoff:
+            try:
+                other.unlink()
+            except OSError:
+                pass
     try:
         temp = path.with_name("%s.%d.tmp" % (path.name, os.getpid()))
         temp.write_text(json.dumps({"expiry": time.time() + ttl}))
@@ -1995,47 +2297,78 @@ def release(cwd, session) -> None:
 def any_live(cwd=None) -> bool:
     """True while any session holds an unexpired lease in the project."""
     now = time.time()
-    for path in lease_dir(cwd).glob("*.json"):
-        try:
-            if float(json.loads(path.read_text()).get("expiry")) > now:
-                return True
-        except (OSError, ValueError, TypeError, AttributeError):
-            continue
-    return False
+    return any((_expiry(path) or 0) > now for path in lease_dir(cwd).glob("*.json"))
 ```
 
-- [ ] **Step 4: Engine side — `lease_is_live` and the waiting drain**
+- [ ] **Step 4: Engine side — `lease_is_live`, the cap, the waiting drain**
 
-In `tts/engine_common.py` add `_LEASE_DIR_NAME = "leases"` beside the other names, and after `stop_request`:
+In `tts/engine_common.py` add `_LEASE_DIR_NAME = "leases"`, `_SPAWNED_FILE_NAME = "spawned.json"` and `MAX_ENGINES = 2` beside the other names, and after `stop_requested`:
 
 ```python
 def lease_is_live(root) -> bool:
     """True while a session holds an unexpired lease on root's engine.
 
-    Expired lease files are deleted on the way: a crashed holder's lease must
-    not keep a model loaded."""
+    Read-only: deleting an expired lease could race a hold() that has just
+    replaced it with a fresh one (voiceover/lease.py prunes old leases)."""
     now = time.time()
-    live = False
     try:
         paths = list((Path(root) / _LEASE_DIR_NAME).glob("*.json"))
     except OSError:
         return False
     for path in paths:
         try:
-            expiry = float(json.loads(path.read_text()).get("expiry"))
+            if float(json.loads(path.read_text()).get("expiry")) > now:
+                return True
         except (OSError, ValueError, TypeError, AttributeError):
             continue
-        if expiry > now:
-            live = True
-        else:
-            try:
-                path.unlink()
-            except OSError:
-                pass
-    return live
+    return False
+
+
+def _other_engines_running(root) -> int:
+    """How many OTHER projects' engines hold their locks right now."""
+    root = Path(root)
+    count = 0
+    try:
+        siblings = [p for p in root.parent.iterdir() if p.is_dir() and p != root]
+    except OSError:
+        return 0
+    for sibling in siblings:
+        try:
+            raw = tts_lock_path(sibling).read_text().strip()
+        except OSError:
+            continue
+        if _lock_held(raw):
+            count += 1
+    return count
+
+
+def _mark_spawned(root):
+    try:
+        (Path(root) / _SPAWNED_FILE_NAME).write_text(json.dumps({"ts": time.time()}))
+    except OSError:
+        pass
+
+
+def _clear_spawned(root):
+    try:
+        (Path(root) / _SPAWNED_FILE_NAME).unlink()
+    except OSError:
+        pass
 ```
 
-In `drain`, replace the `if item is None:` block with:
+In `drain`, right after `keeper = _LockKeeper(root, lock_seconds)` and before `try:`, nothing changes; inside `try:`, before `speaker = open_speaker()`, add:
+
+```python
+        if _other_engines_running(root) >= MAX_ENGINES:
+            # Two projects already speak: step aside. Refresh the spawn
+            # marker so the hooks back off instead of respawning per batch.
+            engine_log("capped", "%d other engines running" % MAX_ENGINES)
+            _mark_spawned(root)
+            return 0
+        _clear_spawned(root)  # arrived: hooks may spawn again if this one dies
+```
+
+Replace the `if item is None:` block with:
 
 ```python
             if item is None:
@@ -2063,26 +2396,68 @@ In `drain`, replace the `if item is None:` block with:
                 keeper.reset()
 ```
 
-and add one sentence to `drain`'s docstring: "While a session holds a lease the drain waits for more, polling every poll_seconds, so the model stays loaded for the turn's next sentence."
+Add two sentences to `drain`'s docstring: "While a session holds a lease the drain waits for more, polling every poll_seconds, so the model stays loaded for the turn's next sentence. At most MAX_ENGINES projects' engines run at once; another steps aside."
 
-- [ ] **Step 5: Writer side — pre-warm and the test switch**
+- [ ] **Step 5: Writer side — pre-warm, dead owners, backoff, the test switch**
 
-In `voiceover/speech.py` add `from . import lease, process_utils, spool` (replacing the existing `from . import process_utils, spool`). In `ensure_drainer` change the first condition to:
+In `voiceover/speech.py` replace `from . import process_utils, spool` with `from . import lease, process_utils, spool`, and add `_SPAWN_BACKOFF_SECONDS = 3.0` beside `_FULL_TEXT_CAP`. Replace `ensure_drainer` with:
 
 ```python
+def ensure_drainer(cwd=None) -> bool:
+    """Start the project's engine unless it is already up or starting.
+
+    Starts it when the queue has items OR a session holds a lease (the
+    pre-warm). Called unconditionally by every narrator path, so a spool
+    left behind by a crashed engine is picked up by the next hook. A lock
+    whose engine has died is treated as free. After a spawn it backs off for
+    a few seconds - until the new engine claims its lock and clears
+    spawned.json - so a burst of calls during uv's start-up spawns one
+    engine, not one per call. Racing callers are harmless: the engine's
+    atomic lock claim admits exactly one drainer per project.
+    """
+    try:
+        spool.remove_legacy_queue()
         if spool.pending_count(cwd) == 0 and not lease.any_live(cwd):
             return False
-```
+        lock = project_lock_path(cwd)
+        if lock_is_live(lock) and process_utils.lock_owner_is_running(lock):
+            return False  # this project's drainer is already working
+        if _recently_spawned(cwd):
+            return False  # one is starting up
+        engine = resolve_engine(cwd)
+        command = _drain_command(engine, project_dir(cwd))
+        if command is None:
+            return False
+        _mark_spawned(cwd)
+        spawned = _spawn_detached(command)
+        _log("queue", "drainer spawned=%s engine=%s pending=%d" % (
+            spawned, engine, spool.pending_count(cwd)), cwd)
+        return spawned
+    except Exception:
+        return False
 
-and update its docstring to say it also starts the engine when a session holds a lease (the pre-warm). Add after it:
 
-```python
-def prewarm(cwd=None, session=None) -> bool:
+def _recently_spawned(cwd) -> bool:
+    try:
+        ts = float(json.loads((project_dir(cwd) / "spawned.json").read_text()).get("ts"))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+    return time.time() - ts < _SPAWN_BACKOFF_SECONDS
+
+
+def _mark_spawned(cwd) -> None:
+    try:
+        (project_dir(cwd) / "spawned.json").write_text(json.dumps({"ts": time.time()}))
+    except OSError:
+        pass
+
+
+def prewarm(cwd=None, session=None, ttl=lease.LEASE_TTL) -> bool:
     """Hold the project's engine for session's turn and start it now, so the
-    model has loaded by the time the first sentence arrives (the first text
-    of a turn arrived at least 2.2s after the prompt in 168 measured turns;
-    loading takes about 1.4s)."""
-    if not lease.hold(cwd, session):
+    model has loaded by the time the first sentence arrives (first text came
+    at least 1.84s after the prompt in 169 measured turns; a cold engine
+    needs about 1.8s including its warm-up)."""
+    if not lease.hold(cwd, session, ttl=ttl):
         return False
     return ensure_drainer(cwd)
 ```
@@ -2096,18 +2471,18 @@ At the top of `_spawn_detached`'s body add:
         return True
 ```
 
-In `tests/_harness.py` `isolate()`, add `os.environ["VOICEOVER_NO_SPAWN"] = "1"` after the dry-run line, and add a sentence to its docstring saying spawning is suppressed.
+In `tests/_harness.py` `isolate()`, add `os.environ["VOICEOVER_NO_SPAWN"] = "1"` after the dry-run line, and a sentence to its docstring saying engine spawning is suppressed. In `tests/test_enqueue_speech.py`, in the "drainer is started for THIS project" block added in Task 2, add `(spool.queue_dir().parent / "spawned.json").unlink(missing_ok=True)` right before `speech.ensure_drainer()` (the previous check's spawn left a backoff marker).
 
 - [ ] **Step 6: Run the new test and the suite**
 
 Run: `python3 tests/test_engine_lifecycle.py && bash tests/run_all.sh 2>&1 | grep -E "^FAIL|ALL TESTS|SOME TESTS"`
-Expected: `18/18 checks passed in test_engine_lifecycle.py` then `ALL TESTS PASSED`
+Expected: `27/27 checks passed in test_engine_lifecycle.py` then `ALL TESTS PASSED`
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add voiceover/lease.py voiceover/speech.py tts/engine_common.py tests/_harness.py tests/test_engine_lifecycle.py
-git commit -m "feat: turn-scoped engine - leases keep it warm, release unloads it
+git add voiceover/lease.py voiceover/speech.py tts/engine_common.py tests/
+git commit -m "feat: turn-scoped engine - leases, pre-warm, a two-engine cap, spawn backoff
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -2117,33 +2492,35 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ### Task 5: Narrator actions and the classic hooks
 
 **Files:**
-- Create: `voiceover/narrator.py`
-- Modify: `hooks/user_prompt_submit.py`, `hooks/pre_tool_use.py`, `hooks/post_tool_use.py`, `hooks/stop.py`
-- Test: `tests/test_narrator_hooks.py` (additions), `tests/test_cutover.py` (narrator expectations)
+- Create: `voiceover/narrator.py`, `hooks/session_end.py`
+- Modify: `voiceover/prose.py` (`skip_unread`)
+- Modify: `hooks/user_prompt_submit.py`, `hooks/pre_tool_use.py`, `hooks/post_tool_use.py`, `hooks/stop.py`, `hooks/notification.py`, `hooks/hooks.json` (SessionEnd)
+- Test: `tests/test_narrator_hooks.py` (additions and marker updates), `tests/test_cutover.py`, `tests/test_plugin_manifest.py` (seven events)
 
 **Interfaces:**
-- Consumes: `spool.clear`, `lease.hold/release`, `speech.enqueue_speech/ensure_drainer/prewarm/request_stop/play_sound`, `templates.blocking_dialog_message`
+- Consumes: `spool.clear`, `lease.*`, `speech.enqueue_speech/ensure_drainer/prewarm/request_stop/play_sound`, `templates.blocking_dialog_message`, `prose.peek_new_prose/commit_offset`, `projects.session_slug`
 - Produces (`voiceover/narrator.py`):
   - `DIALOG_TOOLS = ("AskUserQuestion", "ExitPlanMode")`
-  - `narrates(cwd=None) -> bool` — level is `narrator`, TTS enabled, engine not `none`
-  - `mod_active(session) -> bool`; `mark_mod_session(session) -> None` (prunes markers older than 7 days); `unmark_mod_session(session) -> None`. Marker: `data_dir()/mod_sessions/<session>`
-  - `cutover(cwd, session) -> None` — clear session's items, `request_stop`, `prewarm` when `narrates`
-  - `queue_dialog(cwd, session, tool_name, tool_input, lead_in=None, utterance=None) -> bool` — sticky item, `dialog_alert.json` on success, `ensure_drainer`, release
-  - `dialog_answered(cwd, session) -> None` — `prewarm` when `narrates`
-  - `turn_end(cwd, session, spoken) -> None` — release; decide chime when not spoken
-  - `write_dialog_marker() -> None`
+  - `narrates(cwd=None) -> bool`
+  - `mod_active(session) -> bool`, `mark_mod_session(session) -> None`, `unmark_mod_session(session) -> None` (marker `data_dir()/mod_sessions/<slug>`, week-old markers pruned)
+  - `pin_cwd(session, cwd) -> None`, `pinned_cwd(session, cwd) -> str | None`, `unpin(session) -> None` (`data_dir()/pins/<slug>`)
+  - `is_users_prompt(prompt_text) -> bool` (False for `<task-notification>...`)
+  - `stands_down(session, transcript_path) -> bool` — the mod narrates this session; the prose cursor is moved to the end
+  - `cutover(cwd, session, ttl=LEASE_TTL) -> None`
+  - `write_dialog_marker(session) -> None`, `dialog_recently_announced(session, within=30.0) -> bool` (`data_dir()/dialog_alert/<slug>`)
+  - `queue_dialog(cwd, session, tool_name, tool_input, lead_in=None, utterance=None) -> bool`
+  - `dialog_answered(cwd, session, ttl=LEASE_TTL) -> None`
+  - `turn_end(cwd, session, spoken) -> None`
+- Produces: `prose.skip_unread(transcript_path) -> None`; `hooks/session_end.py`
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `tests/test_narrator_hooks.py` before `report()`:
+In `tests/test_narrator_hooks.py`, the per-session dialog marker replaces the machine-wide one. Change `dialog_marker = Path(os.environ["VOICEOVER_DATA_DIR"]) / "dialog_alert.json"` to `dialog_marker = Path(os.environ["VOICEOVER_DATA_DIR"]) / "dialog_alert" / "S1"`, and in the notification echo-suppression block replace `dialog_marker.write_text(json.dumps({"ts": time.time()}))` with `narrator.write_dialog_marker("S1")` (add `from voiceover import narrator` beside the other imports at the top). Then append before `report()`:
 
 ```python
 # --- the lease table ------------------------------------------------------------
-from voiceover import narrator
-
-
-def lease_held(session="S1"):
-    return (spool.queue_dir().parent / "leases" / (session + ".json")).exists()
+def lease_held(session="S1", cwd=None):
+    return (spool.queue_dir(cwd).parent / "leases" / (session + ".json")).exists()
 
 
 spool.clear()
@@ -2162,6 +2539,45 @@ check("the answer takes it back", lease_held())
 run_hook("stop", base)
 check("the turn's end lets it go", not lease_held())
 
+# --- the pin survives a cd (Review Focus 2) -------------------------------------------
+from _harness import temp_dir
+elsewhere = temp_dir("vo-elsewhere-")
+(elsewhere / ".git").mkdir()
+spool.clear()
+run_hook("user_prompt_submit", {"cwd": str(REPO_ROOT), "session_id": "S1", "prompt": "go"})
+run_hook("pre_tool_use", dict(base, cwd=str(elsewhere), tool_name="Bash", tool_input={}))
+check("a tool call after a cd still holds the turn's own project", lease_held())
+check("and holds nothing in the directory it moved to", not lease_held(cwd=str(elsewhere)))
+run_hook("session_end", {"cwd": str(elsewhere), "session_id": "S1", "reason": "other"})
+check("SessionEnd releases the lease where it was held", not lease_held())
+check("and drops the pin", narrator.pinned_cwd("S1", None) is None)
+
+# --- a background task's notification does not cut over (Review Focus 4) --------------
+spool.clear()
+spool.enqueue("Still talking.", "kokoro", "bf_emma", session="S1")
+stop_dir = spool.queue_dir().parent / "stop"
+for old in stop_dir.glob("*.json"):
+    old.unlink()
+run_hook("user_prompt_submit", {"cwd": str(REPO_ROOT), "session_id": "S1",
+                                "prompt": "<task-notification>build finished</task-notification>"})
+check("a task notification leaves the queue alone", spool.pending_count() == 1)
+check("and requests no stop", not (stop_dir / "S1.json").exists())
+check("but warms the engine for its turn", lease_held())
+lease.release(None, "S1")
+
+# --- permission requests are sticky; the dialog echo marker is per session --------------
+spool.clear()
+narrator.write_dialog_marker("OTHER")
+path = write_transcript("perm.jsonl", [USER])
+commit_offset(str(path), path.stat().st_size)
+run_hook("notification", {"cwd": str(REPO_ROOT), "transcript_path": str(path),
+                          "message": "Claude needs your permission to use Bash",
+                          "session_id": "S1"})
+items = [json.loads(p.read_text()) for p in sorted(spool.queue_dir().glob("*.json"))]
+check("another session's dialog does not silence this session's permission request",
+      len(items) == 1, items)
+check("the permission request is sticky", items and items[0]["sticky"] is True, items)
+
 # --- with the mod running this session, the classic narrator paths stand down ---
 spool.clear()
 narrator.mark_mod_session("MOD")
@@ -2175,6 +2591,8 @@ for hook in ("pre_tool_use", "post_tool_use"):
 run_hook("stop", mod)
 check("no classic narrator path queues text for a mod session", queued_texts() == [], queued_texts())
 check("nor holds a lease for it", not lease_held("MOD"))
+from voiceover.prose import peek_new_prose
+check("the cursor moved past what the mod spoke", peek_new_prose(str(path))[0] is None)
 narrator.unmark_mod_session("MOD")
 check("unmarking ends the stand-down", not narrator.mod_active("MOD"))
 
@@ -2188,6 +2606,8 @@ check("a marker older than 7 days is pruned when another is written", not old.ex
 narrator.unmark_mod_session("NEW")
 ```
 
+Add `from voiceover import lease` beside the `narrator` import.
+
 In `tests/test_cutover.py`:
 - after `set_setting("interaction_level", "narrator")` near the top add `set_setting("tts_engine", "kokoro")`;
 - replace the "playback is stopped" section with:
@@ -2196,10 +2616,9 @@ In `tests/test_cutover.py`:
 # --- the session's sentence is stopped, the engine is NOT killed ---------------
 spool.clear()
 project = spool.queue_dir().parent
-(project / "tts.lock").write_text(json.dumps({"expiry": time.time() + 300, "pid": 999999}))
+(project / "tts.lock").write_text(json.dumps({"expiry": time.time() + 300, "pid": os.getpid()}))
 run_hook({"cwd": str(REPO_ROOT), "session_id": "S1", "prompt": "new question"})
-stop = json.loads((project / "stop.json").read_text())
-check("a stop request names the typing session", stop["session"] == "S1", stop)
+check("a stop request is filed for the typing session", (project / "stop" / "S1.json").exists())
 check("the engine's lock is left alone: it stays loaded for the reply",
       (project / "tts.lock").exists())
 (project / "tts.lock").unlink()
@@ -2215,16 +2634,16 @@ real = (voiceover.spool.clear, voiceover.narrator.request_stop,
 real_stdin = sys.stdin
 
 
-def run_main_recording(level):
+def run_main_recording(level, prompt="new question"):
     """Drive main() in-process at one level; return the calls it made, in order."""
     del order[:]
     set_setting("interaction_level", level)
     voiceover.spool.clear = lambda session=None, cwd=None: order.append("clear") or 0
     voiceover.narrator.request_stop = lambda cwd=None, session=None: order.append("stop")
-    voiceover.narrator.prewarm = lambda cwd=None, session=None: order.append("prewarm") or True
+    voiceover.narrator.prewarm = lambda cwd=None, session=None, ttl=None: order.append("prewarm") or True
     voiceover.speech.stop_speech = lambda: order.append("stop_speech")
     sys.stdin = io.StringIO(json.dumps(
-        {"cwd": str(REPO_ROOT), "session_id": "S1", "prompt": "new question"}))
+        {"cwd": str(REPO_ROOT), "session_id": "S1", "prompt": prompt}))
     try:
         ups.main()
     finally:
@@ -2236,6 +2655,8 @@ def run_main_recording(level):
 
 check("narrator: clear, then stop the sentence, then warm the engine",
       run_main_recording("narrator") == ["clear", "stop", "prewarm"], order)
+check("narrator, a task notification: only warm the engine",
+      run_main_recording("narrator", "<task-notification>x</task-notification>") == ["prewarm"], order)
 check("concise: clear, then stop the one-shot speaker",
       run_main_recording("concise") == ["clear", "stop_speech"], order)
 check("silent: only the clear", run_main_recording("silent") == ["clear"], order)
@@ -2246,36 +2667,54 @@ voiceover.narrator.unmark_mod_session("S1")
 set_setting("interaction_level", "narrator")
 ```
 
+In `tests/test_plugin_manifest.py` add `"SessionEnd"` to the `expected` set and change the check's label to `"all seven hook events are registered"`.
+
 - [ ] **Step 2: Run them to verify they fail**
 
-Run: `python3 tests/test_narrator_hooks.py; python3 tests/test_cutover.py`
-Expected: FAIL — `ImportError: cannot import name 'narrator'` / `No module named 'voiceover.narrator'`.
+Run: `python3 tests/test_narrator_hooks.py; python3 tests/test_cutover.py; python3 tests/test_plugin_manifest.py`
+Expected: FAIL — `ImportError: cannot import name 'narrator'`, and the manifest check `all seven hook events are registered`.
 
-- [ ] **Step 3: Create `voiceover/narrator.py`**
+- [ ] **Step 3: `skip_unread` in `voiceover/prose.py`**
+
+Add after `commit_offset`:
+
+```python
+def skip_unread(transcript_path) -> None:
+    """Mark everything written so far as narrated - someone else (the mod)
+    already spoke it - so a later fallback never replays it."""
+    _text, offset = peek_new_prose(transcript_path)
+    if offset:
+        commit_offset(transcript_path, offset)
+```
+
+- [ ] **Step 4: Create `voiceover/narrator.py`**
 
 ```python
 """Narrator-level actions shared by the classic hooks and the mod bridge.
 
 Both entry points parse their own input and call these, so what a prompt, a
 question dialog or a turn's end does to the queue, the lease and the engine
-has exactly one definition. Stdlib only; every function fails soft.
+has exactly one definition. Per-session records live under data_dir():
+mod_sessions/ (the mod narrates this session), pins/ (the project the
+classic hooks keep a session's turn in) and dialog_alert/ (a dialog was just
+announced). Stdlib only; every function fails soft.
 """
 
 import json
-import re
 import time
 
 from . import lease, spool
 from .debuglog import log as _log
+from .projects import session_slug
+from .prose import skip_unread
 from .settings import data_dir, get_interaction_level, is_tts_enabled, resolve_engine
 from .speech import enqueue_speech, ensure_drainer, play_sound, prewarm, request_stop
 from .templates import blocking_dialog_message
 
 DIALOG_TOOLS = ("AskUserQuestion", "ExitPlanMode")
 
-_MOD_SESSIONS_DIR_NAME = "mod_sessions"
-_MARKER_MAX_AGE_SECONDS = 7 * 86400
-_UNSAFE = re.compile(r"[^A-Za-z0-9_-]")
+_TASK_NOTIFICATION_PREFIX = "<task-notification>"
+_RECORD_MAX_AGE_SECONDS = 7 * 86400
 
 
 def narrates(cwd=None) -> bool:
@@ -2284,51 +2723,95 @@ def narrates(cwd=None) -> bool:
             and resolve_engine(cwd) != "none")
 
 
-# --- the mod's session marker ---------------------------------------------------
+# --- per-session records ----------------------------------------------------------
 
-def _marker(session):
-    name = _UNSAFE.sub("_", str(session or ""))
-    return data_dir() / _MOD_SESSIONS_DIR_NAME / name if name else None
-
-
-def mod_active(session) -> bool:
-    """True when the mod narrates this session, so the classic paths stand down."""
-    marker = _marker(session)
-    return marker is not None and marker.exists()
+def _record(kind, session):
+    slug = session_slug(session)
+    return data_dir() / kind / slug if slug else None
 
 
-def mark_mod_session(session) -> None:
-    """Record that the mod narrates session; prune week-old markers."""
-    marker = _marker(session)
-    if marker is None:
+def _write_record(kind, session, text) -> None:
+    """Write session's record of this kind; prune week-old ones of the kind."""
+    path = _record(kind, session)
+    if path is None:
         return
     try:
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        cutoff = time.time() - _MARKER_MAX_AGE_SECONDS
-        for old in marker.parent.iterdir():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        cutoff = time.time() - _RECORD_MAX_AGE_SECONDS
+        for old in path.parent.iterdir():
             try:
                 if old.stat().st_mtime < cutoff:
                     old.unlink()
             except OSError:
                 pass
-        marker.write_text("")
+        path.write_text(text)
     except OSError:
         pass
+
+
+def _read_record(kind, session):
+    path = _record(kind, session)
+    try:
+        return path.read_text() if path is not None else None
+    except OSError:
+        return None
+
+
+def _drop_record(kind, session) -> None:
+    path = _record(kind, session)
+    if path is None:
+        return
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def mod_active(session) -> bool:
+    """True when the mod narrates this session, so the classic paths stand down."""
+    return _read_record("mod_sessions", session) is not None
+
+
+def mark_mod_session(session) -> None:
+    _write_record("mod_sessions", session, "")
 
 
 def unmark_mod_session(session) -> None:
-    marker = _marker(session)
-    if marker is None:
-        return
-    try:
-        marker.unlink()
-    except OSError:
-        pass
+    _drop_record("mod_sessions", session)
+
+
+def pin_cwd(session, cwd) -> None:
+    """Keep this session's turn in cwd's project, wherever it cds to."""
+    if cwd:
+        _write_record("pins", session, str(cwd))
+
+
+def pinned_cwd(session, cwd):
+    """The session's pinned cwd, else cwd."""
+    return _read_record("pins", session) or cwd
+
+
+def unpin(session) -> None:
+    _drop_record("pins", session)
+
+
+def stands_down(session, transcript_path) -> bool:
+    """True when the mod narrates this session: the classic path does nothing
+    but move the prose cursor past what the mod already spoke."""
+    if not mod_active(session):
+        return False
+    skip_unread(transcript_path)
+    return True
+
+
+def is_users_prompt(prompt_text) -> bool:
+    """False for a background task's notification arriving as a prompt."""
+    return not str(prompt_text or "").lstrip().startswith(_TASK_NOTIFICATION_PREFIX)
 
 
 # --- the actions -----------------------------------------------------------------
 
-def cutover(cwd, session) -> None:
+def cutover(cwd, session, ttl=lease.LEASE_TTL) -> None:
     """The user's own new prompt: drop this session's pending text, stop its
     sentence mid-word, and warm the engine for the reply.
 
@@ -2341,23 +2824,27 @@ def cutover(cwd, session) -> None:
     _log("cutover", "dropped=%d pending items on a new prompt" % dropped, cwd)
     request_stop(cwd, session)
     if narrates(cwd):
-        prewarm(cwd, session)
+        prewarm(cwd, session, ttl=ttl)
 
 
-def write_dialog_marker() -> None:
-    """Tell notification.py a blocking dialog was just announced, so its
-    "needs permission" echo stays quiet."""
+def write_dialog_marker(session) -> None:
+    """Tell notification.py this session's blocking dialog was just
+    announced, so its "needs permission" echo stays quiet."""
+    _write_record("dialog_alert", session, json.dumps({"ts": time.time()}))
+
+
+def dialog_recently_announced(session, within=30.0) -> bool:
+    raw = _read_record("dialog_alert", session)
     try:
-        with open(data_dir() / "dialog_alert.json", "w") as handle:
-            json.dump({"ts": time.time()}, handle)
-    except OSError:
-        pass
+        return raw is not None and time.time() - float(json.loads(raw).get("ts", 0)) < within
+    except (ValueError, TypeError, AttributeError):
+        return False
 
 
 def queue_dialog(cwd, session, tool_name, tool_input, lead_in=None, utterance=None) -> bool:
     """Announce a dialog that is about to block the session on the user.
 
-    The alert is sticky - the jump rule never drops it - and the lease is
+    The alert is sticky - never dropped, played whole - and the lease is
     released, so the engine unloads once the alert has played while the user
     decides. The marker is written only when the alert actually queued:
     otherwise the notification echo is the only thing that will speak.
@@ -2367,16 +2854,16 @@ def queue_dialog(cwd, session, tool_name, tool_input, lead_in=None, utterance=No
     queued = enqueue_speech(text, cwd=cwd, full=True, session=session,
                             utterance=utterance, sticky=True)
     if queued:
-        write_dialog_marker()
+        write_dialog_marker(session)
     ensure_drainer(cwd)
     lease.release(cwd, session)
     return queued
 
 
-def dialog_answered(cwd, session) -> None:
+def dialog_answered(cwd, session, ttl=lease.LEASE_TTL) -> None:
     """The user answered: hold the engine again for the rest of the turn."""
     if narrates(cwd):
-        prewarm(cwd, session)
+        prewarm(cwd, session, ttl=ttl)
 
 
 def turn_end(cwd, session, spoken) -> None:
@@ -2387,7 +2874,7 @@ def turn_end(cwd, session, spoken) -> None:
         play_sound("decide", cwd=cwd)
 ```
 
-- [ ] **Step 4: Rewire the classic hooks**
+- [ ] **Step 5: Rewire the classic hooks**
 
 `hooks/user_prompt_submit.py` — replace `main()` with:
 
@@ -2404,10 +2891,15 @@ def main():
     level = get_interaction_level(cwd)
 
     if level == "narrator":
-        from voiceover import narrator
-        # The mod cuts over on its own when it narrates this session.
-        if not narrator.mod_active(session):
-            narrator.cutover(cwd, session)
+        from voiceover import lease, narrator
+        if narrator.mod_active(session):
+            return  # the mod cuts over on its own
+        narrator.pin_cwd(session, cwd)
+        if narrator.is_users_prompt(payload.get("prompt")):
+            narrator.cutover(cwd, session, ttl=lease.FALLBACK_LEASE_TTL)
+        elif narrator.narrates(cwd):
+            # A background task's turn: warm the engine, cut nothing off.
+            narrator.prewarm(cwd, session, ttl=lease.FALLBACK_LEASE_TTL)
         return
 
     # Clear at every other level, silent included: a queue stranded by a level
@@ -2421,7 +2913,7 @@ def main():
     stop_speech()  # the one-shot speaker only: process_utils scopes it
 ```
 
-and update the module docstring: at the narrator level a new prompt stops the session's sentence (a stop request) and pre-warms the engine; other levels clear and stop the one-shot speaker.
+and update the module docstring: at the narrator level the user's own prompt stops the session's sentence and pre-warms the engine, a task notification only pre-warms; other levels clear and stop the one-shot speaker.
 
 `hooks/pre_tool_use.py` — replace the narrator branch (from `if get_interaction_level(cwd) == "narrator":` through its `return`) with:
 
@@ -2434,9 +2926,10 @@ and update the module docstring: at the narrator level a new prompt stops the se
         from voiceover.speech import ensure_drainer, enqueue_speech
 
         session = payload.get("session_id")
-        if narrator.mod_active(session):
-            return
         transcript = payload.get("transcript_path", "")
+        if narrator.stands_down(session, transcript):
+            return
+        cwd = narrator.pinned_cwd(session, cwd)
         tool_name = payload.get("tool_name", "")
         text, offset = peek_new_prose(transcript)
         if tool_name in narrator.DIALOG_TOOLS:
@@ -2452,7 +2945,7 @@ and update the module docstring: at the narrator level a new prompt stops the se
                                      payload.get("tool_input") or {}, lead_in=text) and text:
                 commit_offset(transcript, offset)
             return
-        lease.hold(cwd, session)
+        lease.hold(cwd, session, ttl=lease.FALLBACK_LEASE_TTL)
         if text and enqueue_speech(text, cwd=cwd, full=True, session=session):
             commit_offset(transcript, offset)
         ensure_drainer(cwd)
@@ -2469,15 +2962,15 @@ and update the module docstring: at the narrator level a new prompt stops the se
         from voiceover.prose import commit_offset, peek_new_prose
         from voiceover.speech import ensure_drainer, enqueue_speech
 
-        cwd = payload.get("cwd")
         session = payload.get("session_id")
-        if narrator.mod_active(session):
-            return
-        if payload.get("tool_name") in narrator.DIALOG_TOOLS:
-            narrator.dialog_answered(cwd, session)  # warm up again for the rest
-        else:
-            lease.hold(cwd, session)
         transcript = payload.get("transcript_path", "")
+        if narrator.stands_down(session, transcript):
+            return
+        cwd = narrator.pinned_cwd(session, payload.get("cwd"))
+        if payload.get("tool_name") in narrator.DIALOG_TOOLS:
+            narrator.dialog_answered(cwd, session, ttl=lease.FALLBACK_LEASE_TTL)
+        else:
+            lease.hold(cwd, session, ttl=lease.FALLBACK_LEASE_TTL)
         text, offset = peek_new_prose(transcript)
         if text and enqueue_speech(text, cwd=cwd, full=True, session=session):
             # Queued means it WILL be spoken, so the cursor can advance now.
@@ -2491,8 +2984,9 @@ and update the module docstring: at the narrator level a new prompt stops the se
 ```python
         from voiceover import narrator
         session = payload.get("session_id")
-        if narrator.mod_active(session):
+        if narrator.stands_down(session, transcript_path):
             return
+        cwd = narrator.pinned_cwd(session, cwd)
 ```
 
 and replace everything after the polling loop's log line, up to the end of the narrator branch, with:
@@ -2510,16 +3004,95 @@ and replace everything after the polling loop's log line, up to the end of the n
         return
 ```
 
-- [ ] **Step 5: Run the tests and the suite**
+`hooks/notification.py` — in `main()`, replace the narrator echo-suppression block and the narrator enqueue with:
+
+```python
+    session = payload.get("session_id")
+    if level == "narrator":
+        from voiceover import narrator
+        # If this session's dialog was announced moments ago, this is its
+        # "needs permission" echo - speaking it would repeat the alert.
+        if narrator.dialog_recently_announced(session):
+            return
+        cwd = narrator.pinned_cwd(session, cwd)
+
+    text = permission_request_message(payload)
+    if text:
+        if level == "narrator":
+            from voiceover.speech import ensure_drainer, enqueue_speech
+            # Sticky: the session is blocked on this answer, so no newer
+            # message may drop it or cut it short.
+            enqueue_speech(text, min_level="concise", cwd=cwd, session=session, sticky=True)
+            ensure_drainer(cwd)
+        else:
+            speak(text, min_level="concise", cwd=cwd, interrupt=True)
+```
+
+(the `from voiceover.settings import data_dir, get_interaction_level` line in that block goes away).
+
+Create `hooks/session_end.py`:
+
+```python
+#!/usr/bin/env python3
+"""SessionEnd hook: let go of the session's engine lease and its pin.
+
+The fallback's only reliable end for a session: Stop does not fire when the
+user interrupts, and an exit would otherwise hold the lease until its TTL.
+Never blocks, never prints to stdout, always exits 0.
+"""
+
+import json
+import sys
+from pathlib import Path
+
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PLUGIN_ROOT))
+
+
+def main():
+    payload = json.load(sys.stdin)
+
+    from voiceover import lease, narrator
+
+    session = payload.get("session_id")
+    lease.release(narrator.pinned_cwd(session, payload.get("cwd")), session)
+    narrator.unpin(session)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        pass
+    sys.exit(0)
+```
+
+In `hooks/hooks.json` add, after the `UserPromptSubmit` entry:
+
+```json
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" session_end",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+```
+
+- [ ] **Step 6: Run the tests and the suite**
 
 Run: `python3 tests/test_narrator_hooks.py && python3 tests/test_cutover.py && bash tests/run_all.sh 2>&1 | grep -E "^FAIL|ALL TESTS|SOME TESTS"`
 Expected: both files pass, then `ALL TESTS PASSED`
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add voiceover/narrator.py hooks/ tests/
-git commit -m "feat: narrator actions shared by hooks and mod; hooks hold/release leases
+git add voiceover/narrator.py voiceover/prose.py hooks/ tests/
+git commit -m "feat: narrator actions shared by hooks and mod; pinned sessions, sticky permissions
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -2530,12 +3103,13 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 **Files:**
 - Modify: `voiceover/process_utils.py` (`TTS_PROCESS_PATTERNS`)
-- Modify: `tts/tts_controller.py` (`UNIX_PATTERNS`, `clear_projects`, `stop_tts`)
+- Modify: `scripts/manage_voices.py`, `scripts/setup_tts.py` (one-shot `--voice` form)
+- Modify: `tts/tts_controller.py` (`UNIX_PATTERNS`, every project lock owner, `clear_projects`)
 - Test: `tests/test_stop_scope.py` (new)
 
 **Interfaces:**
 - Consumes: drainer argv `--drain <dir>` (Task 2), `say --voice=` (Task 3), one-shot wavs named `voiceover-oneshot-*.wav` (Task 3)
-- Produces: `process_utils.TTS_PROCESS_PATTERNS` matching one-shots only; `tts_controller.clear_projects() -> None`
+- Produces: `process_utils.TTS_PROCESS_PATTERNS` matching one-shots only; `tts_controller.clear_projects() -> None`; `tts_controller.lock_paths() -> list[Path]`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2544,13 +3118,12 @@ Create `tests/test_stop_scope.py`:
 ```python
 """The one-shot interrupt never reaches a narrator engine or its playback.
 
-Another project may be narrating: a concise-level session's interrupt must
-only stop the one-shot speaker. Stand-in processes carry the real command
-lines; pkill -f matches on those."""
+Checked in-process against the real command lines - pkill -f matches each
+pattern as an extended regex anywhere in the command line, Windows matches a
+lowercase substring - so the test never kills anything on this machine."""
 
-import subprocess
+import re
 import sys
-import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -2559,52 +3132,60 @@ from _harness import check, isolate, report, REPO_ROOT
 data_dir = isolate()
 from voiceover import process_utils
 
-if sys.platform == "win32":
-    print("SKIP  POSIX-only: pkill command-line patterns")
-    report()
+PATTERNS = process_utils.TTS_PROCESS_PATTERNS
 
 
-def stand_in(*argv):
-    """A sleeping process whose command line carries argv."""
-    return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"] + list(argv))
+def unix_kills(cmdline):
+    return any(re.search(pattern, cmdline) for pattern in PATTERNS)
 
 
-survivors = {
-    "a kokoro drainer": stand_in("kokoro_voice.py", "--drain", "/d/projects/abc"),
-    "a macOS drainer": stand_in("macos_say.py", "--drain", "/d/projects/abc"),
-    "a drainer's say": stand_in("say", "--voice=Samantha"),
-    "a drainer's wav playback": stand_in("afplay", "/d/projects/abc/play/1-2.wav"),
+def windows_kills(cmdline):
+    return any(pattern.lower() in cmdline.lower() for pattern in PATTERNS)
+
+
+DRAINERS = {
+    "a kokoro drainer": "uv run --project /p/tts /p/tts/kokoro_voice.py --drain /d/projects/abc",
+    "a macOS drainer": "python3 /p/tts/macos_say.py --drain /d/projects/abc",
+    "a drainer's say": "say --voice=Samantha",
+    "a drainer's afplay": "afplay /d/projects/abc/play/12-3.wav",
+    "a drainer's aplay": "aplay -q /d/projects/abc/play/12-3.wav",
 }
-victims = {
-    "the one-shot kokoro engine": stand_in("kokoro_voice.py", "--voice", "bf_emma", "--stream", "hi"),
-    "the one-shot say engine": stand_in("macos_say.py", "--voice", "Samantha", "hi"),
-    "the one-shot say child": stand_in("say", "-v", "Samantha"),
-    "the one-shot wav playback": stand_in("afplay", "/tmp/voiceover-oneshot-abc.wav"),
+ONE_SHOTS = {
+    "the one-shot kokoro engine": "uv run --project /p/tts /p/tts/kokoro_voice.py --voice bf_emma --stream hello",
+    "a voice preview": "uv run --project /p/tts /p/tts/kokoro_voice.py --voice af_nicole Hello there",
+    "the one-shot say engine": "python3 /p/tts/macos_say.py --voice Samantha hello",
+    "the one-shot say child": "say -v Samantha",
+    "the one-shot wav playback": "afplay /var/folders/xy/T/voiceover-oneshot-abc.wav",
 }
-time.sleep(0.2)
-process_utils.kill_processes_by_pattern(process_utils.TTS_PROCESS_PATTERNS)
-time.sleep(0.3)
-for name, proc in survivors.items():
-    check(name + " survives the one-shot interrupt", proc.poll() is None)
-for name, proc in victims.items():
-    check(name + " is stopped", proc.poll() is not None)
-for proc in list(survivors.values()) + list(victims.values()):
-    if proc.poll() is None:
-        proc.kill()
-    proc.wait()
+for name, cmdline in DRAINERS.items():
+    check(name + " survives the one-shot interrupt",
+          not unix_kills(cmdline) and not windows_kills(cmdline), cmdline)
+for name, cmdline in ONE_SHOTS.items():
+    check(name + " is stopped by it", unix_kills(cmdline), cmdline)
 
-# --- the kill switch clears every project's state --------------------------------
+# --- every one-shot caller uses the --voice form the patterns match ---------------
+for script in ("scripts/manage_voices.py", "scripts/setup_tts.py"):
+    source = (REPO_ROOT / script).read_text()
+    check(script + " calls kokoro_voice.py with --voice",
+          re.search(r'kokoro_voice\.py"\),\s*"--voice"', source) is not None)
+
+# --- the kill switch reaches every project and clears its state --------------------
 sys.path.insert(0, str(REPO_ROOT / "tts"))
 import tts_controller
 
 project = data_dir / "projects" / "abc123def456"
-for relative in ("tts.lock", "stop.json", "queue/1.json", "leases/S1.json", "play/1.wav"):
+for relative in ("tts.lock", "stop/S1.json", "queue/1.json", "leases/S1.json", "play/1.wav"):
     (project / relative).parent.mkdir(parents=True, exist_ok=True)
     (project / relative).write_text("x")
+check("the kill switch looks at every project's lock",
+      project / "tts.lock" in tts_controller.lock_paths(), tts_controller.lock_paths())
 tts_controller.clear_projects()
-check("the kill switch leaves no lock, queue, lease or stop file",
+check("and leaves no lock, queue, lease, stop file or wav behind",
       [p for p in project.rglob("*") if p.is_file()] == [],
       [str(p) for p in project.rglob("*") if p.is_file()])
+check("the kill switch also stops a drainer's say and aplay",
+      any(re.search(p, "say --voice=Samantha") for p in tts_controller.UNIX_PATTERNS)
+      and any(re.search(p, "aplay -q /d/projects/abc/play/1.wav") for p in tts_controller.UNIX_PATTERNS))
 
 report()
 ```
@@ -2612,7 +3193,7 @@ report()
 - [ ] **Step 2: Run it to verify it fails**
 
 Run: `python3 tests/test_stop_scope.py`
-Expected: FAIL — the drainer survivors are killed (`a kokoro drainer survives ...` FAIL) and `AttributeError: module 'tts_controller' has no attribute 'clear_projects'`.
+Expected: FAIL — the drainer checks (`a kokoro drainer survives ...`) fail against today's broad `kokoro_voice.py` pattern, and the script checks fail.
 
 - [ ] **Step 3: Scope the patterns in `voiceover/process_utils.py`**
 
@@ -2621,7 +3202,8 @@ Expected: FAIL — the drainer survivors are killed (`a kokoro drainer survives 
 # Narrator drainers run as `--drain <project dir>`, speak through
 # `say --voice=<Name>` and play wavs from their project's play/ directory, so
 # none of these reach them: another project may be narrating, and a
-# concise-level interrupt must not cut it off.
+# concise-level interrupt must not cut it off. Every one-shot caller uses the
+# `kokoro_voice.py --voice ...` form.
 TTS_PROCESS_PATTERNS = [
     "kokoro_voice.py --voice",
     "macos_say.py --voice",
@@ -2634,22 +3216,75 @@ TTS_PROCESS_PATTERNS = [
 ]
 ```
 
-Update the module docstring's pattern note to match, and `_kill_lock_owner_group`'s comment: only one-shot engines hold the global lock now.
+Update `_kill_lock_owner_group`'s docstring: only one-shot engines hold the global lock.
 
-- [ ] **Step 4: Extend the kill switch in `tts/tts_controller.py`**
+- [ ] **Step 4: The one-shot callers**
 
-Add `r"(^|[/ ])say --voice="` to `UNIX_PATTERNS` (after the `say -v` line, comment: "the `say` a drainer spawns"). Add:
+In `scripts/manage_voices.py`, change the kokoro command's last items from `str(PLUGIN_ROOT / "tts" / "kokoro_voice.py"), voice, text,` to `str(PLUGIN_ROOT / "tts" / "kokoro_voice.py"), "--voice", voice, text,`. In `scripts/setup_tts.py`, change `str(PLUGIN_ROOT / "tts" / "kokoro_voice.py"), settings.get_voice(), text]` to `str(PLUGIN_ROOT / "tts" / "kokoro_voice.py"), "--voice", settings.get_voice(), text]`. (`kokoro_voice.parse_args` already accepts `--voice`.)
+
+- [ ] **Step 5: The kill switch in `tts/tts_controller.py`**
+
+Add to `UNIX_PATTERNS`, after the `say -v ` line:
 
 ```python
+    r"(^|[/ ])say --voice=",  # the `say` a drainer spawns
+    r"aplay .*\.wav",         # a drainer's playback on Linux
+    r"ffplay .*\.wav",
+```
+
+Replace `_lock_owner_pid` and `_kill_lock_owner_group` with:
+
+```python
+def lock_paths():
+    """The one-shot speaker's lock and every project engine's lock."""
+    paths = [data_dir() / "tts.lock"]
+    try:
+        paths.extend(p / "tts.lock" for p in (data_dir() / "projects").iterdir() if p.is_dir())
+    except OSError:
+        pass
+    return paths
+
+
+def _lock_owner_pid(lock_path):
+    """PID recorded in a lock by the engine that owns it, if any."""
+    try:
+        return int(json.loads(lock_path.read_text().strip()).get("pid"))
+    except Exception:
+        return None
+
+
+def _kill_lock_owner_groups():
+    """Kill each lock owner's whole process group - the engine plus its
+    afplay/say audio child - so no ghost audio outlives the kill switch.
+
+    Engines are spawned with start_new_session=True, so PID == PGID. Each PID
+    is verified against our engine names before signalling, in case it was
+    recycled by an unrelated process."""
+    if sys.platform == "win32":
+        return
+    for lock_path in lock_paths():
+        pid = _lock_owner_pid(lock_path)
+        if not pid:
+            continue
+        try:
+            probe = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                                   capture_output=True, text=True, timeout=2)
+            command = probe.stdout.strip()
+            if "kokoro_voice.py" in command or "macos_say.py" in command:
+                os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except Exception:
+            pass
+
+
 def clear_projects():
-    """Drop every project's lock, queue, leases, stop file and wavs, so the
+    """Drop every project's lock, queue, leases, stop files and wavs, so the
     kill switch leaves nothing that would restart narration."""
     try:
         projects = [p for p in (data_dir() / "projects").iterdir() if p.is_dir()]
     except OSError:
         return
     for project in projects:
-        for pattern in ("tts.lock", "stop.json", "queue/*", "leases/*", "play/*"):
+        for pattern in ("tts.lock", "spawned.json", "stop/*", "queue/*", "leases/*", "play/*"):
             for path in project.glob(pattern):
                 try:
                     path.unlink()
@@ -2657,17 +3292,17 @@ def clear_projects():
                     pass
 ```
 
-and call `clear_projects()` at the end of `stop_tts()`. Update the module docstring: the kill switch stops every engine, drainers included.
+In `stop_tts()` call `_kill_lock_owner_groups()` in place of `_kill_lock_owner_group()` and add `clear_projects()` at the end. Update the module docstring: the kill switch stops every engine, drainers included, and clears every project.
 
-- [ ] **Step 5: Run the test and the suite**
+- [ ] **Step 6: Run the test and the suite**
 
 Run: `python3 tests/test_stop_scope.py && bash tests/run_all.sh 2>&1 | grep -E "^FAIL|ALL TESTS|SOME TESTS"`
-Expected: `9/9 checks passed in test_stop_scope.py` then `ALL TESTS PASSED`
+Expected: `15/15 checks passed in test_stop_scope.py` then `ALL TESTS PASSED`
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add voiceover/process_utils.py tts/tts_controller.py tests/test_stop_scope.py
+git add voiceover/process_utils.py scripts/manage_voices.py scripts/setup_tts.py tts/tts_controller.py tests/test_stop_scope.py
 git commit -m "fix: a one-shot interrupt can no longer kill another project's narration
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
@@ -2683,12 +3318,12 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `voiceover.narrator.*` (Task 5), `speech.enqueue_speech/ensure_drainer/prewarm`, `lease.release`, `prose.clean_for_speech`
-- Produces: `bash hooks/run.sh mod_bridge` reading `{"session": str, "cwd": str, "ops": [...]}` on stdin, ops:
-  - `{"op":"start"}` → `mark_mod_session`
+- Produces: `bash hooks/run.sh mod_bridge` reading `{"session": str, "cwd": str, "ops": [...]}` on stdin. Every batch first marks the session. Ops:
+  - `{"op":"start"}`, `{"op":"status"}` → nothing beyond the mark
   - `{"op":"end-session"}` → `lease.release`, `unmark_mod_session`
-  - `{"op":"prompt"}` → `mark_mod_session`; when narrating, `cutover`
+  - `{"op":"prompt","cutover":bool}` → when narrating and `cutover`, `narrator.cutover`
   - `{"op":"hold"}` → `prewarm` (narrating only)
-  - `{"op":"say","utterance":str,"text":str,"shown":float}` → `clean_for_speech`, `enqueue_speech(full=True, utterance=, shown=)` (narrating only); one `ensure_drainer` after the batch
+  - `{"op":"say","utterance":str,"text":str,"shown":float}` → cleaned (`clean_for_speech`, then unpaired `*` and backticks stripped), `enqueue_speech(full=True, utterance=, shown=)` (narrating only); one `ensure_drainer` after the batch
   - `{"op":"dialog","tool":str,"input":dict,"utterance":str|null}` → `queue_dialog` (narrating only)
   - `{"op":"turn-end","spoken":bool}` → `turn_end` (narrating only)
   - stdout: exactly one line, `{"narrate": true|false}` (`null` after an internal error)
@@ -2721,9 +3356,8 @@ PROJECT = spool.queue_dir().parent
 def bridge(*ops, session="S1", stdin=None):
     payload = stdin if stdin is not None else json.dumps(
         {"session": session, "cwd": str(REPO_ROOT), "ops": list(ops)})
-    proc = subprocess.run(["bash", str(REPO_ROOT / "hooks" / "run.sh"), "mod_bridge"],
+    return subprocess.run(["bash", str(REPO_ROOT / "hooks" / "run.sh"), "mod_bridge"],
                           input=payload, capture_output=True, text=True, env=os.environ.copy())
-    return proc
 
 
 def reply(proc):
@@ -2738,37 +3372,48 @@ def leased(session="S1"):
     return (PROJECT / "leases" / (session + ".json")).exists()
 
 
-# --- prompt: the gate, the marker, the cutover ------------------------------------
-proc = bridge({"op": "prompt"})
+# --- prompt: the gate, the cutover ---------------------------------------------------
+proc = bridge({"op": "prompt", "cutover": True})
 check("the bridge exits 0", proc.returncode == 0, proc.stderr)
 check("it prints exactly one line", len(proc.stdout.strip().splitlines()) == 1, proc.stdout)
 check("prompt reports narration on", reply(proc) == {"narrate": True}, proc.stdout)
-check("prompt marks the session (Review Focus 3)", narrator.mod_active("S1"))
-check("prompt writes the stop request", json.loads((PROJECT / "stop.json").read_text())["session"] == "S1")
-check("prompt pre-warms: the session holds a lease", leased())
+check("the batch marks the session", narrator.mod_active("S1"))
+check("a cutover prompt files the session's stop request", (PROJECT / "stop" / "S1.json").exists())
+check("and pre-warms: the session holds a lease", leased())
 
-# --- say: cleaned, one message, timestamps kept -------------------------------------
 spool.clear()
-bridge({"op": "say", "utterance": "T:0:0", "text": "**Reading** the loader. ", "shown": 100.5},
-       {"op": "say", "utterance": "T:0:0", "text": "| a | b |\n", "shown": 100.6},
-       {"op": "say", "utterance": "T:0:0", "text": "Then the tests.", "shown": 100.7})
+spool.enqueue("Mid-sentence.", "kokoro", "bf_emma", session="S1")
+(PROJECT / "stop" / "S1.json").unlink()
+bridge({"op": "prompt", "cutover": False})
+check("a prompt that is not the user's own drops nothing", spool.pending_count() == 1)
+check("and stops nothing", not (PROJECT / "stop" / "S1.json").exists())
+
+# --- any op marks a session (Review Focus 3) -------------------------------------------
+bridge({"op": "status"}, session="AFTER-CLEAR")
+check("a session id first seen in any op is marked", narrator.mod_active("AFTER-CLEAR"))
+
+# --- say: cleaned, one message, timestamps kept -----------------------------------------
+spool.clear()
+bridge({"op": "say", "utterance": "T:0", "text": "**Reading** the loader. ", "shown": 100.5},
+       {"op": "say", "utterance": "T:0", "text": "| a | b |\n", "shown": 100.6},
+       {"op": "say", "utterance": "T:0", "text": "**Then. ", "shown": 100.7})
 queued = items()
-check("each speakable segment is queued, markdown cleaned",
-      [i["text"] for i in queued] == ["Reading the loader.", "Then the tests."], queued)
-check("segments of one block share its utterance", {i["utterance"] for i in queued} == {"T:0:0"})
+check("each speakable segment is queued, markdown cleaned, stray markers stripped",
+      [i["text"] for i in queued] == ["Reading the loader.", "Then."], queued)
+check("segments of one response share its utterance", {i["utterance"] for i in queued} == {"T:0"})
 check("the shown time is kept for latency logging", queued[0]["shown"] == 100.5, queued[0])
 
-# --- dialog: sticky, under the lead-in's utterance, lease released --------------------
+# --- dialog: sticky, under the lead-in's utterance, lease released ------------------------
 spool.clear()
 bridge({"op": "hold"})
-bridge({"op": "dialog", "tool": "AskUserQuestion", "utterance": "T:0:0",
+bridge({"op": "dialog", "tool": "AskUserQuestion", "utterance": "T:0",
         "input": {"questions": [{"question": "Which approach?", "options": [{"label": "A"}]}]}})
 alert = items()
 check("the dialog alert is queued sticky under the lead-in's message",
-      len(alert) == 1 and alert[0]["sticky"] is True and alert[0]["utterance"] == "T:0:0", alert)
+      len(alert) == 1 and alert[0]["sticky"] is True and alert[0]["utterance"] == "T:0", alert)
 check("it reads the actual question", alert and "Which approach?" in alert[0]["text"], alert)
 check("the lease is released while the user decides", not leased())
-check("the notification echo is suppressed", (data_dir / "dialog_alert.json").exists())
+check("this session's echo is suppressed", narrator.dialog_recently_announced("S1"))
 
 # --- turn-end ---------------------------------------------------------------------------
 bridge({"op": "hold"})
@@ -2776,10 +3421,11 @@ proc = bridge({"op": "turn-end", "spoken": False})
 check("turn-end releases the lease", not leased())
 check("a silent turn ends on the chime", "[voiceover] sound: decide" in proc.stderr, proc.stderr)
 
-# --- below the narrator level, only the gate and the marker act -----------------------
+# --- below the narrator level, only the gate and the mark act -----------------------------
 set_setting("interaction_level", "concise")
 spool.clear()
-proc = bridge({"op": "prompt"}, {"op": "say", "utterance": "U", "text": "Not spoken."},
+proc = bridge({"op": "prompt", "cutover": True},
+              {"op": "say", "utterance": "U", "text": "Not spoken."}, {"op": "hold"},
               session="S2")
 check("concise: narration reported off", reply(proc) == {"narrate": False}, proc.stdout)
 check("concise: nothing queued", items() == [], items())
@@ -2817,54 +3463,67 @@ here and in voiceover/, shared with the classic hooks. Input:
 
     {"session": str, "cwd": str, "ops": [op, ...]}
 
-    {"op": "start"}          the mod narrates this session (classic paths stand down)
-    {"op": "end-session"}    release the lease, drop the marker
-    {"op": "prompt"}         mark the session (a /clear starts a new id with no
-                             session.start); when narrating, cut over
-    {"op": "hold"}           a model step began: hold and warm the engine
+    {"op": "start"} / {"op": "status"}   nothing beyond marking the session
+    {"op": "end-session"}                release the lease, drop the mark
+    {"op": "prompt", "cutover": bool}    the user's own prompt cuts over
+    {"op": "hold"}                       a turn or step began: hold, warm up
     {"op": "say", "utterance": str, "text": str, "shown": float}
     {"op": "dialog", "tool": str, "input": dict, "utterance": str | null}
     {"op": "turn-end", "spoken": bool}
 
-Prints exactly one line, {"narrate": bool}: the narrator gate as of this call
-(null after an internal error). Never blocks, always exits 0.
+Every batch marks the session first: /clear and resume change the id with
+no session.start, and the classic hooks must stand down for the new one from
+its very first op. Prints exactly one line, {"narrate": bool} - the narrator
+gate as of this call (null after an internal error). Always exits 0.
 """
 
 import json
+import re
 import sys
 from pathlib import Path
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PLUGIN_ROOT))
 
+_STRAY_MARKERS = re.compile(r"[*`]+")
+
+
+def speakable(text):
+    """A streamed segment as speech: markdown cleaned, and any * or backtick
+    a mid-markup split left unpaired removed."""
+    from voiceover.prose import clean_for_speech
+
+    return _STRAY_MARKERS.sub("", clean_for_speech(text or "")).strip()
+
 
 def run(payload):
     """Execute one batch of ops in order; return the narrator gate."""
     from voiceover import lease, narrator
-    from voiceover.prose import clean_for_speech
+    from voiceover.debuglog import log as _log
     from voiceover.speech import enqueue_speech, ensure_drainer, prewarm
 
     session = payload.get("session")
     cwd = payload.get("cwd")
+    ops = [op for op in (payload.get("ops") or []) if isinstance(op, dict)]
+    narrator.mark_mod_session(session)
     narrate = narrator.narrates(cwd)
+    _log("bridge", "session=%s ops=%s narrate=%s" % (
+        session, ",".join(str(op.get("op")) for op in ops), narrate), cwd)
     queued = False
-    for op in payload.get("ops") or []:
-        kind = op.get("op") if isinstance(op, dict) else None
-        if kind == "start":
-            narrator.mark_mod_session(session)
-        elif kind == "end-session":
+    for op in ops:
+        kind = op.get("op")
+        if kind == "end-session":
             lease.release(cwd, session)
             narrator.unmark_mod_session(session)
-        elif kind == "prompt":
-            narrator.mark_mod_session(session)
-            if narrate:
-                narrator.cutover(cwd, session)
-        elif not narrate:
+        elif not narrate or kind in ("start", "status"):
             continue
+        elif kind == "prompt":
+            if op.get("cutover"):
+                narrator.cutover(cwd, session)
         elif kind == "hold":
             prewarm(cwd, session)
         elif kind == "say":
-            text = clean_for_speech(op.get("text") or "")
+            text = speakable(op.get("text"))
             if text and enqueue_speech(text, cwd=cwd, full=True, session=session,
                                        utterance=op.get("utterance"), shown=op.get("shown")):
                 queued = True
@@ -2897,7 +3556,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run the test and the suite**
 
 Run: `python3 tests/test_mod_bridge.py && bash tests/run_all.sh 2>&1 | grep -E "^FAIL|ALL TESTS|SOME TESTS"`
-Expected: `23/23 checks passed in test_mod_bridge.py` then `ALL TESTS PASSED`
+Expected: `26/26 checks passed in test_mod_bridge.py` then `ALL TESTS PASSED`
 
 - [ ] **Step 5: Commit**
 
@@ -2957,7 +3616,7 @@ test('a newline ends a segment', () => {
   expect(segmenter.push('A heading\n- an item\n')).toEqual(['A heading\n', '- an item\n'])
 })
 
-test('a fenced block is held until it closes, then emitted whole', () => {
+test('a fence at a line start is held until it closes, then emitted whole', () => {
   const segmenter = createSegmenter()
   expect(segmenter.push('Look:\n```ts\nconst a = 1. b\n')).toEqual(['Look:\n'])
   expect(segmenter.push('```\nAfter.')).toEqual(['```ts\nconst a = 1. b\n```\n'])
@@ -2968,6 +3627,11 @@ test('a fence marker split across chunks is still recognized', () => {
   const segmenter = createSegmenter()
   expect(segmenter.push('``')).toEqual([])
   expect(segmenter.push('`\nx. y\n```\n')).toEqual(['```\nx. y\n```\n'])
+})
+
+test('backticks mentioned inside a line are not a fence', () => {
+  const segmenter = createSegmenter()
+  expect(segmenter.push('Wrap code in ``` marks. Then go.')).toEqual(['Wrap code in ``` marks. '])
 })
 
 test('punctuation inside a word or number is not a boundary', () => {
@@ -2992,9 +3656,9 @@ Expected: FAIL — `segment.test.ts` cannot resolve `./segment`.
 ```ts
 /**
  * Cuts streaming markdown into speakable segments: one per sentence or line,
- * as soon as each completes, never splitting a fenced code block - a fence
- * is emitted whole once it closes, so the bridge's cleaner turns it into the
- * spoken code cue.
+ * as soon as each completes. A fenced code block (``` at the start of a
+ * line) is held until it closes and emitted whole, so the bridge's cleaner
+ * turns it into the spoken code cue; ``` mentioned inside a line is text.
  */
 export type Segmenter = {
   /** Appends streamed text; returns the segments it completed, in order. */
@@ -3034,7 +3698,7 @@ export function createSegmenter(): Segmenter {
 export function boundary(text: string): number {
   let inFence = false
   for (let i = 0; i < text.length; i++) {
-    if (text.startsWith(FENCE, i)) {
+    if (text.startsWith(FENCE, i) && (i === 0 || text[i - 1] === '\n')) {
       inFence = !inFence
       i += FENCE.length - 1
       continue
@@ -3070,17 +3734,18 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ### Task 9: The mod
 
 **Files:**
-- Create: `hooks/bridge.ts`, `hooks/narrator.ts`
-- Modify: `hooks/hooks.json` (add `"modules"`)
-- Test: `hooks/bridge.test.ts`, `hooks/narrator.test.ts`, `tests/test_plugin_manifest.py` (modules check)
+- Create: `hooks/bridge.ts`, `hooks/origin.ts`, `hooks/narrator.ts`, `hooks/mod.json`
+- Modify: `.claude-plugin/plugin.json` (`"hooks": "./hooks/mod.json"`), `tests/test_plugin_manifest.py`
+- Test: `hooks/bridge.test.ts`, `hooks/origin.test.ts`, `hooks/narrator.test.ts`
 
 **Interfaces:**
-- Consumes: `createSegmenter` (Task 8); `hooks/mod_bridge.py`'s op protocol (Task 7); Claude Code events `session.start`, `session.end`, `prompt.submit`, `turn.step`, `tool.call`, `turn.complete`; `$.process.run`, `$.session.id/cwd`, `$.plugin.root`, `$.ui.log`
+- Consumes: `createSegmenter` (Task 8); the bridge op protocol (Task 7); events `session.start`, `session.end`, `prompt.submit`, `turn.start`, `turn.step`, `tool.call`, `turn.complete`; `$.process.run`, `$.session.id/root`, `$.plugin.root`, `$.ui.log`
 - Produces:
-  - `bridge.ts`: `type Op` (the seven ops), `type Reply = { narrate: boolean }`, `createChannel(run: Run): Channel` (`send(op): Promise<Reply>`, never rejects), `runBridge($, session, cwd, ops): Promise<Reply>`, `parseReply(stdout): Reply`
+  - `bridge.ts`: `type Op` (the eight ops), `type Reply = { narrate: boolean }`, `createChannel(run: Run): Channel` (`send(op): Promise<Reply>`, never rejects), `runBridge($, session, cwd, ops): Promise<Reply>`, `parseReply(stdout): Reply`
+  - `origin.ts`: `isUsersOwnPrompt(origin: { kind: string } | undefined): boolean`
   - `narrator.ts`: `export const register: Register`
 
-- [ ] **Step 1: Write the failing channel test**
+- [ ] **Step 1: Write the failing unit tests**
 
 Create `hooks/bridge.test.ts`:
 
@@ -3097,14 +3762,14 @@ test('ops are delivered in order, batched while a call is in flight', async () =
     if (calls.length === 1) await gate
     return { narrate: true }
   })
-  const first = channel.send({ op: 'prompt' })
+  const first = channel.send({ op: 'prompt', cutover: true })
   const second = channel.send({ op: 'hold' })
   const third = channel.send({ op: 'turn-end', spoken: false })
   release()
   expect(await first).toEqual({ narrate: true })
   await second
   await third
-  expect(calls).toEqual([[{ op: 'prompt' }], [{ op: 'hold' }, { op: 'turn-end', spoken: false }]])
+  expect(calls).toEqual([[{ op: 'prompt', cutover: true }], [{ op: 'hold' }, { op: 'turn-end', spoken: false }]])
 })
 
 test('a failed call settles its ops as silent and the next call still runs', async () => {
@@ -3114,14 +3779,32 @@ test('a failed call settles its ops as silent and the next call still runs', asy
     if (n === 1) throw new Error('down')
     return { narrate: true }
   })
-  expect(await channel.send({ op: 'prompt' })).toEqual({ narrate: false })
-  expect(await channel.send({ op: 'prompt' })).toEqual({ narrate: true })
+  expect(await channel.send({ op: 'status' })).toEqual({ narrate: false })
+  expect(await channel.send({ op: 'status' })).toEqual({ narrate: true })
 })
 
 test('the reply is read from the last stdout line', () => {
   expect(parseReply('noise\n{"narrate": true}\n')).toEqual({ narrate: true })
   expect(parseReply('')).toEqual({ narrate: false })
   expect(parseReply('{"narrate": null}')).toEqual({ narrate: false })
+})
+```
+
+Create `hooks/origin.test.ts`:
+
+```ts
+import { expect, test } from 'claude-code/testing'
+import { isUsersOwnPrompt } from './origin'
+
+test('the user typing, Remote Control and an SDK host are the user', () => {
+  for (const kind of ['composer', 'bridge', 'sdk']) expect(isUsersOwnPrompt({ kind })).toBe(true)
+})
+
+test('background work, schedules, peers and plugins are not', () => {
+  for (const kind of ['task-notification', 'scheduled-trigger', 'peer', 'peer-send-message', 'plugin', 'unclassified', 'auto-continuation']) {
+    expect(isUsersOwnPrompt({ kind })).toBe(false)
+  }
+  expect(isUsersOwnPrompt(undefined)).toBe(false)
 })
 ```
 
@@ -3132,33 +3815,44 @@ Create `hooks/narrator.test.ts`:
 ```ts
 import type { On } from 'claude-code'
 import { expect, test } from 'claude-code/testing'
+import { isUsersOwnPrompt } from './origin'
 
-type SentOp = { op: string; text?: string; utterance?: string | null; spoken?: boolean; input?: unknown }
+type SentOp = { op: string; session: string; text?: string; utterance?: string | null; spoken?: boolean; input?: unknown; cutover?: boolean }
 
 /** Stands beneath the mod for the engine: the bridge process, the session, the bottoms. */
-function fakeEngine(on: On, narrate: boolean, bridgeFails = false) {
+function fakeEngine(on: On, narrate: boolean, options: { bridgeFails?: boolean; ids?: string[] } = {}) {
   const ops: SentOp[] = []
+  const origins: string[] = []
+  const ids = [...(options.ids ?? ['S1'])]
   const waiters: { check: (sent: SentOp[]) => boolean; done: () => void }[] = []
   on('process.run', async (_$, e) => {
-    if (bridgeFails) throw new Error('bridge down')
-    const batch = JSON.parse(e.init?.stdin ?? '{}') as { ops?: SentOp[] }
-    ops.push(...(batch.ops ?? []))
+    if (options.bridgeFails) throw new Error('bridge down')
+    const batch = JSON.parse(e.init?.stdin ?? '{}') as { session: string; ops?: Omit<SentOp, 'session'>[] }
+    ops.push(...(batch.ops ?? []).map(op => ({ ...op, session: batch.session })))
     for (const waiter of waiters.splice(0)) {
       if (waiter.check(ops)) waiter.done()
       else waiters.push(waiter)
     }
     return { exitCode: 0, stdout: `${JSON.stringify({ narrate })}\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
   })
-  on('session.id', async () => 'S1')
-  on('session.cwd', async () => '/work/project')
+  on('session.id', async () => ids[0] ?? 'S1')
+  on('session.root', async () => '/work/project')
   on('ui.log', async () => undefined)
-  on('prompt.submit', async (_$, e) => ({ text: e.text }))
+  on('prompt.submit', async (_$, e) => {
+    origins.push(e.origin?.kind ?? '')
+    return { text: e.text }
+  })
+  on('turn.start', async (_$, e) => ({ turnId: e.turnId }))
   on('turn.complete', async () => ({ text: '' }))
-  on('session.end', async () => ({}) as never)
+  on('session.start', async (_$, e) => ({ cwd: e.cwd }))
+  on('session.end', async () => {
+    ids.shift() // a /clear: the process goes on under the next id
+    return {} as never
+  })
   /** Resolves once the ops sent so far satisfy check. */
   const until = (check: (sent: SentOp[]) => boolean): Promise<void> =>
     check(ops) ? Promise.resolve() : new Promise<void>(done => { waiters.push({ check, done }) })
-  return { ops, until }
+  return { ops, origins, until }
 }
 
 /** The model's response for every step: these chunks, then a result. */
@@ -3172,30 +3866,43 @@ function fakeStep(on: On, chunks: readonly unknown[]) {
 const step = (extra: { agentId?: string; turnId?: string } = {}) =>
   ({ turnId: 'T', index: 0, model: 'm', messageCount: 1, ...extra })
 
+const turnEnd = (extra: { agentId?: string } = {}) =>
+  ({ turnId: 'T', answer: '', durationMs: 1, isAborted: false, reason: 'answer' as const, ...extra })
+
 async function collect<C>(stream: AsyncIterable<C>): Promise<C[]> {
   const out: C[] = []
   for await (const chunk of stream) out.push(chunk)
   return out
 }
 
-const turnEnd = (extra: { agentId?: string } = {}) =>
-  ({ turnId: 'T', answer: '', durationMs: 1, isAborted: false, reason: 'answer' as const, ...extra })
+const opsOf = (sent: SentOp[]) => sent.map(o => o.op)
 
 test('every chunk passes through unchanged, and each sentence is queued in order', async ($, on) => {
   const engine = fakeEngine(on, true)
   const chunks = [
     { kind: 'text', index: 0, text: 'Reading the loader. Then' },
     { kind: 'text', index: 0, text: ' the tests.' },
+    { kind: 'text', index: 2, text: ' A second block.' },
     { kind: 'stop', stopReason: 'end_turn', usage: null },
   ]
   fakeStep(on, chunks)
   await $.prompt.submit({ text: 'go' })
   expect(await collect($.turn.step(step()))).toEqual(chunks)
-  await engine.until(sent => sent.filter(o => o.op === 'say').length === 2)
+  await engine.until(sent => sent.filter(o => o.op === 'say').length === 3)
   const says = engine.ops.filter(o => o.op === 'say')
-  expect(says.map(o => o.text)).toEqual(['Reading the loader. ', 'Then the tests.'])
-  expect(says.map(o => o.utterance)).toEqual(['T:0:0', 'T:0:0'])
-  expect(engine.ops.slice(0, 2).map(o => o.op)).toEqual(['prompt', 'hold'])
+  expect(says.map(o => o.text)).toEqual(['Reading the loader. ', 'Then the tests.', ' A second block.'])
+  expect(new Set(says.map(o => o.utterance))).toEqual(new Set(['T:0']))
+  expect(opsOf(engine.ops).slice(0, 2)).toEqual(['prompt', 'hold'])
+})
+
+test('only the user\'s own prompt cuts over; the turn start warms the engine', async ($, on) => {
+  const engine = fakeEngine(on, true)
+  await $.prompt.submit({ text: 'go' })
+  await $.turn.start({ text: 'go', turnId: 'T' })
+  await engine.until(sent => sent.some(o => o.op === 'hold'))
+  const prompt = engine.ops.find(o => o.op === 'prompt')
+  expect(prompt?.cutover).toBe(isUsersOwnPrompt({ kind: engine.origins[0] ?? '' }))
+  expect(opsOf(engine.ops)).toEqual(['prompt', 'hold'])
 })
 
 test('a subagent step is never narrated', async ($, on) => {
@@ -3205,10 +3912,26 @@ test('a subagent step is never narrated', async ($, on) => {
   await collect($.turn.step(step({ agentId: 'A1', turnId: 'SUB' })))
   await collect($.turn.step(step()))
   await engine.until(sent => sent.some(o => o.op === 'say'))
-  expect(engine.ops.filter(o => o.op === 'say').map(o => o.utterance)).toEqual(['T:0:0'])
+  expect(engine.ops.filter(o => o.op === 'say').map(o => o.utterance)).toEqual(['T:0'])
 })
 
-test('nothing but the gate and the marker is sent when narration is off', async ($, on) => {
+test('an aborted stream is not flushed', async ($, on) => {
+  const engine = fakeEngine(on, true)
+  // Hooks must all be registered before the test's first call on $, so one
+  // bottom answers both steps: the interrupted one, then a whole one.
+  on('turn.step', async function* (_$, e) {
+    const text = e.turnId === 'CUT' ? 'A partial thought with no end' : 'Done. '
+    yield { kind: 'text', index: 0, text } as never
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: null }
+  })
+  await $.prompt.submit({ text: 'go' })
+  for await (const _chunk of $.turn.step(step({ turnId: 'CUT' }))) break
+  await collect($.turn.step(step()))
+  await engine.until(sent => sent.some(o => o.op === 'say'))
+  expect(engine.ops.filter(o => o.op === 'say').map(o => o.text)).toEqual(['Done. '])
+})
+
+test('nothing but the gate is sent when narration is off', async ($, on) => {
   const engine = fakeEngine(on, false)
   fakeStep(on, [{ kind: 'text', index: 0, text: 'Quiet now. ' }])
   await $.prompt.submit({ text: 'go' })
@@ -3216,11 +3939,41 @@ test('nothing but the gate and the marker is sent when narration is off', async 
   await $.turn.complete(turnEnd())
   await $.session.end({ reason: 'other' } as never)
   await engine.until(sent => sent.some(o => o.op === 'end-session'))
-  expect(engine.ops.map(o => o.op)).toEqual(['prompt', 'end-session'])
+  expect(opsOf(engine.ops)).toEqual(['prompt', 'end-session'])
+})
+
+test('a headless session is never narrated', async ($, on) => {
+  const engine = fakeEngine(on, true)
+  fakeStep(on, [{ kind: 'text', index: 0, text: 'Nobody listens. ' }])
+  await $.session.start({ cwd: '/work/project', surface: null, isInteractive: false } as never)
+  await $.prompt.submit({ text: 'go' })
+  await collect($.turn.step(step()))
+  await $.session.end({ reason: 'other' } as never)
+  await engine.until(sent => sent.some(o => o.op === 'end-session'))
+  expect(engine.ops.some(o => o.op === 'say' || o.op === 'hold')).toBe(false)
+})
+
+test('a new session id after /clear is used for every later op', async ($, on) => {
+  const engine = fakeEngine(on, true, { ids: ['S1', 'S2'] })
+  fakeStep(on, [{ kind: 'text', index: 0, text: 'Fresh start. ' }])
+  await $.prompt.submit({ text: 'go' })
+  await $.session.end({ reason: 'clear' } as never)
+  await $.prompt.submit({ text: 'again' })
+  await collect($.turn.step(step()))
+  await engine.until(sent => sent.some(o => o.op === 'say'))
+  expect(engine.ops.filter(o => o.op === 'say').map(o => o.session)).toEqual(['S2'])
+})
+
+test('after a lost state the mod recovers the gate with a status op', async ($, on) => {
+  const engine = fakeEngine(on, true)
+  fakeStep(on, [{ kind: 'text', index: 0, text: 'Still here. ' }])
+  await collect($.turn.step(step()))
+  await engine.until(sent => sent.some(o => o.op === 'say'))
+  expect(opsOf(engine.ops)[0]).toBe('status')
 })
 
 test('a failing bridge never breaks the stream', async ($, on) => {
-  fakeEngine(on, true, true)
+  fakeEngine(on, true, { bridgeFails: true })
   const chunks = [{ kind: 'text', index: 0, text: 'Still shown. ' }, { kind: 'stop', stopReason: 'end_turn', usage: null }]
   fakeStep(on, chunks)
   await $.prompt.submit({ text: 'go' })
@@ -3236,9 +3989,9 @@ test('a dialog is announced under the lead-in message; the answer re-warms the e
   const questions = [{ question: 'Which?', header: 'Pick', options: [], multiSelect: false }]
   await $.tool.call({ tool: 'AskUserQuestion', questions } as never)
   await engine.until(sent => sent.filter(o => o.op === 'hold').length === 2)
-  expect(engine.ops.map(o => o.op)).toEqual(['prompt', 'hold', 'say', 'dialog', 'hold'])
+  expect(opsOf(engine.ops)).toEqual(['prompt', 'hold', 'say', 'dialog', 'hold'])
   const dialog = engine.ops.find(o => o.op === 'dialog')
-  expect(dialog?.utterance).toBe('T:0:0')
+  expect(dialog?.utterance).toBe('T:0')
   expect(dialog?.input).toEqual({ questions })
 })
 
@@ -3250,16 +4003,16 @@ test('the turn end says whether the last step spoke; a subagent turn end is igno
   await $.turn.complete(turnEnd({ agentId: 'A1' }))
   await $.turn.complete({ ...turnEnd(), isAborted: true, reason: 'aborted' })
   await engine.until(sent => sent.some(o => o.op === 'turn-end'))
-  expect(engine.ops.filter(o => o.op === 'turn-end')).toEqual([{ op: 'turn-end', spoken: true }])
+  expect(engine.ops.filter(o => o.op === 'turn-end').map(o => o.spoken)).toEqual([true])
 })
 ```
 
-If `claude plugin test` reports that `$.tool.call` raised `classic.PreToolUse` into this plugin's own command hooks (it runs `bash hooks/run.sh pre_tool_use`), add `on('classic.PreToolUse', async () => ({}) as never)` at the top of that test, beneath the plugin, and re-run.
+If `claude plugin test` reports that `$.tool.call` raised `classic.PreToolUse` into this plugin's own command hooks (it would run `bash hooks/run.sh pre_tool_use`), add `on('classic.PreToolUse', async () => ({}) as never)` at the top of that test, beneath the plugin, and re-run. The tests assume each one gets a fresh load of the plugin (module variables such as `headless` start over); if `claude plugin test` reuses one load across a file, move "a headless session is never narrated" to the end of the file.
 
 - [ ] **Step 3: Run them to verify they fail**
 
 Run: `claude plugin test .`
-Expected: FAIL — `bridge.test.ts` cannot resolve `./bridge`; `narrator.test.ts` sees no `say` ops (no module loaded).
+Expected: FAIL — `bridge.test.ts` / `origin.test.ts` cannot resolve their modules; `narrator.test.ts` sees no ops (no module declared).
 
 - [ ] **Step 4: Create `hooks/bridge.ts`**
 
@@ -3273,8 +4026,9 @@ import type { EngineInterface } from 'claude-code'
 
 export type Op =
   | { op: 'start' }
+  | { op: 'status' }
   | { op: 'end-session' }
-  | { op: 'prompt' }
+  | { op: 'prompt'; cutover: boolean }
   | { op: 'hold' }
   | { op: 'say'; utterance: string; text: string; shown: number }
   | { op: 'dialog'; tool: string; input: unknown; utterance: string | null }
@@ -3335,7 +4089,24 @@ export function parseReply(stdout: string): Reply {
 }
 ```
 
-- [ ] **Step 5: Create `hooks/narrator.ts`**
+- [ ] **Step 5: Create `hooks/origin.ts`**
+
+```ts
+/**
+ * Whose prompt is it? Only the user's own prompt may cut narration off
+ * mid-sentence: typed at the terminal (composer), sent through Remote
+ * Control (bridge), or an SDK host's turn such as the VS Code extension's
+ * (sdk). A background task's notification, a schedule, a peer session, a
+ * plugin or an unattested channel never does.
+ */
+const USERS_OWN = new Set(['composer', 'bridge', 'sdk'])
+
+export function isUsersOwnPrompt(origin: { kind: string } | undefined): boolean {
+  return origin !== undefined && USERS_OWN.has(origin.kind)
+}
+```
+
+- [ ] **Step 6: Create `hooks/narrator.ts`**
 
 ```ts
 /**
@@ -3344,22 +4115,24 @@ export function parseReply(stdout: string): Reply {
  * It only captures. Each sentence of the main loop's visible text goes, in
  * order, to hooks/mod_bridge.py, which owns every narration policy - gating,
  * cleaning, voices, the per-project queue and engine. The bridge marks this
- * session, and the classic hooks stand down for marked sessions at the
- * narrator level, so nothing is spoken twice.
+ * session on every call, and the classic hooks stand down for marked
+ * sessions at the narrator level, so nothing is spoken twice.
  *
  * Nothing here may delay what the user sees: every chunk is yielded before
- * the tap reads it, and every bridge call is fire-and-forget.
+ * the tap reads it, and no hook awaits a bridge call except session.end.
  */
 import type { EngineInterface, Register } from 'claude-code'
 import { createChannel, runBridge, type Channel, type Op } from './bridge'
+import { isUsersOwnPrompt } from './origin'
 import { createSegmenter, type Segmenter } from './segment'
 
 type SessionState = {
   $: EngineInterface
   session: string
-  cwd: string
+  /** The session's project root: a shell cd inside the session never moves it. */
+  root: string
   channel: Channel
-  /** This turn's narrator gate, from the bridge's answer to the prompt op. */
+  /** This turn's narrator gate, from the bridge's answer to prompt/status. */
   narrate: Promise<boolean>
   /** The utterance of the last text sent: a dialog alert continues it. */
   lastUtterance: string | null
@@ -3369,7 +4142,11 @@ type SessionState = {
 
 export const register: Register = on => {
   let state: SessionState | undefined
-  let ready: Promise<SessionState | undefined> = Promise.resolve(undefined)
+  /** The session state being opened or open; undefined = none. Assigned
+   * synchronously by every hook that opens one, so two hooks racing an
+   * open can never create two channels for one session. */
+  let ready: Promise<SessionState | undefined> | undefined
+  let headless = false
 
   const debug = ($: EngineInterface, text: string): void => {
     void $.ui.log(`voiceover: ${text}`, { to: 'debug' })
@@ -3377,17 +4154,16 @@ export const register: Register = on => {
 
   /** The state for the session $ belongs to: a fresh one after /clear. */
   const open = async ($: EngineInterface): Promise<SessionState> => {
-    const [session, cwd] = await Promise.all([$.session.id(), $.session.cwd()])
+    const [session, root] = await Promise.all([$.session.id(), $.session.root()])
     if (state && state.session === session) {
       state.$ = $
-      state.cwd = cwd
       return state
     }
     const fresh: SessionState = {
       $,
       session,
-      cwd,
-      channel: createChannel(ops => runBridge(fresh.$, fresh.session, fresh.cwd, ops)),
+      root,
+      channel: createChannel(ops => runBridge(fresh.$, fresh.session, fresh.root, ops)),
       narrate: Promise.resolve(false),
       lastUtterance: null,
       stepSpoke: false,
@@ -3395,6 +4171,24 @@ export const register: Register = on => {
     state = fresh
     return fresh
   }
+
+  /** Opens a state and asks for the gate with `first` (prompt or status). */
+  const begin = ($: EngineInterface, first: Op): Promise<SessionState | undefined> =>
+    open($).then(
+      s => {
+        s.lastUtterance = null
+        s.narrate = s.channel.send(first).then(reply => reply.narrate && !headless)
+        return s
+      },
+      error => {
+        debug($, `open: ${String(error)}`)
+        return undefined
+      },
+    )
+
+  /** This session's state; after a module restart lost it, recover it. */
+  const current = ($: EngineInterface): Promise<SessionState | undefined> =>
+    (ready ??= begin($, { op: 'status' }))
 
   /** Sends op once this turn's gate says narration is on. */
   const whenNarrating = (s: SessionState, op: Op): void => {
@@ -3405,6 +4199,7 @@ export const register: Register = on => {
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
+    headless = e.surface === null
     ready = open($).then(
       s => {
         void s.channel.send({ op: 'start' })
@@ -3424,53 +4219,54 @@ export const register: Register = on => {
       await s.channel.send({ op: 'end-session' })
       state = undefined
     }
-    ready = Promise.resolve(undefined)
+    ready = undefined
     return next(e)
   })
 
   on('prompt.submit', ($, e, next) => {
     // Never awaited: the prompt is not delayed. The gate resolves long
     // before the first text chunk (no turn's first text arrived sooner than
-    // 2.2s after the prompt, across 168 measured turns).
-    ready = open($).then(
-      s => {
-        s.lastUtterance = null
-        s.narrate = s.channel.send({ op: 'prompt' }).then(reply => reply.narrate)
-        return s
-      },
-      error => {
-        debug($, `prompt.submit: ${String(error)}`)
-        return undefined
-      },
-    )
+    // 1.84s after its prompt, across 169 measured turns).
+    ready = begin($, { op: 'prompt', cutover: isUsersOwnPrompt(e.origin) })
+    return next(e)
+  })
+
+  on('turn.start', async ($, e, next) => {
+    void current($).then(s => {
+      if (s) whenNarrating(s, { op: 'hold' })
+    })
     return next(e)
   })
 
   on('turn.step', async function* ($, e, next) {
     const stream = next(e)
     if (e.agentId !== undefined) return yield* stream // a subagent's words are not narrated
-    const current = ready
+    const turn = current($)
+    const utterance = `${e.turnId}:${e.index}` // every block of one response is one message
     const segmenters = new Map<number, Segmenter>()
-    void current.then(s => {
+    void turn.then(s => {
       if (!s) return
       s.$ = $
       s.stepSpoke = false
       whenNarrating(s, { op: 'hold' })
     })
-    const emit = (block: number, pieces: readonly string[]): void => {
+    const emit = (pieces: readonly string[]): void => {
       if (pieces.length === 0) return
-      const utterance = `${e.turnId}:${e.index}:${block}`
       const shown = Date.now() / 1000
-      void current.then(s => {
+      void turn.then(s => {
         if (!s) return
         s.lastUtterance = utterance
         s.stepSpoke = true
         for (const text of pieces) whenNarrating(s, { op: 'say', utterance, text, shown })
       })
     }
+    let completed = false
     try {
       for (let step = await stream.next(); ; step = await stream.next()) {
-        if (step.done) return step.value
+        if (step.done) {
+          completed = true
+          return step.value
+        }
         yield step.value
         try {
           const chunk = step.value
@@ -3480,39 +4276,40 @@ export const register: Register = on => {
               segmenter = createSegmenter()
               segmenters.set(chunk.index, segmenter)
             }
-            emit(chunk.index, segmenter.push(chunk.text))
+            emit(segmenter.push(chunk.text))
           }
         } catch (error) {
           debug($, `segmenter: ${String(error)}`)
         }
       }
     } finally {
-      for (const [block, segmenter] of segmenters) emit(block, segmenter.flush())
+      // An interrupted response's half-sentence is not worth hearing.
+      if (completed) for (const segmenter of segmenters.values()) emit(segmenter.flush())
     }
   })
 
-  const announceDialog = (tool: string, input: unknown): void => {
-    void ready.then(s => {
+  const announceDialog = ($: EngineInterface, tool: string, input: unknown): void => {
+    void current($).then(s => {
       if (s) whenNarrating(s, { op: 'dialog', tool, input, utterance: s.lastUtterance })
     })
   }
-  const dialogAnswered = (): void => {
-    void ready.then(s => {
+  const dialogAnswered = ($: EngineInterface): void => {
+    void current($).then(s => {
       if (s) whenNarrating(s, { op: 'hold' })
     })
   }
 
   on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
-    announceDialog('AskUserQuestion', { questions: (e as { questions?: unknown }).questions ?? [] })
+    announceDialog($, 'AskUserQuestion', { questions: (e as { questions?: unknown }).questions ?? [] })
     const result = await next(e)
-    dialogAnswered()
+    dialogAnswered($)
     return result
   })
 
   on('tool.call', { tool: 'ExitPlanMode' }, async ($, e, next) => {
-    announceDialog('ExitPlanMode', {})
+    announceDialog($, 'ExitPlanMode', {})
     const result = await next(e)
-    dialogAnswered()
+    dialogAnswered($)
     return result
   })
 
@@ -3521,7 +4318,7 @@ export const register: Register = on => {
     // A subagent's turn ending is not ours: releasing there would unload the
     // engine in the middle of the main turn.
     if (e.agentId === undefined) {
-      void ready.then(s => {
+      void current($).then(s => {
         if (s) whenNarrating(s, { op: 'turn-end', spoken: s.stepSpoke })
       })
     }
@@ -3530,18 +4327,32 @@ export const register: Register = on => {
 }
 ```
 
-- [ ] **Step 6: Declare the module**
+- [ ] **Step 7: Declare the module in its own hooks file**
 
-In `hooks/hooks.json` add `"modules": ["./narrator.ts"],` as the line after `"description"`. In `tests/test_plugin_manifest.py`, after the "all six hook events" check, add:
+Create `hooks/mod.json`:
 
-```python
-hooks_json = json.loads((REPO_ROOT / "hooks" / "hooks.json").read_text())
-check("hooks.json declares the narrator mod beside the command hooks",
-      hooks_json.get("modules") == ["./narrator.ts"], hooks_json.get("modules"))
-check("the mod's module file exists", (REPO_ROOT / "hooks" / "narrator.ts").is_file())
+```json
+{ "modules": ["./narrator.ts"] }
 ```
 
-- [ ] **Step 7: Validate, test, type-check, run the suite**
+In `.claude-plugin/plugin.json` add `"hooks": "./hooks/mod.json",`. In `tests/test_plugin_manifest.py`, replace the check `"the manifest does not declare a hooks path"` with:
+
+```python
+declared = manifest.get("hooks")
+check("the manifest never names the standard hooks file (it is auto-discovered)",
+      declared in (None, "./hooks/mod.json"),
+      "plugin.json names hooks=%r; naming hooks/hooks.json makes Claude Code load "
+      "it twice and reject the plugin" % declared)
+mod_json = json.loads((REPO_ROOT / "hooks" / "mod.json").read_text())
+check("the mod lives in its own hooks file", mod_json == {"modules": ["./narrator.ts"]}, mod_json)
+check("the mod's module file exists", (REPO_ROOT / "hooks" / "narrator.ts").is_file())
+check("the standard hooks file declares no module",
+      "modules" not in json.loads((REPO_ROOT / "hooks" / "hooks.json").read_text()))
+```
+
+and update that file's docstring: an ADDITIONAL hooks file may be declared (the mod's `hooks/mod.json`); naming the standard one is the 1.3.0 defect.
+
+- [ ] **Step 8: Validate, test, type-check, run the suite**
 
 Run:
 
@@ -3549,12 +4360,12 @@ Run:
 claude plugin validate . && claude plugin test . && npx -y -p typescript@5 tsc -p <SCRATCH>/tsconfig.json && bash tests/run_all.sh 2>&1 | grep -E "^FAIL|ALL TESTS|SOME TESTS"
 ```
 
-Expected: validation passes and lists `./narrator.ts hooks: session.start, session.end, prompt.submit, turn.step, tool.call, turn.complete` and calls including `process.run`, `session.id`, `session.cwd`, `ui.log`; every mod test passes; tsc prints nothing; `ALL TESTS PASSED`.
+Expected: validation passes and lists `./narrator.ts hooks: session.start, session.end, prompt.submit, turn.start, turn.step, tool.call, turn.complete` with calls including `process.run`, `session.id`, `session.root`, `ui.log`; every mod test passes; tsc prints nothing; `ALL TESTS PASSED`.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
-git add hooks/bridge.ts hooks/narrator.ts hooks/bridge.test.ts hooks/narrator.test.ts hooks/hooks.json tests/test_plugin_manifest.py
+git add hooks/bridge.ts hooks/origin.ts hooks/narrator.ts hooks/mod.json hooks/*.test.ts .claude-plugin/plugin.json tests/test_plugin_manifest.py
 git commit -m "feat: the narrator mod - speak Claude's prose as it streams
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
@@ -3571,20 +4382,21 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 Update every section the earlier tasks changed so the contract matches the code exactly:
 - `voiceover/settings.py`: `detect_project_root` skips `~/.claude`.
-- New `voiceover/projects.py`, `voiceover/lease.py`, `voiceover/narrator.py` sections with the signatures from Tasks 1, 4, 5.
+- New sections: `voiceover/projects.py` (Task 1), `voiceover/lease.py` (Task 4), `voiceover/narrator.py` (Task 5), with their signatures as listed in those tasks' Interfaces blocks.
 - `voiceover/spool.py`: the per-project path, the `cwd` parameters, the item fields, `remove_legacy_queue`.
-- `voiceover/speech.py`: `enqueue_speech` fields, `ensure_drainer` (per project, pre-warm), `prewarm`, `request_stop`, `project_lock_path`, `lock_is_live(path=None)`.
-- `tts/engine_common.py`: the root-parameterized API, `drain(root, open_speaker, engine_names, lock_seconds, poll_seconds)`, the jump rule, speakers and playbacks, `lease_is_live`, `stop_request`, `engine_log`.
-- `voiceover/process_utils.py`: one-shot-only patterns.
-- hooks: the narrator paths' stand-down and lease table; `hooks/mod_bridge.py`'s op protocol; `hooks/narrator.ts`; `hooks.json` `modules`.
+- `voiceover/speech.py`: `enqueue_speech` fields, `ensure_drainer` (per project, pre-warm, dead owners, backoff), `prewarm`, `request_stop`, `project_lock_path`, `lock_is_live(path=None)`.
+- `voiceover/prose.py`: `skip_unread`.
+- `tts/engine_common.py`: the root-parameterized API; `drain(root, open_speaker, engine_names, lock_seconds, poll_seconds)`; the jump rule, `peek_next`, `stop_requested`, speakers (`begin`, `prefetch`) and playbacks; `lease_is_live`; `MAX_ENGINES`; `engine_log`; dead-pid locks.
+- `voiceover/process_utils.py`: one-shot-only patterns. `tts/tts_controller.py`: every project's lock owner; `clear_projects`.
+- hooks: the narrator paths' pinned cwd, stand-down and lease table; `session_end.py`; `mod_bridge.py`'s op protocol; `hooks/mod.json` + `narrator.ts`; `plugin.json` naming `./hooks/mod.json`.
 
 - [ ] **Step 2: README.md**
 
-Add to the narrator-level section: narration now starts as Claude writes (with the mod, Claude Code 2.1.287 or newer; older builds fall back to the hooks); each project has its own queue and voice and may overlap another project; set a project's voice with `/voiceover:voice <name> --project`; a new message from Claude preempts the old one at the end of the current sentence; the engine is loaded only while a turn runs.
+Add to the narrator-level section: narration starts as Claude writes (with the mod, Claude Code 2.1.287 or newer; older builds fall back to the hooks); each project has its own queue and voice and may overlap one other project (two at most); set a project's voice with `/voiceover:voice <name> --project`; a new message from Claude preempts the old one at the end of the current sentence, while question alerts and permission requests always play whole; the engine is loaded only while a turn runs; headless (`claude -p`) sessions are not narrated.
 
 - [ ] **Step 3: CHANGELOG.md and version**
 
-Rename `## Unreleased` to `## 1.4.0 - <today>` and add `### Added` / `### Changed` / `### Fixed` entries: streaming capture through the mod; per-project queue, voice and engine; sentence-boundary preemption; turn-scoped engine with pre-warm; `~/.claude` no longer a project marker; the one-shot interrupt no longer kills another project's narration. Note that sessions must restart (or `/reload-plugins`) after updating. Set `"version": "1.4.0"` in `.claude-plugin/plugin.json`. Add `.claude/voiceover.json` to `.gitignore`.
+Rename `## Unreleased` to `## 1.4.0 - <today>` and add `### Added` / `### Changed` / `### Fixed` entries: streaming capture through the mod; per-project queue, voice and engine; sentence-boundary preemption and prefetch; the turn-scoped engine with pre-warm, a two-engine cap and the new SessionEnd hook; `~/.claude` no longer a project marker; the one-shot interrupt no longer kills another project's narration; a dead engine no longer silences its project; Windows playback no longer holds 30s per clip. State plainly: **every running Claude Code session must be restarted (or `/reload-plugins`) after updating** — a 1.3 session left running interrupts 1.4 engines — and the new SessionEnd hook needs a restart to register. Set `"version": "1.4.0"` in `.claude-plugin/plugin.json`. Add `.claude/voiceover.json` to `.gitignore`.
 
 - [ ] **Step 4: Run everything**
 
@@ -3613,20 +4425,30 @@ Runs in the MAIN session. It changes the user's machine settings, so every step 
 (cd /Users/hanan/Projects/OrcaMCP && python3 /Users/hanan/Projects/claude-voiceover/scripts/manage_voices.py set emma --project)
 ```
 
-Expected: each prints `Voice set to ... (project setting)`; `/Users/hanan/Projects/claude-voiceover/.claude/voiceover.json` and `/Users/hanan/Projects/OrcaMCP/.claude/voiceover.json` exist.
+Expected: each prints `Voice set to ... (project setting)`; `/Users/hanan/Projects/claude-voiceover/.claude/voiceover.json` and `/Users/hanan/Projects/OrcaMCP/.claude/voiceover.json` exist, and `~/.claude/voiceover.json` was NOT created.
 
-- [ ] **Step 2: Load the branch in a session (ask first)**
+- [ ] **Step 2: Restart every live session onto the branch (ask first)**
 
-Disable the installed copy for the test, then start a terminal session on the branch:
+List the running sessions (`ps -eo pid,lstart,command | grep -E "[c]laude( |$)|native-binary/claude"`) and tell the user each must be restarted or `/reload-plugins`-ed. Then load the branch: disable the installed copy for the test and start a terminal session on the branch:
 
 ```bash
 claude plugin disable voiceover@claude-voiceover
 claude --plugin-dir /Users/hanan/Projects/claude-voiceover
 ```
 
-For the VS Code extension, the equivalent is `CLAUDE_CODE_PLUGIN_DIRS=/Users/hanan/Projects/claude-voiceover` in the `env` block of `~/.claude/settings.json`, followed by reopening the panel. Re-enable the installed copy (`claude plugin enable voiceover@claude-voiceover`) when done. Also check whether `/reload-plugins` alone loads the new module in a session that was already running; record the answer in the CHANGELOG's restart note.
+For the VS Code extension, the equivalent is `CLAUDE_CODE_PLUGIN_DIRS=/Users/hanan/Projects/claude-voiceover` in the `env` block of `~/.claude/settings.json`, followed by reopening the panel. Re-enable the installed copy (`claude plugin enable voiceover@claude-voiceover`) when done. Record whether `/reload-plugins` alone loaded the new module and the new SessionEnd hook in a session already running.
 
-- [ ] **Step 3: Measure**
+- [ ] **Step 3: Confirm both hook files load**
+
+In that session send any prompt, then:
+
+```bash
+grep -E " bridge | standdown " ~/.claude-voiceover/voiceover.log | tail -5
+```
+
+Expected: `bridge` lines (the mod loaded from `hooks/mod.json`), and narration heard. Then `claude --plugin-dir ... -p "say hi"` once and confirm the classic hooks still run (a `cutover` log line from `user_prompt_submit`). If an older Claude Code build is available, start it with the branch and confirm the classic hooks still narrate; record the result for the README's minimum-version note.
+
+- [ ] **Step 4: Measure**
 
 With `debug_log` on (it is), work normally in that session until at least 50 mid-turn lines have been spoken, then run:
 
@@ -3635,8 +4457,8 @@ grep " sound " ~/.claude-voiceover/voiceover.log | sed -E 's/.*lag_shown=([0-9.]
   | awk '{a[NR]=$1} END {print "n=" NR, "median=" a[int(NR/2)+1], "p90=" a[int(NR*0.9)+1]}'
 ```
 
-Pass: `n ≥ 50`, median ≤ 2.5, p90 ≤ 8.0. Then end a turn and run `sleep 3; pgrep -fl "kokoro_voice.py --drain"`: expected no output (the engine unloaded once the last sentence played and the turn's lease was released).
+Pass: `n ≥ 50`, median ≤ 2.5, p90 ≤ 8.0. Then end a turn and run `sleep 5; pgrep -fl "kokoro_voice.py --drain"`: expected no output (the engine unloaded once the last sentence played and the turn's lease was released).
 
-- [ ] **Step 4: Report**
+- [ ] **Step 5: Report**
 
-Tell the user the measured median and p90 against the targets, whether the engine unloaded, whether `/reload-plugins` was enough, and anything that misbehaved. Do not merge or push without their go-ahead.
+Tell the user the measured median and p90 against the targets, whether the engine unloaded, whether `/reload-plugins` was enough, the older-build result, and anything that misbehaved. Do not merge or push without their go-ahead.
