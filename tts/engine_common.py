@@ -36,6 +36,9 @@ from pathlib import Path
 _QUEUE_DIR_NAME = "queue"
 _TAKEN_SUFFIX = ".taken"
 _STOP_DIR_NAME = "stop"
+_LEASE_DIR_NAME = "leases"
+_SPAWNED_FILE_NAME = "spawned.json"
+MAX_ENGINES = 2
 _ALL_SESSIONS = "_all"
 _UNSAFE = re.compile(r"[^A-Za-z0-9_-]")
 POLL_SECONDS = 0.05
@@ -455,6 +458,62 @@ def stop_requested(root, item) -> bool:
     return False
 
 
+def lease_is_live(root) -> bool:
+    """True while a session holds an unexpired lease on root's engine.
+
+    Read-only: deleting an expired lease could race a hold() that has just
+    replaced it with a fresh one (voiceover/lease.py prunes old leases)."""
+    now = time.time()
+    try:
+        paths = list((Path(root) / _LEASE_DIR_NAME).glob("*.json"))
+    except OSError:
+        return False
+    for path in paths:
+        try:
+            if float(json.loads(path.read_text()).get("expiry")) > now:
+                return True
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+    return False
+
+
+def _other_engines_running(root) -> int:
+    """How many OTHER projects' engines hold their locks right now."""
+    root = Path(root)
+    count = 0
+    try:
+        siblings = [p for p in root.parent.iterdir() if p.is_dir() and p != root]
+    except OSError:
+        return 0
+    for sibling in siblings:
+        try:
+            raw = tts_lock_path(sibling).read_text().strip()
+        except OSError:
+            continue
+        if _lock_held(raw):
+            count += 1
+    return count
+
+
+_FAILED_OPEN_BACKOFF = 27.0  # with the hooks' 3s window: no respawn for 30s
+
+
+def _mark_spawned(root, ahead=0.0):
+    """voiceover/speech.py's spawn marker: hooks start no engine for 3s after
+    its timestamp. Written `ahead` seconds in the future to back off longer."""
+    try:
+        (Path(root) / _SPAWNED_FILE_NAME).write_text(json.dumps({"ts": time.time() + ahead}))
+    except OSError:
+        pass
+
+
+def _clear_spawned(root):
+    try:
+        (Path(root) / _SPAWNED_FILE_NAME).unlink()
+    except OSError:
+        pass
+
+
 # --- playback ---------------------------------------------------------------
 
 class Playback:
@@ -604,7 +663,10 @@ def drain(root, open_speaker, engine_names, lock_seconds=60.0,
     When the spool runs dry the lock is released and the spool checked ONCE
     more before exiting: that closes the race against a hook that appended an
     item a moment earlier and saw the lock still held. A lock this drain does
-    not own is never deleted.
+    not own is never deleted. While a session holds a lease the drain waits
+    for more, polling every poll_seconds, so the model stays loaded for the
+    turn's next sentence. At most MAX_ENGINES projects' engines run at once;
+    another steps aside.
     """
     root = Path(root)
     if not try_claim_lock(root, lock_seconds):
@@ -612,17 +674,42 @@ def drain(root, open_speaker, engine_names, lock_seconds=60.0,
     owns_lock = True
     keeper = _LockKeeper(root, lock_seconds)
     try:
+        if _other_engines_running(root) >= MAX_ENGINES:
+            # Two projects already speak: step aside. Refresh the spawn
+            # marker so the hooks back off instead of respawning per call.
+            engine_log("capped", "%d other engines running" % MAX_ENGINES)
+            _mark_spawned(root)
+            return 0
         speaker = open_speaker()
         if not speaker:
-            return 0  # setup failed; the finally below hands the lock back
+            # Setup failed (a missing or broken model): back the hooks off
+            # for 30s rather than reloading on every call. The finally below
+            # hands the lock back.
+            _mark_spawned(root, ahead=_FAILED_OPEN_BACKOFF)
+            return 0
+        _clear_spawned(root)  # up and loaded: hooks may spawn again if this one dies
+        # A model download, load and warm-up can outlast the lock's expiry,
+        # and the keeper only refreshes once an item starts.
+        update_lock_expiry(root, lock_seconds)
+        keeper.reset()
         while True:
             item, taken_path = next_item(root, engine_names)
             if item is None:
+                if lease_is_live(root):
+                    keeper.keep()  # a session's turn is running: stay warm
+                    time.sleep(poll_seconds)
+                    continue
                 remove_tts_lock(root)
                 owns_lock = False
                 item, taken_path = next_item(root, engine_names)
                 if item is None:
-                    return 0
+                    # A session may have taken a lease after our check, then
+                    # seen our lock and started nothing: stay for it.
+                    if not lease_is_live(root) or not try_claim_lock(root, lock_seconds):
+                        return 0
+                    owns_lock = True
+                    keeper.reset()
+                    continue
                 if not try_claim_lock(root, lock_seconds):
                     # Another engine claimed the lock in the gap - it will
                     # drain this item. Never delete a lock we do not own.

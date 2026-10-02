@@ -135,6 +135,7 @@ speech._spawn_detached = lambda command: spawned.append(command) or True
 try:
     spool.clear()
     speech.enqueue_speech("project scoped", full=True)
+    (spool.queue_dir().parent / "spawned.json").unlink(missing_ok=True)
     speech.ensure_drainer()
 finally:
     speech._spawn_detached = real_spawn

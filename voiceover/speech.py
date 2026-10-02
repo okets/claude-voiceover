@@ -19,7 +19,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import process_utils, spool
+from . import lease, process_utils, spool
 from .audio_player import play_audio_file
 from .settings import (
     data_dir,
@@ -39,6 +39,7 @@ _SOUNDS_DIR = Path(__file__).resolve().parent / "sounds"
 
 _LOCK_FILE_NAME = "tts.lock"
 _FULL_TEXT_CAP = 6000
+_SPAWN_BACKOFF_SECONDS = 3.0
 
 _MACOS_VOICES = {"macos-female": "Samantha", "macos-male": "Daniel"}
 
@@ -133,29 +134,63 @@ def enqueue_speech(text, min_level="concise", cwd=None, full=False, session=None
 
 
 def ensure_drainer(cwd=None) -> bool:
-    """Start the project's engine draining its spool unless one is already up.
+    """Start the project's engine unless it is already up or starting.
 
-    Called unconditionally by every narrator path, so a spool left behind by
-    a crashed engine is picked up by the next hook rather than sitting
-    there. Racing callers are harmless: the engine's own atomic lock claim
-    admits exactly one drainer per project.
+    Starts it when the queue has items OR a session holds a lease (the
+    pre-warm). Called unconditionally by every narrator path, so a spool
+    left behind by a crashed engine is picked up by the next hook. A lock
+    whose engine has died is treated as free. After a spawn it backs off for
+    a few seconds - until the new engine claims its lock and clears
+    spawned.json (tts/engine_common.py) - so a burst of calls during uv's
+    start-up spawns one engine, not one per call. Racing callers are
+    harmless: the engine's atomic lock claim admits exactly one drainer per
+    project.
     """
     try:
         spool.remove_legacy_queue()
-        if spool.pending_count(cwd) == 0:
+        if spool.pending_count(cwd) == 0 and not lease.any_live(cwd):
             return False
-        if lock_is_live(project_lock_path(cwd)):
+        lock = project_lock_path(cwd)
+        if lock_is_live(lock) and process_utils.lock_owner_is_running(lock):
             return False  # this project's drainer is already working
+        if _recently_spawned(cwd):
+            return False  # one is starting up
         engine = resolve_engine(cwd)
         command = _drain_command(engine, project_dir(cwd))
         if command is None:
             return False
+        _mark_spawned(cwd)
         spawned = _spawn_detached(command)
         _log("queue", "drainer spawned=%s engine=%s pending=%d" % (
             spawned, engine, spool.pending_count(cwd)), cwd)
         return spawned
     except Exception:
         return False
+
+
+def _recently_spawned(cwd) -> bool:
+    try:
+        ts = float(json.loads((project_dir(cwd) / "spawned.json").read_text()).get("ts"))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+    return time.time() - ts < _SPAWN_BACKOFF_SECONDS
+
+
+def _mark_spawned(cwd) -> None:
+    try:
+        (project_dir(cwd) / "spawned.json").write_text(json.dumps({"ts": time.time()}))
+    except OSError:
+        pass
+
+
+def prewarm(cwd=None, session=None, ttl=lease.LEASE_TTL) -> bool:
+    """Hold the project's engine for session's turn and start it now, so the
+    model has loaded by the time the first sentence arrives (first text came
+    at least 1.84s after the prompt in 169 measured turns; a cold engine
+    needs about 1.8s including its warm-up)."""
+    if not lease.hold(cwd, session, ttl=ttl):
+        return False
+    return ensure_drainer(cwd)
 
 
 def request_stop(cwd=None, session=None) -> None:
