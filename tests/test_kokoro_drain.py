@@ -31,6 +31,7 @@ sys.modules.setdefault("soundfile", _soundfile)
 
 sys.path.insert(0, str(REPO_ROOT / "tts"))
 import engine_common
+ROOT = spool.queue_dir().parent  # this repo's project dir
 import kokoro_voice
 
 
@@ -44,7 +45,7 @@ class FakeKokoro:
 
     def _note_horizon(self):
         try:
-            raw = engine_common.tts_lock_path().read_text()
+            raw = engine_common.tts_lock_path(ROOT).read_text()
             self.horizons.append(json.loads(raw)["expiry"] - time.time())
         except Exception:
             self.horizons.append(None)
@@ -75,7 +76,7 @@ load_saw_lock = []
 
 def _construct(*args, **kwargs):
     # The lock must already be ours when the model starts loading.
-    load_saw_lock.append(engine_common.lock_is_live())
+    load_saw_lock.append(engine_common.lock_is_live(ROOT))
     return fake
 
 
@@ -90,7 +91,7 @@ time.sleep(0.002)
 spool.enqueue("second item", "kokoro", "af_sarah")
 
 argv = sys.argv
-sys.argv = ["kokoro_voice.py", "--drain"]
+sys.argv = ["kokoro_voice.py", "--drain", str(ROOT)]
 try:
     code = kokoro_voice.main()
 finally:
@@ -107,7 +108,7 @@ check("the model is loaded exactly once for the whole drain",
 check("the lock is claimed BEFORE the model is loaded",
       load_saw_lock == [True], load_saw_lock)
 check("the lock is released when the drain ends",
-      engine_common.lock_is_live() is False)
+      engine_common.lock_is_live(ROOT) is False)
 
 # --- the lock outlives synthesis, not just playback ------------------------
 # drain() sets the expiry to its own lock_seconds (60). A long item can take
@@ -119,16 +120,16 @@ check("the lock horizon is extended BEFORE a long item is synthesized",
       fake.horizons)
 
 # --- the non-streaming fallback keeps the lock too --------------------------
-engine_common.try_claim_lock(60.0)
+engine_common.try_claim_lock(ROOT, 60.0)
 fallback = FakeKokoro()
-kokoro_voice._speak_whole_keeping_lock(fallback, "fallback text", "af_sarah")
+kokoro_voice._speak_whole_keeping_lock(fallback, "fallback text", "af_sarah", ROOT)
 check("the fallback renders the item whole", fallback.whole == ["fallback text"])
 check("the fallback does NOT remove the lock the drain loop owns",
-      engine_common.lock_is_live() is True)
+      engine_common.lock_is_live(ROOT) is True)
 
 # --- the single-utterance path still owns and releases its lock ------------
 kokoro_voice.speak_streaming(FakeKokoro(), "one shot", "af_sarah")
 check("speak_streaming still releases the lock when it is done",
-      engine_common.tts_lock_path().exists() is False)
+      engine_common.tts_lock_path(engine_common.data_dir()).exists() is False)
 
 report()

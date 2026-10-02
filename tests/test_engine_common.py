@@ -14,26 +14,27 @@ isolate()
 sys.path.insert(0, str(REPO_ROOT / "tts"))
 from voiceover import spool
 import engine_common
+ROOT = spool.queue_dir().parent  # this repo's project dir
 
 
 # --- the two halves agree on where the queue lives -------------------------
 check("engine and hook layer resolve the same queue dir",
-      engine_common.queue_dir().resolve() == spool.queue_dir().resolve(),
-      "%s vs %s" % (engine_common.queue_dir(), spool.queue_dir()))
+      engine_common.queue_dir(ROOT).resolve() == spool.queue_dir().resolve(),
+      "%s vs %s" % (engine_common.queue_dir(ROOT), spool.queue_dir()))
 
 # --- lock lifecycle ---------------------------------------------------------
-check("lock is not live before any claim", engine_common.lock_is_live() is False)
-check("first claim wins", engine_common.try_claim_lock(30.0) is True)
-check("lock reads as live once claimed", engine_common.lock_is_live() is True)
-engine_common.remove_tts_lock()
-check("lock is gone after removal", engine_common.lock_is_live() is False)
+check("lock is not live before any claim", engine_common.lock_is_live(ROOT) is False)
+check("first claim wins", engine_common.try_claim_lock(ROOT, 30.0) is True)
+check("lock reads as live once claimed", engine_common.lock_is_live(ROOT) is True)
+engine_common.remove_tts_lock(ROOT)
+check("lock is gone after removal", engine_common.lock_is_live(ROOT) is False)
 
 # --- an expired lock does not block a claim --------------------------------
-engine_common.tts_lock_path().write_text(
+engine_common.tts_lock_path(ROOT).write_text(
     json.dumps({"expiry": time.time() - 5, "pid": os.getpid()}))
-check("an expired lock is treated as stale", engine_common.lock_is_live() is False)
-check("claim succeeds over an expired lock", engine_common.try_claim_lock(30.0) is True)
-engine_common.remove_tts_lock()
+check("an expired lock is treated as stale", engine_common.lock_is_live(ROOT) is False)
+check("claim succeeds over an expired lock", engine_common.try_claim_lock(ROOT, 30.0) is True)
+engine_common.remove_tts_lock(ROOT)
 
 # --- reading in order -------------------------------------------------------
 spool.clear()
@@ -42,7 +43,7 @@ for word in ("alpha", "beta", "gamma"):
     time.sleep(0.002)
 spoken = []
 while True:
-    item, taken = engine_common.take_oldest()
+    item, taken = engine_common.take_oldest(ROOT)
     if item is None:
         break
     spoken.append(item["text"])
@@ -54,8 +55,8 @@ check("the spool is empty after draining", spool.pending_count() == 0)
 # --- exactly one reader wins an item ---------------------------------------
 spool.clear()
 spool.enqueue("only", "kokoro", "bf_emma")
-first_item, first_path = engine_common.take_oldest()
-second_item, second_path = engine_common.take_oldest()
+first_item, first_path = engine_common.take_oldest(ROOT)
+second_item, second_path = engine_common.take_oldest(ROOT)
 check("the first reader gets the item", first_item is not None and first_item["text"] == "only")
 check("a second reader gets nothing", second_item is None, second_item)
 check("a claimed item is not listed as pending", spool.pending_count() == 0)
@@ -63,7 +64,7 @@ check("a claimed item is not listed as pending", spool.pending_count() == 0)
 # --- put_back restores order ------------------------------------------------
 engine_common.put_back(first_path)
 check("put_back makes the item pending again", spool.pending_count() == 1)
-again_item, again_path = engine_common.take_oldest()
+again_item, again_path = engine_common.take_oldest(ROOT)
 check("the restored item is the same one",
       again_item is not None and again_item["text"] == "only", again_item)
 engine_common.finish(again_path)
@@ -73,9 +74,9 @@ spool.clear()
 for word in ("one", "two"):
     spool.enqueue(word, "kokoro", "bf_emma")
     time.sleep(0.002)
-item, path = engine_common.take_oldest()      # claims "one"
+item, path = engine_common.take_oldest(ROOT)      # claims "one"
 engine_common.put_back(path)                  # must go back to the FRONT
-item, path = engine_common.take_oldest()
+item, path = engine_common.take_oldest(ROOT)
 check("put_back keeps the item at the front of the queue",
       item is not None and item["text"] == "one", item)
 engine_common.finish(path)
@@ -88,7 +89,7 @@ for text, engine in (("theirs", "macos-female"), ("mine", "kokoro"),
                      ("theirs too", "macos-male")):
     spool.enqueue(text, engine, "v")
     time.sleep(0.002)
-item, path = engine_common.take_oldest({"kokoro"})
+item, path = engine_common.take_oldest(ROOT, {"kokoro"})
 check("take_oldest claims the oldest item it CAN speak",
       item is not None and item["text"] == "mine", item)
 check("foreign items are left pending", spool.pending_count() == 2,
@@ -97,11 +98,18 @@ check("skipped items are never renamed to .taken",
       list(spool.queue_dir().glob("*.taken")) == [Path(path)],
       list(spool.queue_dir().glob("*.taken")))
 engine_common.finish(path)
-empty_item, _ = engine_common.take_oldest({"kokoro"})
+empty_item, _ = engine_common.take_oldest(ROOT, {"kokoro"})
 check("nothing is claimed when only foreign items remain",
       empty_item is None, empty_item)
 check("and those foreign items are still there", spool.pending_count() == 2)
 check("an unfiltered read still sees them",
-      engine_common.take_oldest()[0] is not None)
+      engine_common.take_oldest(ROOT)[0] is not None)
+
+# --- drain_root ---------------------------------------------------------------
+check("drain_root reads the directory after --drain",
+      engine_common.drain_root(["x.py", "--drain", "/p/q"]) == Path("/p/q"))
+check("drain_root is None without one",
+      engine_common.drain_root(["x.py", "--drain"]) is None
+      and engine_common.drain_root(["x.py", "--drain", "--voice"]) is None)
 
 report()

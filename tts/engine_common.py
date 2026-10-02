@@ -10,8 +10,12 @@ process and venv. It therefore duplicates the data-dir resolution by design,
 but it is the ONLY copy: both engines import it rather than carrying their
 own. Stdlib only.
 
+Every lock and spool helper takes `root`, the directory its state lives in:
+a project's directory for a drainer, data_dir() for the one-shot speaker's
+lock.
+
 The spool it reads is written by voiceover/spool.py. The shared contract is
-just this: pending items are `*.json` files in data_dir()/queue/ whose
+just this: pending items are `*.json` files in <root>/queue/ whose
 filenames sort chronologically, each holding
 {"text", "engine", "voice", "created", "session"}.
 """
@@ -38,8 +42,20 @@ def data_dir():
     return path
 
 
-def tts_lock_path():
-    return data_dir() / "tts.lock"
+def drain_root(argv):
+    """The directory given after --drain in argv, or None when it is missing."""
+    argv = list(argv)
+    try:
+        value = argv[argv.index("--drain") + 1]
+    except (ValueError, IndexError):
+        return None
+    if value.startswith("--"):
+        return None
+    return Path(value)
+
+
+def tts_lock_path(root):
+    return Path(root) / "tts.lock"
 
 
 def _parse_lock_expiry(raw):
@@ -53,24 +69,28 @@ def _parse_lock_expiry(raw):
             return None
 
 
-def lock_is_live() -> bool:
+def lock_is_live(root) -> bool:
     """True while an unexpired lock exists. Read-only: never clears anything."""
     try:
-        raw = tts_lock_path().read_text().strip()
+        raw = tts_lock_path(root).read_text().strip()
     except OSError:
         return False
     expiry = _parse_lock_expiry(raw)
     return expiry is not None and time.time() < expiry
 
 
-def try_claim_lock(duration):
-    """Atomically claim the TTS lock. True = we own it and may speak.
+def try_claim_lock(root, duration):
+    """Atomically claim root's TTS lock. True = we own it and may speak.
 
     O_CREAT|O_EXCL semantics via os.link guarantee that of two engines
     racing, exactly one wins; the loser skips quietly. The lock stores our
     PID so stop_speech() can kill this engine's whole process group.
     """
-    lock_file = tts_lock_path()
+    lock_file = tts_lock_path(root)
+    try:
+        Path(root).mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False
     payload = json.dumps({"expiry": time.time() + duration, "pid": os.getpid()})
     # Write payload to a private temp file, then os.link() it into place:
     # the lock appears WITH its content in one atomic step, so a racing
@@ -106,18 +126,18 @@ def try_claim_lock(duration):
             pass
 
 
-def update_lock_expiry(duration):
-    """Refresh our own lock with the real playback end time (keeps our PID)."""
+def update_lock_expiry(root, duration):
+    """Refresh our own lock with a new expiry (keeps our PID)."""
     try:
-        tts_lock_path().write_text(
+        tts_lock_path(root).write_text(
             json.dumps({"expiry": time.time() + duration, "pid": os.getpid()}))
     except OSError:
         pass
 
 
-def remove_tts_lock():
+def remove_tts_lock(root):
     try:
-        lock_file = tts_lock_path()
+        lock_file = tts_lock_path(root)
         if lock_file.exists():
             lock_file.unlink()
     except OSError:
@@ -126,8 +146,8 @@ def remove_tts_lock():
 
 # --- spool reading ----------------------------------------------------------
 
-def queue_dir():
-    directory = data_dir() / _QUEUE_DIR_NAME
+def queue_dir(root):
+    directory = Path(root) / _QUEUE_DIR_NAME
     try:
         directory.mkdir(parents=True, exist_ok=True)
     except OSError:
@@ -150,7 +170,7 @@ def _peek_engine(path):
     return item.get("engine") if isinstance(item, dict) else None
 
 
-def take_oldest(engine_names=None):
+def take_oldest(root, engine_names=None):
     """Claim the oldest item this engine can speak. (item, taken_path) or (None, None).
 
     With engine_names given, items belonging to ANOTHER engine are skipped -
@@ -171,7 +191,7 @@ def take_oldest(engine_names=None):
     rewritten between the peek and the claim.
     """
     try:
-        candidates = sorted(queue_dir().glob("*.json"))
+        candidates = sorted(queue_dir(root).glob("*.json"))
     except OSError:
         return None, None
     for path in candidates:
@@ -239,7 +259,7 @@ def put_back(taken_path) -> None:
 QUEUE_MAX_AGE_SECONDS = 300  # must match voiceover/spool.py
 
 
-def drain(speak_item, engine_names, lock_seconds=60.0, prepare=None) -> int:
+def drain(root, speak_item, engine_names, lock_seconds=60.0, prepare=None) -> int:
     """Speak the spool dry, one item at a time. Returns a process exit code.
 
     speak_item(item) -> bool is called for each item this engine owns;
@@ -261,21 +281,21 @@ def drain(speak_item, engine_names, lock_seconds=60.0, prepare=None) -> int:
     the lock still held, which would otherwise strand that item until the
     next hook fired.
     """
-    if not try_claim_lock(lock_seconds):
+    if not try_claim_lock(root, lock_seconds):
         return 0  # another engine is already draining
     owns_lock = True
     try:
         if prepare is not None and not prepare():
             return 0  # setup failed; the finally below hands the lock back
         while True:
-            item, taken_path = take_oldest(engine_names)
+            item, taken_path = take_oldest(root, engine_names)
             if item is None:
-                remove_tts_lock()
+                remove_tts_lock(root)
                 owns_lock = False
-                item, taken_path = take_oldest(engine_names)
+                item, taken_path = take_oldest(root, engine_names)
                 if item is None:
                     return 0
-                if not try_claim_lock(lock_seconds):
+                if not try_claim_lock(root, lock_seconds):
                     # Another engine claimed the lock in the gap - it will
                     # drain this item. Never delete a lock we do not own.
                     put_back(taken_path)
@@ -292,7 +312,7 @@ def drain(speak_item, engine_names, lock_seconds=60.0, prepare=None) -> int:
             if age > QUEUE_MAX_AGE_SECONDS:
                 finish(taken_path)     # too stale to be worth hearing
                 continue
-            update_lock_expiry(lock_seconds)
+            update_lock_expiry(root, lock_seconds)
             try:
                 speak_item(item)
             except Exception:
@@ -300,4 +320,4 @@ def drain(speak_item, engine_names, lock_seconds=60.0, prepare=None) -> int:
             finish(taken_path)
     finally:
         if owns_lock:
-            remove_tts_lock()
+            remove_tts_lock(root)

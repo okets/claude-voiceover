@@ -31,6 +31,7 @@ from .settings import (
 )
 from .templates import truncate_to_words
 from .debuglog import log as _log
+from .projects import project_dir
 
 _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 _TTS_DIR = _PLUGIN_ROOT / "tts"
@@ -94,7 +95,8 @@ def speak(text, min_level="concise", cwd=None, interrupt=False, full=False) -> b
         return False
 
 
-def enqueue_speech(text, min_level="concise", cwd=None, full=False, session=None) -> bool:
+def enqueue_speech(text, min_level="concise", cwd=None, full=False, session=None,
+                   utterance=None, sticky=False, shown=None, source=None) -> bool:
     """Queue text to be spoken. True when it was queued.
 
     The queued counterpart of speak(): identical gating and identical
@@ -119,9 +121,11 @@ def enqueue_speech(text, min_level="concise", cwd=None, full=False, session=None
         # macOS engines take a `say -v <Name>` voice, and get_voice() only
         # ever returns a kokoro id.
         voice = _MACOS_VOICES.get(engine) or get_voice(cwd)
-        queued = spool.enqueue(message, engine, voice, session=session)
+        queued = spool.enqueue(message, engine, voice, session=session,
+                               utterance=utterance, sticky=sticky, shown=shown,
+                               source=source, cwd=cwd)
         _log("queue", "queued=%s pending=%d chars=%d :: %.60s" % (
-            queued, spool.pending_count(), len(message),
+            queued, spool.pending_count(cwd), len(message),
             message.replace("\n", " ")), cwd)
         return queued
     except Exception:
@@ -129,34 +133,39 @@ def enqueue_speech(text, min_level="concise", cwd=None, full=False, session=None
 
 
 def ensure_drainer(cwd=None) -> bool:
-    """Start an engine draining the spool unless one is already speaking.
+    """Start the project's engine draining its spool unless one is already up.
 
-    Called unconditionally by every narrator hook path, so a spool left
-    behind by a crashed engine is picked up by the next hook rather than
-    sitting there. Racing hooks are harmless: the engine's own atomic lock
-    claim admits exactly one drainer.
+    Called unconditionally by every narrator path, so a spool left behind by
+    a crashed engine is picked up by the next hook rather than sitting
+    there. Racing callers are harmless: the engine's own atomic lock claim
+    admits exactly one drainer per project.
     """
     try:
-        if spool.pending_count() == 0:
+        spool.remove_legacy_queue()
+        if spool.pending_count(cwd) == 0:
             return False
-        if lock_is_live():
-            return False  # a drainer is already working through the queue
+        if lock_is_live(project_lock_path(cwd)):
+            return False  # this project's drainer is already working
         engine = resolve_engine(cwd)
-        if engine == "kokoro":
-            command = [
-                "uv", "run", "--project", str(_TTS_DIR),
-                str(_TTS_DIR / "kokoro_voice.py"), "--drain",
-            ]
-        elif engine in _MACOS_VOICES:
-            command = ["python3", str(_TTS_DIR / "macos_say.py"), "--drain"]
-        else:
+        command = _drain_command(engine, project_dir(cwd))
+        if command is None:
             return False
         spawned = _spawn_detached(command)
         _log("queue", "drainer spawned=%s engine=%s pending=%d" % (
-            spawned, engine, spool.pending_count()), cwd)
+            spawned, engine, spool.pending_count(cwd)), cwd)
         return spawned
     except Exception:
         return False
+
+
+def _drain_command(engine, root):
+    """The argv that drains root's spool with engine, or None for no engine."""
+    if engine == "kokoro":
+        return ["uv", "run", "--project", str(_TTS_DIR),
+                str(_TTS_DIR / "kokoro_voice.py"), "--drain", str(root)]
+    if engine in _MACOS_VOICES:
+        return ["python3", str(_TTS_DIR / "macos_say.py"), "--drain", str(root)]
+    return None
 
 
 def stop_speech() -> None:
@@ -218,6 +227,11 @@ def _dispatch(message, engine, cwd) -> None:
 
 def _spawn_detached(command) -> bool:
     """Start the engine process without ever waiting on it."""
+    if os.environ.get("VOICEOVER_NO_SPAWN"):
+        # Set by the test harness: report success, start nothing, so no test
+        # races a real drainer for the queue it is inspecting (and, from
+        # Task 4 on, no test leaves an engine waiting on a lease).
+        return True
     try:
         kwargs = {
             "cwd": str(_TTS_DIR),
@@ -242,13 +256,19 @@ def _spawn_detached(command) -> bool:
 # Lock file (read/clear only - the engine subprocess creates and removes it)
 # ---------------------------------------------------------------------------
 
-def _lock_expiry():
-    """The lock's expiry timestamp, or None when there is no readable lock.
+def project_lock_path(cwd=None) -> Path:
+    """The project's drainer lock. The engine creates and removes it."""
+    return project_dir(cwd) / _LOCK_FILE_NAME
 
-    Lock content is JSON {"expiry", "pid"}; pre-1.1 locks were a bare float.
+
+def _lock_expiry(path=None):
+    """A lock's expiry timestamp, or None when there is no readable lock.
+
+    path defaults to the one-shot speaker's lock. Lock content is JSON
+    {"expiry", "pid"}; pre-1.1 locks were a bare float.
     """
     try:
-        raw = lock_path().read_text().strip()
+        raw = (path or lock_path()).read_text().strip()
     except OSError:
         return None
     try:
@@ -260,7 +280,7 @@ def _lock_expiry():
             return None
 
 
-def lock_is_live() -> bool:
+def lock_is_live(path=None) -> bool:
     """True while an unexpired lock exists. Read-only: never deletes anything.
 
     ensure_drainer() asks this from a HOOK, about a lock a live engine holds.
@@ -268,7 +288,7 @@ def lock_is_live() -> bool:
     lock it does not own - and it applies just as much from outside: a hook
     that deletes a working drainer's lock lets a rival start beside it.
     """
-    expiry = _lock_expiry()
+    expiry = _lock_expiry(path)
     return expiry is not None and time.time() < expiry
 
 

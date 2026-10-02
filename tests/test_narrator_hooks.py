@@ -75,7 +75,7 @@ path = write_transcript("locked.jsonl", [USER])
 commit_offset(str(path), path.stat().st_size)
 with open(path, "a") as handle:
     handle.write(json.dumps(assistant("This must not be lost.")) + "\n")
-(Path(os.environ["VOICEOVER_DATA_DIR"]) / "tts.lock").write_text(
+(spool.queue_dir().parent / "tts.lock").write_text(
     json.dumps({"expiry": time.time() + 60, "pid": 1}))
 proc = run_hook("post_tool_use", {"cwd": str(REPO_ROOT), "transcript_path": str(path),
                                   "tool_name": "Bash", "tool_input": {},
@@ -90,7 +90,7 @@ proc = run_hook("post_tool_use", {"cwd": str(REPO_ROOT), "transcript_path": str(
                                   "session_id": "S1"})
 check("the same prose is not queued a second time",
       queued_texts() == ["This must not be lost."], queued_texts())
-(Path(os.environ["VOICEOVER_DATA_DIR"]) / "tts.lock").unlink()
+(spool.queue_dir().parent / "tts.lock").unlink()
 
 # --- pre_tool_use queues too ----------------------------------------------
 spool.clear()

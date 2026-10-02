@@ -17,7 +17,7 @@ import os
 import subprocess
 import sys
 
-from engine_common import remove_tts_lock, try_claim_lock, update_lock_expiry
+from engine_common import data_dir, remove_tts_lock, try_claim_lock, update_lock_expiry
 
 DRY_RUN = bool(os.environ.get("VOICEOVER_DRY_RUN"))
 DEFAULT_VOICE = "Samantha"
@@ -44,12 +44,12 @@ def say_once(voice, text) -> bool:
 
 def speak(voice, text):
     """Single-utterance path: claim the lock, speak, release it."""
-    if not try_claim_lock(estimate_duration(text)):
+    if not try_claim_lock(data_dir(), estimate_duration(text)):
         return True  # another narration is playing - skip quietly
     try:
         return say_once(voice, text)
     finally:
-        remove_tts_lock()
+        remove_tts_lock(data_dir())
 
 
 # --- CLI ---------------------------------------------------------------------
@@ -71,7 +71,12 @@ def parse_args(argv):
 
 def main():
     if "--drain" in sys.argv[1:]:
-        from engine_common import drain
+        from engine_common import drain, drain_root
+
+        root = drain_root(sys.argv)
+        if root is None:
+            print("Usage: macos_say.py --drain <project dir>", file=sys.stderr)
+            return 0
 
         def speak_one(item):
             text = item["text"]
@@ -83,10 +88,10 @@ def main():
                 return False
             # Extend the lock to this item's real length before speaking, so a
             # long utterance cannot let the lock expire under a sibling engine.
-            update_lock_expiry(estimate_duration(text) + 5.0)
+            update_lock_expiry(root, estimate_duration(text) + 5.0)
             return say_once(voice, text)
 
-        return drain(speak_one, {"macos-female", "macos-male"})
+        return drain(root, speak_one, {"macos-female", "macos-male"})
 
     voice, text = parse_args(sys.argv[1:])
     if not text:

@@ -24,7 +24,7 @@ import tempfile
 import urllib.request
 from pathlib import Path
 
-from engine_common import remove_tts_lock, try_claim_lock, update_lock_expiry
+from engine_common import data_dir, remove_tts_lock, try_claim_lock, update_lock_expiry
 
 DRY_RUN = bool(os.environ.get("VOICEOVER_DRY_RUN"))
 
@@ -165,12 +165,12 @@ def get_voice_settings(voice):
     return VOICE_SETTINGS.get(voice, DEFAULT_VOICE_SETTINGS)
 
 
-def play_chunk(samples, sample_rate):
+def play_chunk(samples, sample_rate, root):
     """Play one streamed chunk; extends the lock, never removes it."""
     import soundfile as sf
 
     duration = len(samples) / float(sample_rate) if sample_rate else 0.0
-    update_lock_expiry(duration + 20.0)  # this chunk plus headroom for the next
+    update_lock_expiry(root, duration + 20.0)  # this chunk plus headroom for the next
     tmp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     tmp_path = tmp_file.name
     tmp_file.close()
@@ -189,7 +189,7 @@ def play_samples(samples, sample_rate):
     import soundfile as sf
 
     duration = len(samples) / float(sample_rate) if sample_rate else 0.0
-    update_lock_expiry(duration)
+    update_lock_expiry(data_dir(), duration)
     # delete=False + manual cleanup avoids Windows file-locking issues.
     tmp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     tmp_path = tmp_file.name
@@ -198,7 +198,7 @@ def play_samples(samples, sample_rate):
         sf.write(tmp_path, samples, sample_rate)
         return play_audio_file(tmp_path, timeout=max(30, int(duration) + 10))
     finally:
-        remove_tts_lock()
+        remove_tts_lock(data_dir())
         try:
             os.unlink(tmp_path)
         except OSError:
@@ -236,7 +236,7 @@ def speak_standard(kokoro, text, voice):
     return play_samples(samples, sample_rate)
 
 
-def _speak_whole_keeping_lock(kokoro, text, voice):
+def _speak_whole_keeping_lock(kokoro, text, voice, root):
     """Synthesize the whole text, then play it, WITHOUT removing the lock.
 
     The non-streaming fallback for a caller that owns the lock across several
@@ -251,11 +251,11 @@ def _speak_whole_keeping_lock(kokoro, text, voice):
         trim=settings["trim"],
     )
     duration = len(samples) / float(sample_rate) if sample_rate else 0.0
-    update_lock_expiry(duration + 20.0)
+    update_lock_expiry(root, duration + 20.0)
     return _play_samples_keeping_lock(samples, sample_rate, duration)
 
 
-def stream_chunks(kokoro, text, voice) -> bool:
+def stream_chunks(kokoro, text, voice, root) -> bool:
     """Synthesize in chunks and play each one as it arrives. True if any played.
 
     Owns no lock lifecycle: play_chunk() refreshes the expiry per chunk and
@@ -287,7 +287,7 @@ def stream_chunks(kokoro, text, voice) -> bool:
                 samples = chunk.audio
             if samples is None or not len(samples):
                 continue
-            play_chunk(samples, sample_rate)
+            play_chunk(samples, sample_rate, root)
             played = True
         return played
 
@@ -310,13 +310,13 @@ def speak_streaming(kokoro, text, voice):
     items and would end after the first.
     """
     try:
-        return stream_chunks(kokoro, text, voice)
+        return stream_chunks(kokoro, text, voice, data_dir())
     except Exception as error:
         log("[ERROR] Streaming failed: " + str(error))
         log("[FALLBACK] Falling back to standard synthesis...")
         return speak_standard(kokoro, text, voice)
     finally:
-        remove_tts_lock()
+        remove_tts_lock(data_dir())
 
 
 def speak_text(text, voice, use_streaming=False):
@@ -327,7 +327,7 @@ def speak_text(text, voice, use_streaming=False):
         # see this narration during the multi-second spin-up, not only once
         # playback begins. play_samples() refreshes the expiry with the real
         # audio duration and removes the lock when playback ends.
-        if not try_claim_lock(10.0 + 0.4 * len(text.split())):
+        if not try_claim_lock(data_dir(), 10.0 + 0.4 * len(text.split())):
             return True  # another narration is playing - skip quietly
         try:
             from kokoro_onnx import Kokoro
@@ -337,7 +337,7 @@ def speak_text(text, voice, use_streaming=False):
                 return speak_streaming(kokoro, text, voice)
             return speak_standard(kokoro, text, voice)
         except Exception:
-            remove_tts_lock()
+            remove_tts_lock(data_dir())
             raise
     except Exception as error:
         log("[ERROR] Speech failed: " + str(error))
@@ -393,13 +393,18 @@ def print_usage():
 
 def main():
     if "--drain" in sys.argv[1:]:
-        from engine_common import drain
+        from engine_common import drain, drain_root
+
+        root = drain_root(sys.argv)
+        if root is None:
+            log("Usage: kokoro_voice.py --drain <project dir>")
+            return 0
 
         if DRY_RUN:
             def speak_one(item):
                 print("[voiceover] " + item["text"], file=sys.stderr)
                 return True
-            return drain(speak_one, {"kokoro"})
+            return drain(root, speak_one, {"kokoro"})
 
         loaded = {}
 
@@ -433,19 +438,19 @@ def main():
             # expiry inside the synthesis window reads as "free" to the next
             # hook, which starts a second drainer - two voices on one speaker.
             # Same length-proportional estimate speak_text() uses.
-            update_lock_expiry(10.0 + 0.4 * len(text.split()))
+            update_lock_expiry(root, 10.0 + 0.4 * len(text.split()))
             try:
                 # Stream: each chunk plays as it is synthesized, and play_chunk
                 # keeps extending the lock. Without this the whole item renders
                 # before a single word is heard - the dead air this queue
                 # exists to remove.
-                return stream_chunks(kokoro, text, voice)
+                return stream_chunks(kokoro, text, voice, root)
             except Exception as error:
                 log("[ERROR] Streaming failed: " + str(error))
                 log("[FALLBACK] Falling back to standard synthesis...")
-                return _speak_whole_keeping_lock(kokoro, text, voice)
+                return _speak_whole_keeping_lock(kokoro, text, voice, root)
 
-        return drain(speak_one, {"kokoro"}, prepare=prepare)
+        return drain(root, speak_one, {"kokoro"}, prepare=prepare)
 
     parsed = parse_args(sys.argv[1:])
     if parsed is None:

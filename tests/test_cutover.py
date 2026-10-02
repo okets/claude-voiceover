@@ -72,7 +72,7 @@ real_ensure = voiceover.speech.ensure_drainer
 real_stdin = sys.stdin
 
 
-def record_clear(session=None):
+def record_clear(session=None, cwd=None):
     order.append("clear")
     return 0
 

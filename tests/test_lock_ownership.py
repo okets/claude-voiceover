@@ -27,7 +27,8 @@ set_setting("interaction_level", "narrator")
 # here is the lock check it makes first, not the spawn.
 set_setting("tts_engine", "none")
 
-lock = speech.lock_path()
+lock = speech.lock_path()                  # the one-shot speaker's lock
+project_lock = speech.project_lock_path()  # this project's drainer lock
 
 
 def dead_pid():
@@ -37,22 +38,22 @@ def dead_pid():
     return proc.pid
 
 
-def write_lock(expiry_offset, pid):
-    lock.write_text(json.dumps({"expiry": time.time() + expiry_offset, "pid": pid}))
+def write_lock(expiry_offset, pid, path=None):
+    (path or lock).write_text(json.dumps({"expiry": time.time() + expiry_offset, "pid": pid}))
 
 
 # --- ensure_drainer reads the lock, it does not clear it -------------------
 spool.clear()
 spool.enqueue("something to say", "kokoro", "af_sarah")
 
-write_lock(-5, os.getpid())          # expired, but held by a live process
+write_lock(-5, os.getpid(), project_lock)  # expired, but held by a live process
 speech.ensure_drainer()
 check("ensure_drainer does not delete an expired lock it does not own",
-      lock.exists(), "the hook unlinked a live engine's lock")
+      project_lock.exists(), "the hook unlinked a live engine's lock")
 
-write_lock(300, os.getpid())
+write_lock(300, os.getpid(), project_lock)
 check("a live lock still stops a second drainer", speech.ensure_drainer() is False)
-check("and that lock survives too", lock.exists())
+check("and that lock survives too", project_lock.exists())
 
 # --- speak()'s own lock check is unchanged for the non-narrator levels -----
 # It clears an expired lock as a side effect; that is pre-existing behaviour

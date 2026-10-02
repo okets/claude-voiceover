@@ -34,7 +34,7 @@ def main():
     # change would otherwise be drained later and speak an abandoned turn.
     dropped = 0
     if session:
-        dropped = clear(session=session)
+        dropped = clear(session=session, cwd=cwd)
     # With no session id we cannot tell which items are ours, and an
     # unscoped clear would wipe every other session's pending narration.
     _log("cutover", "dropped=%d pending items on a new prompt" % dropped, cwd)

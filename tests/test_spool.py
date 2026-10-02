@@ -8,9 +8,9 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _harness import check, isolate, report, REPO_ROOT
+from _harness import check, isolate, report, REPO_ROOT, temp_dir
 
-isolate()
+data_dir = isolate()
 from voiceover import spool
 
 
@@ -118,5 +118,44 @@ check("enqueue succeeds after pruning corrupt item", enqueued is True,
 final_texts = [json.loads((spool.queue_dir() / n).read_text())["text"]
                for n in item_files()]
 check("new item lands after prune of corrupt item", final_texts == ["recovery"], final_texts)
+
+# --- one queue per project --------------------------------------------------
+project_a = temp_dir("vo-proj-a-")
+(project_a / ".git").mkdir()
+project_b = temp_dir("vo-proj-b-")
+(project_b / ".git").mkdir()
+spool.enqueue("for a", "kokoro", "bf_emma", cwd=str(project_a))
+check("an item lands in its own project's queue",
+      spool.pending_count(cwd=str(project_a)) == 1
+      and spool.pending_count(cwd=str(project_b)) == 0)
+check("the two projects' queue dirs differ",
+      spool.queue_dir(cwd=str(project_a)) != spool.queue_dir(cwd=str(project_b)))
+spool.enqueue("b one", "kokoro", "bf_emma", session="S", cwd=str(project_b))
+spool.clear(session="S", cwd=str(project_a))
+check("clear is scoped to one project", spool.pending_count(cwd=str(project_b)) == 1)
+
+# --- message fields -----------------------------------------------------------
+spool.clear(cwd=str(project_a))
+spool.enqueue("one", "kokoro", "v", cwd=str(project_a))
+spool.enqueue("two", "kokoro", "v", cwd=str(project_a))
+spool.enqueue("three", "kokoro", "v", utterance="U1", sticky=True, shown=12.5,
+              source="pre_tool_use", cwd=str(project_a))
+fields = [json.loads(p.read_text())
+          for p in sorted(spool.queue_dir(cwd=str(project_a)).glob("*.json"))]
+check("an item with no utterance starts a message of its own",
+      fields[0]["utterance"] and fields[0]["utterance"] != fields[1]["utterance"],
+      fields[:2])
+check("a given utterance, sticky flag, shown time and source are kept",
+      fields[2]["utterance"] == "U1" and fields[2]["sticky"] is True
+      and fields[2]["shown"] == 12.5 and fields[2]["source"] == "pre_tool_use", fields[2])
+check("items are not sticky by default", fields[0]["sticky"] is False, fields[0])
+
+# --- the legacy machine-wide queue is removed once -----------------------------
+legacy = data_dir / "queue"
+legacy.mkdir(exist_ok=True)
+(legacy / "0000000000001-1-00.json").write_text("{}")
+check("remove_legacy_queue deletes the old items", spool.remove_legacy_queue() == 1)
+check("and the old directory", not legacy.exists())
+check("a second call has nothing to do", spool.remove_legacy_queue() == 0)
 
 report()
