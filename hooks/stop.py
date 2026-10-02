@@ -29,8 +29,15 @@ def main():
     from voiceover.templates import completion_message
     from voiceover.transcript import cycle_stats
 
-    cwd = payload.get("cwd")
+    from voiceover import lease, narrator
+
+    session = payload.get("session_id")
+    cwd = narrator.pinned_cwd(session, payload.get("cwd"))
     level = get_interaction_level(cwd)
+    if level != "narrator":
+        # The turn is over and nothing narrates it now (the level may have
+        # changed mid-turn): never leave an engine held for it.
+        lease.release(cwd, session)
     if level == "silent":
         return
     if level == "quiet":
@@ -42,38 +49,36 @@ def main():
         return
 
     if level == "narrator":
+        if narrator.headless():
+            return
         from voiceover.debuglog import log as _log
-        from voiceover.prose import commit_offset, peek_new_prose
+        from voiceover.prose import commit_offset, peek_new_prose_stamped
         from voiceover.speech import ensure_drainer, enqueue_speech
         import os as _os
         _log("stop", "enter size=%s" % _os.path.getsize(transcript_path), cwd)
         # The final assistant message is flushed to the transcript shortly
         # AFTER Stop fires (measured ~0.5s); poll briefly so the finale is
         # actually readable instead of always arriving one turn late.
-        prose, offset = peek_new_prose(transcript_path)
+        prose, offset, shown = peek_new_prose_stamped(transcript_path)
         retries = 0
         for _ in range(10):
             if prose:
                 break
             time.sleep(0.5)
-            prose, offset = peek_new_prose(transcript_path)
+            prose, offset, shown = peek_new_prose_stamped(transcript_path)
             retries += 1
         _log("stop", "peek after %d retries: %d chars, size=%s" % (
             retries, len(prose or ""), _os.path.getsize(transcript_path)), cwd)
-        if prose:
+        if prose and enqueue_speech(prose, cwd=cwd, full=True, session=session,
+                                    shown=shown, source="stop"):
             # The finale is Claude's own closing words. It goes to the BACK of
-            # the queue: order is what makes narration followable, and the
-            # queue drains without waiting for another hook anyway.
-            if enqueue_speech(prose, cwd=cwd, full=True,
-                              session=payload.get("session_id")):
-                commit_offset(transcript_path, offset)
-            ensure_drainer(cwd)
-            return
+            # the queue: order is what makes narration followable.
+            commit_offset(transcript_path, offset)
         ensure_drainer(cwd)
-        # Nothing unread (all prose narrated mid-turn). Narrator mode speaks
-        # only Claude's own words, so the turn ends on the chime: a template
-        # here would be invented, and the newest text a re-run.
-        play_sound("decide", cwd=cwd)
+        # The turn is over: the engine goes once the finale has played. A
+        # turn with nothing left to say ends on the chime instead - narrator
+        # mode only ever speaks Claude's own words.
+        narrator.turn_end(cwd, session, spoken=bool(prose))
         return
 
     stats = cycle_stats(transcript_path)

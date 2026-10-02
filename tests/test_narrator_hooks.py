@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _harness import check, isolate, report, REPO_ROOT
 
 data_dir = isolate()
-from voiceover import spool
+from voiceover import lease, narrator, spool
 from voiceover.settings import set_setting
 
 set_setting("interaction_level", "narrator")
@@ -146,7 +146,7 @@ item = json.loads(sorted(spool.queue_dir().glob("*.json"))[0].read_text())
 check("the hook records its session id", item["session"] == "SESSION-XYZ", item)
 
 # --- the dialog branch announces and marks --------------------------------
-dialog_marker = Path(os.environ["VOICEOVER_DATA_DIR"]) / "dialog_alert.json"
+dialog_marker = Path(os.environ["VOICEOVER_DATA_DIR"]) / "dialog_alert" / "S1"
 dialog_marker.unlink(missing_ok=True)
 spool.clear()
 path = write_transcript("dialog.jsonl", [USER])
@@ -201,7 +201,7 @@ check("notification queued its permission text", len(queued_texts()) == 1, queue
 
 # ... and stays quiet when a fresh dialog marker says it was just announced
 spool.clear()
-dialog_marker.write_text(json.dumps({"ts": time.time()}))
+narrator.write_dialog_marker("S1")
 proc = run_hook("notification", {
     "cwd": str(REPO_ROOT), "transcript_path": str(path),
     "message": "Claude needs your permission to use Bash",
@@ -210,5 +210,116 @@ check("notification (echo-suppressed) exits 0", proc.returncode == 0, proc.stder
 check("notification queues nothing when the dialog was just announced",
       queued_texts() == [], queued_texts())
 dialog_marker.unlink(missing_ok=True)
+
+def run_hook_env(name, payload, **env):
+    """run_hook with extra environment variables for the hook process."""
+    return subprocess.run(
+        [sys.executable, str(REPO_ROOT / "hooks" / (name + ".py"))],
+        input=json.dumps(payload), capture_output=True, text=True,
+        env=dict(os.environ, **env))
+
+
+def lease_held(session="S1", cwd=None):
+    return (spool.queue_dir(cwd).parent / "leases" / (session + ".json")).exists()
+
+
+def pending_items():
+    return [json.loads(p.read_text()) for p in sorted(spool.queue_dir().glob("*.json"))]
+
+
+# --- the lease table, and an answered alert is retired (Review Focus 5) -----------------
+spool.clear()
+path = write_transcript("lease.jsonl", [USER])
+commit_offset(str(path), path.stat().st_size)
+base = {"cwd": str(REPO_ROOT), "transcript_path": str(path), "session_id": "S1"}
+run_hook("pre_tool_use", dict(base, tool_name="Bash", tool_input={}))
+check("a tool call holds the project's engine", lease_held())
+run_hook("pre_tool_use", dict(base, tool_name="AskUserQuestion",
+                              tool_input={"questions": [{"question": "Which?", "options": []}]}))
+check("a question dialog releases it while the user decides", not lease_held())
+items = pending_items()
+check("the dialog alert is queued sticky", items and items[-1]["sticky"] is True, items)
+check("and tagged as a dialog", items and items[-1]["source"] == "dialog", items)
+run_hook("post_tool_use", dict(base, tool_name="AskUserQuestion", tool_input={}))
+check("the answer takes it back", lease_held())
+check("an alert answered before it played is retired",
+      not any(i["sticky"] for i in pending_items()), pending_items())
+run_hook("stop", base)
+check("the turn's end lets it go", not lease_held())
+
+# --- prose items carry their source and when they appeared ---------------------------
+spool.clear()
+with open(path, "a") as handle:
+    entry = assistant("Stamped prose.")
+    entry["timestamp"] = "2026-10-02T12:00:00.000Z"
+    handle.write(json.dumps(entry) + "\n")
+run_hook("pre_tool_use", dict(base, tool_name="Bash", tool_input={}))
+items = pending_items()
+check("a mid-turn item names the hook that queued it",
+      items and items[0]["source"] == "pre_tool_use", items)
+check("and when its prose appeared", items and isinstance(items[0]["shown"], float), items)
+lease.release(None, "S1")
+
+# --- the pin survives a cd (Review Focus 2) -------------------------------------------
+from _harness import temp_dir
+elsewhere = temp_dir("vo-elsewhere-")
+(elsewhere / ".git").mkdir()
+spool.clear()
+run_hook("user_prompt_submit", {"cwd": str(REPO_ROOT), "session_id": "S1", "prompt": "go"})
+run_hook("pre_tool_use", dict(base, cwd=str(elsewhere), tool_name="Bash", tool_input={}))
+check("a tool call after a cd still holds the turn's own project", lease_held())
+check("and holds nothing in the directory it moved to", not lease_held(cwd=str(elsewhere)))
+run_hook("session_end", {"cwd": str(elsewhere), "session_id": "S1", "reason": "other"})
+check("SessionEnd releases the lease where it was held", not lease_held())
+check("and drops the pin", narrator.pinned_cwd("S1", None) is None)
+
+# --- a background task's notification does not cut over (Review Focus 3) --------------
+spool.clear()
+spool.enqueue("Still talking.", "kokoro", "bf_emma", session="S1")
+stop_dir = spool.queue_dir().parent / "stop"
+for old in stop_dir.glob("*.json"):
+    old.unlink()
+run_hook("user_prompt_submit", {"cwd": str(REPO_ROOT), "session_id": "S1",
+                                "prompt": "<task-notification>build finished</task-notification>"})
+check("a task notification leaves the queue alone", spool.pending_count() == 1)
+check("and requests no stop", not (stop_dir / "S1.json").exists())
+check("but warms the engine for its turn", lease_held())
+lease.release(None, "S1")
+run_hook("user_prompt_submit", {"cwd": str(REPO_ROOT), "prompt": "no session id"})
+check("a prompt without a session id stops no one", not (stop_dir / "_all.json").exists())
+
+# --- permission requests are sticky; the dialog echo marker is per session --------------
+spool.clear()
+dialog_marker.unlink(missing_ok=True)   # the lease-table dialog above marked S1
+narrator.write_dialog_marker("OTHER")
+path = write_transcript("perm.jsonl", [USER])
+commit_offset(str(path), path.stat().st_size)
+run_hook("notification", {"cwd": str(REPO_ROOT), "transcript_path": str(path),
+                          "message": "Claude needs your permission to use Bash",
+                          "session_id": "S1"})
+items = pending_items()
+check("another session's dialog does not silence this session's permission request",
+      len(items) == 1, items)
+check("the permission request is sticky", items and items[0]["sticky"] is True, items)
+
+# --- headless runs are not narrated -----------------------------------------------------
+spool.clear()
+path = write_transcript("headless.jsonl", [USER])
+commit_offset(str(path), path.stat().st_size)
+with open(path, "a") as handle:
+    handle.write(json.dumps(assistant("Nobody is listening.")) + "\n")
+headless = {"cwd": str(REPO_ROOT), "transcript_path": str(path), "session_id": "H1"}
+run_hook_env("user_prompt_submit", dict(headless, prompt="go"), CLAUDE_CODE_ENTRYPOINT="sdk-cli")
+run_hook_env("pre_tool_use", dict(headless, tool_name="Bash", tool_input={}),
+             CLAUDE_CODE_ENTRYPOINT="sdk-cli")
+check("a headless run queues nothing", spool.pending_count() == 0, pending_items())
+check("and holds no engine", not lease_held("H1"))
+
+# --- a turn's end releases the engine at any level ----------------------------------------
+lease.hold(None, "S1")
+set_setting("interaction_level", "concise")
+run_hook("stop", {"cwd": str(REPO_ROOT), "transcript_path": str(path), "session_id": "S1"})
+set_setting("interaction_level", "narrator")
+check("a stop after narration was turned off still releases the engine", not lease_held())
 
 report()

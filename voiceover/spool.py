@@ -133,6 +133,24 @@ def clear(session=None, cwd=None) -> int:
     return removed
 
 
+def clear_sticky(session, cwd=None) -> int:
+    """Retire a session's pending alerts and permission requests: a tool has
+    finished, so whatever they asked has been answered. Returns how many."""
+    if not session:
+        return 0
+    removed = 0
+    for path in _items(cwd):
+        item = _read(path)
+        if item is None or not item.get("sticky") or item.get("session") != session:
+            continue
+        try:
+            path.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 def prune(max_age_seconds=QUEUE_MAX_AGE_SECONDS, cwd=None) -> int:
     """Drop items older than the cap, plus leftovers from a killed reader."""
     removed = 0

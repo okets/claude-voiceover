@@ -49,8 +49,8 @@ for field in ("name", "displayName", "version", "description", "author", "licens
 # --- hooks.json itself stays well-formed and complete ---------------------
 hooks = json.loads((REPO_ROOT / "hooks" / "hooks.json").read_text())["hooks"]
 expected = {"PreToolUse", "PostToolUse", "Notification", "Stop",
-            "SubagentStop", "UserPromptSubmit"}
-check("all six hook events are registered",
+            "SubagentStop", "UserPromptSubmit", "SessionEnd"}
+check("all seven hook events are registered",
       set(hooks) == expected, "registered: %s" % sorted(hooks))
 
 # --- version agrees with the marketplace entry beside it ------------------

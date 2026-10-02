@@ -66,6 +66,17 @@
           }
         ]
       }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" session_end",
+            "timeout": 10
+          }
+        ]
+      }
     ]
   }
 }

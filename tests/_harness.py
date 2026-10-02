@@ -20,13 +20,16 @@ _temp_dirs = []
 def isolate():
     """Point the plugin at a throwaway data dir and enable dry-run audio.
 
-    Engine spawning is suppressed too (VOICEOVER_NO_SPAWN).
+    Engine spawning is suppressed too (VOICEOVER_NO_SPAWN), and the run counts as
+    an interactive session (CLAUDE_CODE_ENTRYPOINT=cli) so the narrator paths
+    under test run whatever process starts the suite.
     """
     data_dir = tempfile.mkdtemp(prefix="vo-test-data-")
     _temp_dirs.append(data_dir)
     os.environ["VOICEOVER_DATA_DIR"] = data_dir
     os.environ["VOICEOVER_DRY_RUN"] = "1"
     os.environ["VOICEOVER_NO_SPAWN"] = "1"
+    os.environ["CLAUDE_CODE_ENTRYPOINT"] = "cli"
     sys.path.insert(0, str(REPO_ROOT))
     return Path(data_dir)
 

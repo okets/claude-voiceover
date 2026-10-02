@@ -158,4 +158,14 @@ check("remove_legacy_queue deletes the old items", spool.remove_legacy_queue() =
 check("and the old directory", not legacy.exists())
 check("a second call has nothing to do", spool.remove_legacy_queue() == 0)
 
+# --- an answered alert is retired -------------------------------------------------
+spool.clear()
+spool.enqueue("May I run it?", "kokoro", "v", session="S", sticky=True)
+spool.enqueue("Plain prose.", "kokoro", "v", session="S")
+spool.enqueue("Their alert.", "kokoro", "v", session="T", sticky=True)
+check("clear_sticky retires only that session's sticky items", spool.clear_sticky("S") == 1)
+left = sorted(json.loads(p.read_text())["text"] for p in spool.queue_dir().glob("*.json"))
+check("prose and other sessions' alerts stay", left == ["Plain prose.", "Their alert."], left)
+check("clear_sticky without a session retires nothing", spool.clear_sticky(None) == 0)
+
 report()

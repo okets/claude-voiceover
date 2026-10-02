@@ -11,6 +11,7 @@ the last fully-narrated line. Transcripts are append-only JSONL, so a byte
 offset is a complete, restart-safe cursor. Stdlib only.
 """
 
+import datetime
 import json
 import re
 from pathlib import Path
@@ -28,17 +29,24 @@ def peek_new_prose(transcript_path):
     speech_text is None when there is nothing new to say. The stored offset
     is NOT advanced - call commit_offset(transcript_path, new_offset) after
     the text was actually spoken."""
+    text, offset, _shown = peek_new_prose_stamped(transcript_path)
+    return text, offset
+
+
+def peek_new_prose_stamped(transcript_path):
+    """peek_new_prose(), plus `shown`: when the first unread prose row was
+    written (unix seconds, from its transcript timestamp), or None."""
     try:
         path = Path(transcript_path)
         if not path.is_file():
-            return None, 0
+            return None, 0, None
         start = _read_offset(str(path))
         size = path.stat().st_size
         if start is None:
             # First time narrating this transcript: start from NOW, not from
             # the whole session's backlog.
             commit_offset(str(path), size)
-            return None, size
+            return None, size, None
         if size < start:
             start = 0  # transcript replaced/truncated - start over
         with open(path, "rb") as handle:
@@ -47,17 +55,28 @@ def peek_new_prose(transcript_path):
         # Only consume complete lines; a line still being written stays unread.
         last_newline = blob.rfind(b"\n")
         if last_newline < 0:
-            return None, start
+            return None, start, None
         new_offset = start + last_newline + 1
-        texts = []
+        texts, shown = [], None
         for line in blob[: last_newline + 1].splitlines():
             text = _assistant_text(line)
             if text:
                 texts.append(text)
+                if shown is None:
+                    shown = _row_time(line)
         speech = clean_for_speech("\n\n".join(texts)) if texts else None
-        return (speech or None), new_offset
+        return (speech or None), new_offset, (shown if speech else None)
     except Exception:
-        return None, 0
+        return None, 0, None
+
+
+def _row_time(line):
+    """A transcript row's ISO timestamp as unix seconds, or None."""
+    try:
+        stamp = json.loads(line).get("timestamp")
+        return datetime.datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
 
 
 def commit_offset(transcript_path, offset) -> None:

@@ -18,55 +18,42 @@ sys.path.insert(0, str(PLUGIN_ROOT))
 def main():
     payload = json.load(sys.stdin)
 
-    from voiceover.prose import commit_offset, peek_new_prose
+    from voiceover import narrator
+    from voiceover.prose import commit_offset, peek_new_prose_stamped
     from voiceover.settings import get_interaction_level
     from voiceover.speech import speak, stop_speech
     from voiceover.templates import pre_tool_announcement
 
-    cwd = payload.get("cwd")
+    session = payload.get("session_id")
+    # The session's turn stays in the project its prompt was sent from.
+    cwd = narrator.pinned_cwd(session, payload.get("cwd"))
     if get_interaction_level(cwd) == "narrator":
         # Narrator mode: queue Claude's actual words written since the last
-        # narration. Tool play-by-play stays silent, and nothing interrupts -
-        # the queue keeps order and the drainer plays it back to back.
+        # narration. Tool play-by-play stays silent, and nothing interrupts.
+        if narrator.headless():
+            return
+        from voiceover import lease
         from voiceover.speech import ensure_drainer, enqueue_speech
 
         transcript = payload.get("transcript_path", "")
         tool_name = payload.get("tool_name", "")
-        session = payload.get("session_id")
-        text, offset = peek_new_prose(transcript)
-        if tool_name in ("AskUserQuestion", "ExitPlanMode"):
+        text, offset, shown = peek_new_prose_stamped(transcript)
+        if tool_name in narrator.DIALOG_TOOLS:
             # A dialog is about to block the session with no further hooks.
-            # Wait out the transcript flush race for the lead-in prose, then
-            # queue prose + an explicit 'I need your input' announcement of
-            # the actual question.
+            # Wait out the transcript flush race for the lead-in prose.
             if not text:
                 for _ in range(3):
                     time.sleep(0.5)
-                    text, offset = peek_new_prose(transcript)
+                    text, offset, shown = peek_new_prose_stamped(transcript)
                     if text:
                         break
-            from voiceover.templates import blocking_dialog_message
-            alert = blocking_dialog_message(tool_name, payload.get("tool_input") or {})
-            combined = (text + "\n" + alert) if text else alert
-            announced = enqueue_speech(combined, cwd=cwd, full=True, session=session)
-            if announced and text:
+            if narrator.queue_dialog(cwd, session, tool_name, payload.get("tool_input") or {},
+                                     lead_in=text, shown=shown) and text:
                 commit_offset(transcript, offset)
-            ensure_drainer(cwd)
-            if announced:
-                # Tell the notification hook this block was already announced,
-                # so its "needs permission" echo stays quiet. Only when the
-                # announcement actually queued - otherwise the echo is the
-                # only thing that will speak, and it must not be suppressed.
-                try:
-                    import json as _json
-                    import time as _time
-                    from voiceover.settings import data_dir
-                    with open(data_dir() / "dialog_alert.json", "w") as handle:
-                        _json.dump({"ts": _time.time()}, handle)
-                except Exception:
-                    pass
             return
-        if text and enqueue_speech(text, cwd=cwd, full=True, session=session):
+        lease.hold(cwd, session, ttl=lease.FALLBACK_LEASE_TTL)
+        if text and enqueue_speech(text, cwd=cwd, full=True, session=session,
+                                   shown=shown, source="pre_tool_use"):
             commit_offset(transcript, offset)
         ensure_drainer(cwd)
         return
