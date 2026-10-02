@@ -101,6 +101,17 @@ def project_dir(cwd=None) -> Path      # data_dir()/projects/<key>/, created on 
 Engines receive the project directory as an argument and never compute a key:
 the hook layer is the single authority for what a project is.
 
+**Fix in `settings.detect_project_root`:** a `.claude` directory found at
+`Path.home()` is not a project marker — it is Claude Code's own user
+configuration. Today the upward search accepts it: measured on 2026-10-02,
+`/Users/hanan/Projects/claude-voiceover` (no `.claude` of its own) resolves to
+`/Users/hanan`, so every project without its own `.claude` shares one root,
+and `/voiceover:voice <name> --project` run there writes
+`~/.claude/voiceover.json`, changing the voice of all of them. With the fix
+the `.claude` search skips the home directory and falls through to the `.git`
+search, so this repo resolves to itself. Side effect: such projects' default
+(hash-picked) voice changes once.
+
 ### 2. Spool — per project (`voiceover/spool.py`, `tts/engine_common.py`)
 
 - Every spool function takes `cwd` and works in `project_dir(cwd)/queue/`.
@@ -258,7 +269,7 @@ the existing `"hooks"` block. A probe with both keys passes
 | `prompt.submit` | `prompt` op, **not awaited** before `next(e)`, so the prompt is never delayed. The op returns `{"narrate": bool}` (level is `narrator`, TTS enabled, engine not `none`) and, when true, performs the cutover and pre-warm of §6. |
 | `turn.step` (main loop only: `e.agentId` absent) | An async generator that yields every chunk of `next(e)` unchanged and immediately. A text chunk is yielded first, then appended to the segmenter for block key `<turnId>:<index>:<chunk.index>`. Complete segments become `say` ops. When the step's stream ends, each block's remainder is flushed. A `hold` op is sent at step start. When `narrate` is false the tap does nothing but yield. |
 | `tool.call` for AskUserQuestion, ExitPlanMode | `dialog` op (Python builds the alert with `blocking_dialog_message`, enqueues it sticky under the session's most recent utterance key — so it continues the lead-in message rather than preempting it — writes `dialog_alert.json`, releases the lease); then `const r = await next(e)`; then a `hold` op; return `r`. |
-| `turn.complete` (every reason) | `turn-end` op: release the lease; play the decide chime when the turn queued no text (the stop-hook rule from commit c9aa3de). |
+| `turn.complete` (main loop only: `e.agentId` absent; every reason) | `turn-end` op: release the lease; play the decide chime when the turn's last step queued no text (the stop-hook rule from commit c9aa3de). A subagent's `turn.complete` is ignored — releasing there would unload the engine mid-turn. |
 
 **The bridge.** `$.process.run(["bash", $.plugin.root + "/hooks/run.sh",
 "mod_bridge"], { stdin, timeoutMs: 5000 })`, payload
