@@ -156,6 +156,37 @@ check("a prompt op below the narrator level leaves the pin alone",
       narrator.pinned_cwd("S2", None) == str(REPO_ROOT), narrator.pinned_cwd("S2", None))
 set_setting("interaction_level", "narrator")
 
+# --- a moved root keeps the turn in the project its prompt pinned ----------------------------
+spool.clear()
+spool.clear(cwd=str(other))
+bridge_from(REPO_ROOT, "S4", {"op": "prompt", "cutover": True}, {"op": "hold"})
+bridge_from(other, "S4", {"op": "hold"}, {"op": "say", "utterance": "M:0", "text": "Still the repo's turn. ", "shown": 1.0})
+check("a say after the root moved is queued in the pinned project",
+      spool.pending_count(cwd=str(REPO_ROOT)) == 1, spool.pending_count(cwd=str(REPO_ROOT)))
+check("and nothing is queued in the project the root moved to",
+      spool.pending_count(cwd=str(other)) == 0, spool.pending_count(cwd=str(other)))
+bridge_from(other, "S4", {"op": "turn-end", "spoken": True})
+check("the turn end releases the lease in the pinned project", not leased("S4"))
+check("and no lease was taken in the other project",
+      not (spool.queue_dir(cwd=str(other)).parent / "leases" / "S4.json").exists())
+
+# --- status keeps an existing pin -------------------------------------------------------------
+bridge_from(REPO_ROOT, "S5", {"op": "start"})
+bridge_from(other, "S5", {"op": "status"})
+check("status leaves an existing pin alone",
+      narrator.pinned_cwd("S5", None) == str(REPO_ROOT), narrator.pinned_cwd("S5", None))
+
+# --- the user's prompt cuts over even with TTS just turned off ------------------------------
+spool.clear()
+set_setting("tts_enabled", False)
+try:
+    spool.enqueue("Old turn.", "kokoro", "bf_emma", session="S6", cwd=str(REPO_ROOT))
+    bridge_from(REPO_ROOT, "S6", {"op": "prompt", "cutover": True})
+    check("with TTS off the user's prompt still clears the old turn", spool.pending_count(cwd=str(REPO_ROOT)) == 0)
+    check("and files the stop request", (PROJECT / "stop" / "S6.json").exists())
+finally:
+    set_setting("tts_enabled", True)
+
 # --- SessionEnd drops the mark even when the mod never says so -----------------------------
 narrator.mark_mod_session("S3")
 proc = subprocess.run(["bash", str(REPO_ROOT / "hooks" / "run.sh"), "session_end"],

@@ -6,11 +6,14 @@ here and in voiceover/narrator.py, shared with the classic hooks. Input:
 
     {"session": str, "cwd": str, "ops": [op, ...]}      cwd = the session's root
 
-    {"op": "start"} / {"op": "status"}   pin the session's project
+    Every op acts in the session's pinned project, wherever the root has moved.
+
+    {"op": "start"} / {"op": "status"}   pin a session that has no pin
     {"op": "end-session"}                release the lease, drop the mark
-    {"op": "prompt", "cutover": bool}    narrator level only: re-pin; the user's own
-                                         prompt stops the old turn (in the old project
-                                         too, after a move) and cuts over. The classic
+    {"op": "prompt", "cutover": bool}    narrator level only: re-pin to the root; the
+                                         user's own prompt stops the old turn (in the old
+                                         project too, after a move) and cuts over, whatever
+                                         the gate says. The classic
                                          prompt hook keeps the other levels.
     {"op": "hold"}                       a turn or step began: hold, warm up
     {"op": "say", "utterance": str, "text": str, "shown": float}
@@ -52,9 +55,11 @@ def run(payload):
     from voiceover.speech import enqueue_speech, ensure_drainer, prewarm
 
     session = payload.get("session")
-    cwd = payload.get("cwd")
+    root = payload.get("cwd")  # the session's root now: /cd or a worktree move can change it mid-turn
     ops = [op for op in (payload.get("ops") or []) if isinstance(op, dict)]
     narrator.mark_mod_session(session)
+    # A turn stays in the project its prompt pinned, wherever the root moves.
+    cwd = narrator.pinned_cwd(session, root)
     narrate = narrator.narrates(cwd)
     _log("bridge", "session=%s ops=%s narrate=%s" % (
         session, ",".join(str(op.get("op")) for op in ops), narrate), cwd)
@@ -65,12 +70,15 @@ def run(payload):
             lease.release(cwd, session)
             narrator.unmark_mod_session(session)
         elif kind in ("start", "status"):
-            narrator.pin_cwd(session, cwd)
+            if narrator.pinned_cwd(session, None) is None:
+                narrator.pin_cwd(session, root)  # a reload or a gate retry keeps the turn's pin
         elif kind == "prompt":
-            if not narrator.mod_owns_prompt(session, cwd):
+            if not narrator.mod_owns_prompt(session, root):
                 continue  # below the narrator level the classic prompt hook re-pins and clears
-            previous = narrator.repin(session, cwd)
-            if narrate and op.get("cutover"):
+            previous = narrator.repin(session, root)
+            cwd, narrate = root, narrator.narrates(root)
+            if op.get("cutover") and not narrator.headless():
+                # The user's own prompt stops the old turn, whatever narrates() says now.
                 if previous:
                     narrator.abandon(previous, session)  # the old turn, in its own project
                 narrator.cutover(cwd, session, warm=False)  # turn.start's hold warms

@@ -355,7 +355,7 @@ first step.
 | `session.end` | `end-session` op, awaited. |
 | `prompt.submit` | `prompt` op with `cutover` = the origin is not automated (Decisions). Not awaited. The reply is this turn's `narrate` gate. |
 | `turn.start` | `hold` op (the pre-warm); resets the dialog lead-in. |
-| `turn.step` (main loop only) | Yields every chunk of `next(e)` unchanged, then feeds text chunks to the segmenter; every block of one response shares the utterance `<turnId>:<index>`; complete segments become `say` ops. Flushed only when the response completed (`stopReason` set, not aborted); an interrupted stream is closed beneath and not flushed. |
+| `turn.step` (main loop only) | Yields every chunk of `next(e)` unchanged, then feeds text chunks to the segmenter; every block of one response shares the utterance `<turnId>:<index>`; complete segments become `say` ops. A block is flushed when the next block starts or the response completed (`stopReason` set, not aborted); an interrupted stream is closed beneath and its open block is not flushed. |
 | `tool.call` AskUserQuestion, ExitPlanMode | `dialog` op under the last utterance, awaited before `next(e)` so the permission echo finds the marker; then `hold`. |
 | `turn.complete` (main loop only) | `turn-end` op with `spoken` = the last step queued speakable text. |
 

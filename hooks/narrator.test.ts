@@ -1,7 +1,7 @@
 import type { On } from 'claude-code'
 import { expect, test } from 'claude-code/testing'
 
-type SentOp = { op: string; session: string; text?: string; utterance?: string | null; spoken?: boolean; input?: unknown; cutover?: boolean; tool?: string }
+type SentOp = { op: string; session: string; text?: string; utterance?: string | null; spoken?: boolean; input?: unknown; cutover?: boolean; tool?: string; shown?: number }
 
 /** Stands beneath the mod for the engine: the bridge process, the session, the event bottoms. */
 function fakeEngine(on: On, narrate: boolean, options: { failures?: number; ids?: string[] } = {}) {
@@ -246,4 +246,42 @@ test('a prompt typed mid-turn keeps the lead-in a later dialog continues', async
   await $.tool.call({ tool: 'AskUserQuestion', questions: [] } as never)
   await engine.until(sent => sent.some(o => o.op === 'dialog'))
   expect(engine.ops.find(o => o.op === 'dialog')?.utterance).toBe('T:0')
+})
+
+test('a text block is flushed when the next block starts, stamped when its last text arrived', async ($, on) => {
+  const engine = fakeEngine(on, true)
+  let inputDoneAt = 0
+  on('turn.step', async function* (_$, e) {
+    yield text('Let me write the config.') as never
+    yield { kind: 'tool', index: 1, id: 'tu1', name: 'Write' } as never
+    const until = Date.now() + 50
+    while (Date.now() < until) { /* the tool's arguments streaming */ }
+    yield { kind: 'input', index: 1, json: '{"file_path":"x"}' } as never
+    inputDoneAt = Date.now() / 1000
+    yield text('Done writing. ', 2) as never
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'tool_use', usage: null }
+  })
+  await $.prompt.submit(prompt())
+  await collect($.turn.step(step()))
+  await engine.until(sent => sent.filter(o => o.op === 'say').length === 2)
+  const says = engine.ops.filter(o => o.op === 'say')
+  expect(says.map(o => o.text)).toEqual(['Let me write the config.', 'Done writing. '])
+  expect((says[0]?.shown ?? Infinity) < inputDoneAt).toBe(true)
+})
+
+test('an interrupted turn ends without the chime', async ($, on) => {
+  const engine = fakeEngine(on, true)
+  fakeStep(on, () => [text('---\n')])
+  await $.prompt.submit(prompt())
+  await collect($.turn.step(step()))
+  await $.turn.complete({ ...turnEnd(), isAborted: true, reason: 'aborted' })
+  await engine.until(sent => sent.some(o => o.op === 'turn-end'))
+  expect(engine.ops.find(o => o.op === 'turn-end')?.spoken).toBe(true)
+})
+
+test('a prompt asked to wait its turn does not cut over', async ($, on) => {
+  const engine = fakeEngine(on, true)
+  await $.prompt.submit({ text: 'later', wait: true, origin: { kind: 'composer' } } as never)
+  await engine.until(sent => sent.some(o => o.op === 'prompt'))
+  expect(engine.ops.find(o => o.op === 'prompt')?.cutover).toBe(false)
 })

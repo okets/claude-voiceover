@@ -403,9 +403,10 @@ bridge re-pins and cuts over). Below the narrator level the classic hooks run as
   `ensure_drainer`; for `AskUserQuestion` / `ExitPlanMode` wait out the transcript flush race
   for the lead-in prose, then `narrator.queue_dialog` (sticky alert). Other levels: stop_speech
   (one-shot only), then verbose-level announcement via pre_tool_announcement.
-- `post_tool_use.py` — narrator: `spool.clear_sticky(session)` first (a finished tool means
-  the session's pending alert or permission request was answered; do not read it out), hold
-  or re-hold the lease, queue unread prose. Verbose: announcement via post_tool_announcement.
+- `post_tool_use.py` — narrator: `spool.clear_sticky(session)` first, in mod sessions too (a
+  finished tool means the session's pending alert or permission request was answered; do not
+  read it out), then stand down for a mod session; otherwise hold or re-hold the lease, queue
+  unread prose. Verbose: announcement via post_tool_announcement.
 - `notification.py` — clears a stale one-shot lock; permission requests: concise+ speaks
   permission_request_message (narrator: queued STICKY, `source="notification"`, unless this
   session's dialog alert was announced <30s ago); quiet plays 'notification' sound.
@@ -431,22 +432,24 @@ lives here and in `voiceover/narrator.py`, shared with the classic hooks.
 {"session": str, "cwd": str, "ops": [op, ...]}      cwd = the session's root
 ```
 
+Every op acts in the session's pinned project (`narrator.pinned_cwd(session, root)`), wherever the
+root has moved mid-turn; only `prompt` re-pins, to the root.
+
 | Op | Does |
 |----|------|
-| `{"op": "start"}` / `{"op": "status"}` | `narrator.pin_cwd`; `status` is also how the mod re-asks the gate |
+| `{"op": "start"}` / `{"op": "status"}` | `narrator.pin_cwd`, only for a session that has no pin; `status` is also how the mod re-asks the gate |
 | `{"op": "end-session"}` | `lease.release`, `narrator.unmark_mod_session` |
-| `{"op": "prompt", "cutover": bool}` | acts only when `narrator.mod_owns_prompt(session, cwd)`; then `narrator.repin`, and with `cutover` and narration on: `narrator.abandon(previous, session)` when the project moved, then `narrator.cutover(cwd, session, warm=False)` |
+| `{"op": "prompt", "cutover": bool}` | acts only when `narrator.mod_owns_prompt(session, cwd)`; then `narrator.repin` to the root (the gate is re-read there), and with `cutover` (not a headless run, whatever the gate says): `narrator.abandon(previous, session)` when the project moved, then `narrator.cutover(cwd, session, warm=False)` |
 | `{"op": "hold"}` | a turn or step began: `prewarm` (narration on only) |
 | `{"op": "say", "utterance", "text", "shown"}` | `speakable(text)`, then `enqueue_speech(full=True, source="mod", utterance=, shown=)`; `ensure_drainer` once per batch if anything queued (narration on only) |
 | `{"op": "dialog", "tool", "input", "utterance"}` | narration on: `narrator.queue_dialog(..., utterance=)`; off: `lease.release` |
-| `{"op": "turn-end", "spoken": bool}` | narration on: `narrator.turn_end`; off: `lease.release` |
+| `{"op": "turn-end", "spoken": bool}` | narration on: `narrator.turn_end` (its decide chime is played detached, so the bridge answers at once); off: `lease.release` |
 
 Every batch first calls `narrator.mark_mod_session(session)` (`/clear` and resume change the id
 with no `session.start`, and the classic hooks must stand down from the new session's first op),
 then reads the gate `narrator.narrates(cwd)` once. The gate decides per op:
-`start` and `status` pin whatever the gate says; `end-session` always releases and unmarks;
-`prompt` acts only when `narrator.mod_owns_prompt` is true, and cuts over only when the gate is
-also on; `turn-end` and `dialog` act when the gate is on and only release the lease when it is
+`start` and `status` pin a session without a pin, whatever the gate says; `end-session` always releases and unmarks;
+`prompt` acts only when `narrator.mod_owns_prompt` is true, and its cutover does not depend on the gate (headless runs skip it); `turn-end` and `dialog` act when the gate is on and only release the lease when it is
 off; `hold` and `say` run only when the gate is on. `speakable` cleans markdown with `prose.clean_for_speech` and strips any `*`
 or backtick a mid-markup split left unpaired.
 
@@ -462,14 +465,17 @@ it and the classic hooks narrate. TypeScript tests sit beside the sources (`*.te
 
 - `narrator.ts` - registers the mod's event handlers: `session.start` (open the gate with a
   `start` op), `session.end` (`end-session`, awaited), `prompt.submit` (`prompt` op, never
-  awaited, `cutover` from `isUsersOwnPrompt`), `turn.start` (`hold`), `turn.step` (main loop
+  awaited, `cutover` from `isUsersOwnPrompt` and not a `wait` prompt), `turn.start` (`hold`), `turn.step` (main loop
   only, never a subagent: every text chunk is yielded first, then fed to one segmenter per block;
-  each completed segment is a `say` op; on a clean stop the rest is flushed, on an interrupt a
-  half sentence is dropped), `tool.call` for `AskUserQuestion` / `ExitPlanMode` (a `dialog` op,
+  each completed segment is a `say` op; a block's last sentence is flushed when the next block
+  starts, stamped `shown` with when that block's last text arrived, or at a clean stop; on an
+  interrupt a half sentence is dropped), `tool.call` for `AskUserQuestion` / `ExitPlanMode` (a `dialog` op,
   awaited so the alert queues before the permission echo can speak; then `hold`), and
-  `turn.complete` (`turn-end` with whether the step queued speakable text; main loop only).
+  `turn.complete` (`turn-end` with whether the step queued speakable text, or `true` when the turn was interrupted so there is no chime; main loop only).
   One utterance id per response: `<turnId>:<step index>`. A single queue sends ops to the bridge
-  in order, batching those that arrive during a call (timeout 5s).
+  in order, batching those that arrive during a call (timeout 5s); each call runs on the newest
+  sender's `$`, so a batch never rides an interrupted dispatch.
+  Deferred: in a mod session, a level or TTS switched ON mid-turn takes effect at the next prompt.
   - The gate: `openGate` sends an op; if the answer is unknown (`null`) it asks once more with
     `status`, and if still unknown it reads as off and leaves no gate, so the next op asks again.
     `currentGate` reuses the turn's gate or opens one with `status`. One failed bridge call never
@@ -521,10 +527,9 @@ All commands invoke scripts with `"${CLAUDE_PLUGIN_ROOT}/scripts/<script>.py"` p
   description packed with search terms (voice, text-to-speech, TTS, narration, notification
   sounds, Kokoro, offline, local), author Hanan (okets), homepage/repository
   https://github.com/okets/claude-voiceover, license MIT.
-  It must NOT declare "hooks" or "commands" paths: Claude Code auto-discovers
-  hooks/hooks.json and commands/, and naming either one makes it load the file
-  twice and refuse the plugin ("Duplicate hooks file detected"). Declaring
-  manifest.hooks is only for ADDITIONAL hook files beyond the standard one: it names
-  `./hooks/mod.json` (the narrator mod), which is not `hooks/hooks.json`.
+  The manifest must not name `hooks/hooks.json` or `commands/`: Claude Code
+  auto-discovers both, and naming either one makes it load the file twice and
+  refuse the plugin ("Duplicate hooks file detected"). It names `./hooks/mod.json`,
+  the mod's own file, which is an ADDITIONAL hook file.
 - `marketplace.json` — marketplace name "claude-voiceover", owner okets, one plugin entry
   with source "./" so `/plugin marketplace add okets/claude-voiceover` works directly.

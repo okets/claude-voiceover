@@ -67,7 +67,7 @@ Each project has its own queue and voice, and may speak over one other project (
 
 ### Narration starts as Claude writes
 
-At the narrator level, narration starts while Claude is still writing: a Claude Code mod speaks each sentence as it streams, through the same per-project queue and engine. It needs Claude Code 2.1.287 or newer, where mods are on by default. On a build without mods, or with them off, the hooks narrate as before and nothing breaks. After installing or updating, run `/reload-plugins` or restart Claude Code.
+At the narrator level, narration starts while Claude is still writing: a Claude Code mod speaks each sentence as it streams, through the same per-project queue and engine. It needs Claude Code 2.1.287 or newer, where mods are on by default. On a build without mods, the hooks narrate as before; Claude Code may log that it could not load `hooks/mod.json`, which is expected. After installing or updating, run `/reload-plugins` or restart Claude Code.
 
 ## The Narration output style
 

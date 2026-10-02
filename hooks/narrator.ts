@@ -22,10 +22,16 @@ import { createSegmenter, type Segmenter } from './segment'
 
 type Pending = { op: Op; settle: (narrate: boolean | null) => void }
 
+/** A text block being cut into sentences, and when its last text arrived. */
+type Block = { segmenter: Segmenter; at: number }
+
 const SPEAKABLE = /[A-Za-z0-9]/
 
 let queue: Pending[] = []
-let pumping = false
+/** The bridge call in progress, or the last one: each delivery waits for it. */
+let inFlight: Promise<void> = Promise.resolve()
+/** The newest send's number: only its delivery runs, so a batch always goes out on a live dispatch's `$`. */
+let latest = 0
 /** This turn's narrator gate; undefined until a start, a prompt or a recovery asks for it, and again after an unknown answer. */
 let gate: Promise<boolean> | undefined
 /** The utterance of the last text sent this turn: a dialog alert continues it. */
@@ -34,7 +40,11 @@ let lastUtterance: string | null = null
 let stepSpoke = false
 
 function debug($: EngineInterface, text: string): void {
-  void $.ui.log(`voiceover: ${text}`, { to: 'debug' })
+  try {
+    void $.ui.log(`voiceover: ${text}`, { to: 'debug' })
+  } catch {
+    // an ended dispatch takes its log with it
+  }
 }
 
 /** One bridge call. The session id and root are read per call: /clear and resume change the id. */
@@ -47,28 +57,30 @@ async function runBatch($: EngineInterface, ops: readonly Op[]): Promise<boolean
   return parseReply(stdout).narrate
 }
 
-/** Delivers queued ops in order; ops queued while a call runs go together in the next one. */
-async function pump($: EngineInterface): Promise<void> {
-  pumping = true
-  while (queue.length > 0) {
-    const batch = queue
-    queue = []
-    let narrate: boolean | null = null // unknown when the call fails
-    try {
-      narrate = await runBatch($, batch.map(entry => entry.op))
-    } catch (error) {
-      debug($, `bridge: ${String(error)}`)
-    }
+/**
+ * Delivers every queued op in one bridge call, on this sender's `$`, unless a
+ * newer send will: an interrupted hook's `$` calls abort with it.
+ */
+async function deliver($: EngineInterface, seq: number): Promise<void> {
+  if (seq !== latest || queue.length === 0) return
+  const batch = queue
+  queue = []
+  let narrate: boolean | null = null // unknown when the call fails
+  try {
+    narrate = await runBatch($, batch.map(entry => entry.op))
+  } catch (error) {
+    debug($, `bridge: ${String(error)}`)
+  } finally {
     for (const entry of batch) entry.settle(narrate)
   }
-  pumping = false
 }
 
 /** Sends op to the bridge, after every op sent before it. Resolves with the gate, null when unknown; never rejects. */
 function send($: EngineInterface, op: Op): Promise<boolean | null> {
   return new Promise<boolean | null>(settle => {
     queue.push({ op, settle })
-    if (!pumping) void pump($)
+    const seq = ++latest
+    inFlight = inFlight.then(() => deliver($, seq)).catch(() => undefined)
   })
 }
 
@@ -104,12 +116,20 @@ function always($: EngineInterface, op: Op): Promise<boolean | null> {
   return currentGate($).then(() => send($, op))
 }
 
-function emit($: EngineInterface, utterance: string, pieces: readonly string[]): void {
+function emit($: EngineInterface, utterance: string, pieces: readonly string[], shown: number): void {
   if (pieces.length === 0) return
-  const shown = Date.now() / 1000
   lastUtterance = utterance
   if (pieces.some(text => SPEAKABLE.test(text))) stepSpoke = true
   for (const text of pieces) whenNarrating($, { op: 'say', utterance, text, shown })
+}
+
+/** Ends every open text block but `keep`: a block's last sentence goes out as soon as the next block starts, stamped when its text arrived. */
+function closeBlocks($: EngineInterface, utterance: string, blocks: Map<number, Block>, keep?: number): void {
+  for (const [index, block] of blocks) {
+    if (index === keep) continue
+    blocks.delete(index)
+    emit($, utterance, block.segmenter.flush(), block.at)
+  }
 }
 
 function questionsOf(e: unknown): unknown {
@@ -133,7 +153,8 @@ export const register: Register = on => {
     // Never awaited: the prompt is not delayed. The gate resolves long before
     // the first text (no turn's first text came sooner than 1.84s after its
     // prompt, across 169 measured turns).
-    void openGate($, { op: 'prompt', cutover: isUsersOwnPrompt(e.origin) })
+    // A prompt asked to wait its turn (ctrl+x enter) leaves the running turn's speech alone.
+    void openGate($, { op: 'prompt', cutover: isUsersOwnPrompt(e.origin) && !e.wait })
     return next(e)
   })
 
@@ -147,7 +168,7 @@ export const register: Register = on => {
     const stream = next(e)
     if (e.agentId !== undefined) return yield* stream // a subagent's words are not narrated
     const utterance = `${e.turnId}:${e.index}` // every block of one response is one message
-    const segmenters = new Map<number, Segmenter>()
+    const blocks = new Map<number, Block>()
     let result: TurnStepResult | undefined
     stepSpoke = false
     whenNarrating($, { op: 'hold' })
@@ -159,14 +180,17 @@ export const register: Register = on => {
         }
         yield step.value
         const chunk = step.value
-        if (chunk.kind !== 'text') continue
         try {
-          let segmenter = segmenters.get(chunk.index)
-          if (!segmenter) {
-            segmenter = createSegmenter()
-            segmenters.set(chunk.index, segmenter)
+          // Blocks stream one after another: a chunk of another block means the open ones are whole.
+          if ('index' in chunk) closeBlocks($, utterance, blocks, chunk.index)
+          if (chunk.kind !== 'text') continue
+          let block = blocks.get(chunk.index)
+          if (!block) {
+            block = { segmenter: createSegmenter(), at: 0 }
+            blocks.set(chunk.index, block)
           }
-          emit($, utterance, segmenter.push(chunk.text))
+          block.at = Date.now() / 1000
+          emit($, utterance, block.segmenter.push(chunk.text), block.at)
         } catch (error) {
           debug($, `segmenter: ${String(error)}`)
         }
@@ -176,7 +200,7 @@ export const register: Register = on => {
         // Interrupted: close the stream beneath; a half-sentence is not worth hearing.
         await stream.return(undefined as never)
       } else if (result.stopReason !== null && !next.signal.aborted) {
-        for (const segmenter of segmenters.values()) emit($, utterance, segmenter.flush())
+        closeBlocks($, utterance, blocks)
       }
     }
   })
@@ -200,7 +224,8 @@ export const register: Register = on => {
     const result = await next(e)
     // A subagent's turn ending is not ours: releasing there would unload the
     // engine in the middle of the main turn.
-    if (e.agentId === undefined) void always($, { op: 'turn-end', spoken: stepSpoke })
+    // An interrupted turn ends without the your-turn chime: the user stopped it.
+    if (e.agentId === undefined) void always($, { op: 'turn-end', spoken: stepSpoke || e.isAborted })
     return result
   })
 }

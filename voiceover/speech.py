@@ -231,8 +231,9 @@ def stop_speech() -> None:
     _clear_lock()
 
 
-def play_sound(name, cwd=None) -> None:
-    """Play a bundled mp3 ping ('notification' | 'decide'), if allowed."""
+def play_sound(name, cwd=None, wait=True) -> None:
+    """Play a bundled mp3 ping ('notification' | 'decide'), if allowed.
+    wait=False starts the player detached and returns at once."""
     try:
         if not get_setting("notification_sounds", cwd):
             return
@@ -242,8 +243,13 @@ def play_sound(name, cwd=None) -> None:
             _dry_print("sound: {}".format(name))
             return
         sound_file = _SOUNDS_DIR / "{}.mp3".format(name)
-        if sound_file.is_file():
+        if not sound_file.is_file():
+            return
+        if wait:
             play_audio_file(str(sound_file), timeout=10)
+        else:
+            _spawn_detached([sys.executable, str(Path(__file__).resolve().parent / "audio_player.py"),
+                             str(sound_file)])
     except Exception:
         pass
 

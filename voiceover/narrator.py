@@ -2,7 +2,7 @@
 
 The hooks parse their own input and call these, so what a prompt, a question
 dialog or a turn's end does to the queue, the lease and the engine has
-exactly one definition (the deferred mod's bridge will call the same ones).
+exactly one definition (the mod's bridge calls the same ones).
 Per-session records live under data_dir(): pins/ (the project a session's
 turn stays in), dialog_alert/ (a dialog was just announced) and
 mod_sessions/ (the mod narrates this session; the classic paths stand
@@ -226,7 +226,8 @@ def dialog_answered(cwd, session, ttl=lease.LEASE_TTL) -> None:
 
 def turn_end(cwd, session, spoken) -> None:
     """The turn is over: let the engine go once its queue has played. A turn
-    whose last step said nothing ends on the decide chime instead."""
+    whose last step said nothing ends on the decide chime instead (played
+    without waiting, so the mod's bridge answers at once)."""
     lease.release(cwd, session)
     if not spoken:
-        play_sound("decide", cwd=cwd)
+        play_sound("decide", cwd=cwd, wait=False)

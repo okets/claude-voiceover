@@ -410,4 +410,29 @@ check("and leaves the pin to it too", narrator.pinned_cwd("MOD", None) is None)
 narrator.unmark_mod_session("MOD")
 check("unmarking ends the stand-down", not narrator.mod_active("MOD"))
 
+# --- an answered alert is retired in a mod session too; the chime never blocks ------------
+spool.clear()
+narrator.mark_mod_session("S7")
+spool.enqueue("Which approach?", "kokoro", "bf_emma", session="S7", sticky=True)
+check("the mod session's alert is pending", any(i["sticky"] for i in pending_items()), pending_items())
+run_hook("post_tool_use", {"cwd": str(REPO_ROOT), "session_id": "S7", "tool_name": "Bash", "tool_input": {}})
+check("a finished tool retires the alert in a mod session", not any(i["sticky"] for i in pending_items()), pending_items())
+narrator.unmark_mod_session("S7")
+
+import voiceover.speech as speech
+played, spawned = [], []
+saved = (speech.play_audio_file, speech._spawn_detached, os.environ.get("VOICEOVER_DRY_RUN"))
+speech.play_audio_file = lambda *a, **k: played.append(a) or True
+speech._spawn_detached = lambda command: spawned.append(command) or True
+try:
+    del os.environ["VOICEOVER_DRY_RUN"]
+    narrator.turn_end(str(REPO_ROOT), "S8", spoken=False)
+finally:
+    speech.play_audio_file, speech._spawn_detached = saved[0], saved[1]
+    if saved[2] is not None:
+        os.environ["VOICEOVER_DRY_RUN"] = saved[2]
+check("the turn-end chime does not wait on the player", played == [], played)
+check("it starts the player detached", len(spawned) == 1, spawned)
+check("and runs audio_player.py", spawned and spawned[0][1].endswith("audio_player.py"), spawned)
+
 report()

@@ -30,15 +30,18 @@ def main():
         # (which pre-tool can miss by a flush race) is queued here instead.
         if narrator.headless():
             return
+        from voiceover import spool
+
+        # A tool finished: whatever this session's pending alert or
+        # permission request asked has been answered - do not read it out
+        # (the mod's sessions too: retiring is not narrating).
+        spool.clear_sticky(session, cwd=cwd)
         if narrator.stands_down(session, payload.get("transcript_path", "")):
             return  # the mod speaks this session's text as it streams
-        from voiceover import lease, spool
+        from voiceover import lease
         from voiceover.prose import commit_offset, peek_new_prose_stamped
         from voiceover.speech import ensure_drainer, enqueue_speech
 
-        # A tool finished: whatever this session's pending alert or
-        # permission request asked has been answered - do not read it out.
-        spool.clear_sticky(session, cwd=cwd)
         if payload.get("tool_name") in narrator.DIALOG_TOOLS:
             narrator.dialog_answered(cwd, session, ttl=lease.FALLBACK_LEASE_TTL)
         elif narrator.narrates(cwd):  # TTS off or no engine: never hold one

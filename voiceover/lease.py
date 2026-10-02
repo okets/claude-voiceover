@@ -2,7 +2,7 @@
 turn runs, so the model stays loaded for the next sentence and unloads once
 nobody needs it.
 
-Hooks (and, later, the deferred mod's bridge) WRITE leases; the engine READS them through
+Hooks (and the mod's bridge) WRITE leases; the engine READS them through
 tts/engine_common.py (lease_is_live) and never deletes one. The shared
 contract is only this: <project dir>/leases/<session slug>.json holding
 {"expiry": unix seconds}. The expiry is a crash backstop, not a timer:
@@ -17,7 +17,7 @@ from pathlib import Path
 
 from .projects import project_dir, session_slug
 
-LEASE_TTL = 600.0            # a holder whose turn end always arrives (the deferred mod)
+LEASE_TTL = 600.0            # a holder whose turn end always arrives (the mod)
 FALLBACK_LEASE_TTL = 120.0   # classic hooks: Stop does not fire on an interrupt
 
 _LEASE_DIR_NAME = "leases"
