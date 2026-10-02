@@ -658,17 +658,11 @@ def completion_message(stats):
 
 
 def _templated_completion(stats):
+    # Never echo the user's request back: a truncated quote of their own
+    # words is noise, not news.
     outcomes = _completion_outcomes(stats)
-    ending = random.choice(_COMPLETION_ENDINGS)
-    intent = None
-    if stats.user_intent:
-        intent = truncate_user_intent(stats.user_intent, max_words=8)
-    if intent and outcomes:
-        return "{}. {}. {}".format(intent, ", ".join(outcomes), ending)
     if outcomes:
-        return "{}. {}".format(", ".join(outcomes), ending)
-    if intent:
-        return "You instructed me to: {}. Done!".format(intent)
+        return "{}. {}".format(", ".join(outcomes), random.choice(_COMPLETION_ENDINGS))
     return random.choice(_COMPLETION_FALLBACKS)
 
 

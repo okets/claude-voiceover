@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- The end-of-turn summary no longer parrots the request back. The legacy
+  "You instructed me to: <truncated request>. Done!" line is gone, and so is
+  the truncated request that prefixed the outcome summary ("2 files updated,
+  3 edits. Done." stays).
+- Narrator mode no longer speaks a template when the stop hook finds nothing
+  unread. It used to fall through to the templated completion, which also
+  re-spoke the turn's newest text when that text was short - a line already
+  narrated mid-turn, heard twice. It now plays the decide chime instead, so
+  narrator mode only ever speaks Claude's own words.
+
 ## 1.3.2 - 2026-09-23
 
 ### Fixed

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Stop hook: speak a completion summary for the finished request cycle.
 
-Reads the Stop payload from stdin. Concise+ levels speak
-completion_message(cycle_stats(transcript_path)); quiet plays the decide
-sound; stop_hook_active is skipped to avoid announcement loops. Never
-blocks, never prints to stdout, always exits 0.
+Reads the Stop payload from stdin. Concise and verbose speak
+completion_message(cycle_stats(transcript_path)); narrator queues Claude's
+unread closing prose, or plays the decide sound when there is none; quiet
+plays the decide sound; stop_hook_active is skipped to avoid announcement
+loops. Never blocks, never prints to stdout, always exits 0.
 """
 
 import json
@@ -69,8 +70,11 @@ def main():
             ensure_drainer(cwd)
             return
         ensure_drainer(cwd)
-        # Nothing unread (all prose narrated mid-turn): fall through to the
-        # templated completion so the turn still audibly ends.
+        # Nothing unread (all prose narrated mid-turn). Narrator mode speaks
+        # only Claude's own words, so the turn ends on the chime: a template
+        # here would be invented, and the newest text a re-run.
+        play_sound("decide", cwd=cwd)
+        return
 
     stats = cycle_stats(transcript_path)
     # Same flush race: wait briefly for the final response text so simple
@@ -82,13 +86,7 @@ def main():
         stats = cycle_stats(transcript_path)
     text = completion_message(stats)
     if text:
-        if get_interaction_level(cwd) == "narrator":
-            from voiceover.speech import ensure_drainer, enqueue_speech
-            enqueue_speech(text, min_level="concise", cwd=cwd,
-                           session=payload.get("session_id"))
-            ensure_drainer(cwd)
-        else:
-            speak(text, min_level="concise", cwd=cwd, interrupt=True)
+        speak(text, min_level="concise", cwd=cwd, interrupt=True)
 
 
 if __name__ == "__main__":
