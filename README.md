@@ -19,6 +19,7 @@ Since March 2026 Claude Code has native `/voice` dictation, but it is input-only
 ```
 /plugin marketplace add okets/claude-voiceover
 /plugin install voiceover@claude-voiceover
+/reload-plugins
 /voiceover:setup
 ```
 
@@ -92,17 +93,17 @@ Nothing phones home. All speech is generated on your machine.
 
 ## Install and update
 
-Install with the three Quickstart commands above, then run `/reload-plugins` (or restart Claude Code). If narration doesn't start, restart Claude Code.
+Install with the Quickstart commands above. The reload loads the hooks and the mod. If narration doesn't start, restart Claude Code.
 
 To update to a new version:
 
 1. `/plugin marketplace update claude-voiceover` refreshes the catalog.
 2. `/plugin update voiceover@claude-voiceover` updates the plugin. From a terminal, run `claude plugin update voiceover@claude-voiceover`; it applies after a restart.
-3. Restart every running Claude Code session, or run `/reload-plugins` in each one. A session left on the old version interrupts the new engines.
+3. Restart every running Claude Code session, or run `/reload-plugins` in each one, so it loads the new hooks and mod. Coming from 1.3, a 1.3 session left running interrupts 1.4 engines, so restart them all.
 
 To give a project its own voice, run `/voiceover:voice <name> --project`.
 
-A mod is code that runs inside Claude Code on your machine, with the same access Claude Code has, written by its publisher, not Anthropic. Install Voiceover only if you trust it, as with any plugin.
+The narrator mod is code that runs inside Claude Code on your machine, with the same access Claude Code has, written by its publisher, not Anthropic. Install Voiceover only if you trust it, as with any plugin.
 
 ## Migrating from smarter-claude
 

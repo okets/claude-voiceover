@@ -322,7 +322,8 @@ cleanup=None)` wraps a child process; `DryRunSpeaker` prints `[voiceover] <sente
 `drain()` prefetches the next item's first sentence during an item's last one.
 
 Each spoken sentence logs (`engine_log("sound", ...)`, debug_log setting on):
-`source=<source> utterance=<utterance> lag_created=<s> lag_shown=<s or None> chars=<n> :: <first 60 chars>`.
+`source=<source> utterance=<utterance> lag_created=<s> lag_shown=<s> chars=<n> :: <first 60 chars>`.
+A missing `source`, `utterance` or `lag_shown` prints as `-`.
 `utterance` is the item's message id, so a log reader can see which sentences were one message.
 
 `drain()` claims the lock BEFORE `open_speaker()` loads anything, and tracks ownership with
@@ -390,7 +391,7 @@ Lease table (narrator level; `FALLBACK_LEASE_TTL` unless noted):
 | user_prompt_submit (task notification) | held (pre-warm); nothing cut off |
 | pre_tool_use | held; released instead for a dialog tool (`queue_dialog`) |
 | post_tool_use | held; a dialog tool's answer re-holds via `dialog_answered` |
-| stop | narrator level: released by `narrator.turn_end` (not at all when the mod narrates the session; the mod's `turn-end` op does it). Any other level: `lease.release` directly |
+| stop | narrator level: released by `narrator.turn_end` (not at all when the mod narrates the session; the mod's `turn-end` op does it). Any other level: `lease.release` directly. The narrator level also releases when there is no transcript path; headless runs return before narrating |
 | session_end | released |
 
 Stand-down: at the narrator level `pre_tool_use`, `post_tool_use` and `stop` return after
@@ -442,8 +443,11 @@ lives here and in `voiceover/narrator.py`, shared with the classic hooks.
 
 Every batch first calls `narrator.mark_mod_session(session)` (`/clear` and resume change the id
 with no `session.start`, and the classic hooks must stand down from the new session's first op),
-then reads the gate `narrator.narrates(cwd)` once. Ops other than the ones that release run only
-when the gate is on. `speakable` cleans markdown with `prose.clean_for_speech` and strips any `*`
+then reads the gate `narrator.narrates(cwd)` once. The gate decides per op:
+`start` and `status` pin whatever the gate says; `end-session` always releases and unmarks;
+`prompt` acts only when `narrator.mod_owns_prompt` is true, and cuts over only when the gate is
+also on; `turn-end` and `dialog` act when the gate is on and only release the lease when it is
+off; `hold` and `say` run only when the gate is on. `speakable` cleans markdown with `prose.clean_for_speech` and strips any `*`
 or backtick a mid-markup split left unpaired.
 
 Reply: exactly one stdout line, `{"narrate": true|false|null}` - the gate as of the call; `null`
