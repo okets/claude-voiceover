@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Cut mid-turn narration lag on the classic hooks — every project its own queue, voice and turn-scoped engine; preemption at sentence boundaries; the next sentence synthesized while the current one plays. Replay prediction for this design: first word of a mid-turn line median 4.8s → 3.6s and p90 15.2s → 8.4s; what you hear trails the screen median 7.3s → 5.0s, p90 23s → 15.8s. Prefetch is not modelled and should only lower these.
+**Goal:** Cut narration lag: every project its own queue, voice and turn-scoped engine; preemption at sentence boundaries; the next sentence synthesized while the current one plays; and a Claude Code mod that speaks each sentence as Claude writes it. Replay prediction with the mod: what you hear trails the screen median 7.3s → 2.3s and p90 23s → 7.6s; first word of a message median 4.8s → 1.0s. On the classic-hooks fallback: first word 4.8s → 3.6s, p90 15.2s → 8.4s.
 
-**Architecture:** The Python hook layer keeps all narration policy. A per-project directory (`data_dir()/projects/<key>/`) holds that project's queue, engine lock, leases and stop requests. The drainer engine plays one sentence at a time, synthesizes the next one while the current one plays, applies the jump-to-newest rule between sentences, and stays loaded only while a session holds a lease. Streaming capture through a Claude Code mod is deferred: the rollout switch that lets installed plugins load mods is off on this account (`docs/superpowers/plans/2026-10-02-narrator-mod-deferred.md`).
+**Architecture:** The Python hook layer keeps all narration policy. A per-project directory (`data_dir()/projects/<key>/`) holds that project's queue, engine lock, leases and stop requests. The drainer engine plays one sentence at a time, synthesizes the next one while the current one plays, applies the jump-to-newest rule between sentences, and stays loaded only while a session holds a lease. A TypeScript mod (in its own `hooks/mod.json`) taps `turn.step` text chunks, cuts them into sentences and hands them to `hooks/mod_bridge.py`, which calls the same narrator actions; the classic hooks stand down for sessions the bridge has marked and remain the fallback. (Mods were switched off for this account earlier on 2026-10-02 and on later that day; Tasks 1–7 were built first as the hooks-only release, Tasks 8–10 add the mod.)
 
-**Tech Stack:** Python 3.9+ stdlib (hook layer, `tts/engine_common.py`), kokoro-onnx in the `tts/` uv venv, macOS `say`.
+**Tech Stack:** Python 3.9+ stdlib (hook layer, `tts/engine_common.py`), kokoro-onnx in the `tts/` uv venv, macOS `say`, TypeScript ES modules against the Claude Code 2.1.287 function-hooks API (`claude-code`, `claude-code/testing`).
 
 **Spec:** `docs/superpowers/specs/2026-10-02-low-latency-narration-design.md` (read it first: it carries the measurements, the user's decisions, the review-round defaults, and §12–§13, the adversarial findings this plan answers). It builds on `docs/superpowers/specs/2026-09-10-narration-queue-design.md`.
 
@@ -15,10 +15,11 @@
 - Branch: `feature/low-latency-narration` (already created, based on `fix/completion-no-parrot`).
 - Hook layer (`hooks/*.py`, `voiceover/*.py`) imports only the Python standard library; Python ≥ 3.9 (the suite runs under the system 3.9.6 too).
 - Engines (`tts/*.py`) never import `voiceover/`; `tts/engine_common.py` is stdlib only. Where the two sides share a rule (a session's file name, the spawn marker), each side carries it and its docstring names the other.
-- Every hook always exits 0 and prints nothing to stdout.
+- Every hook and `hooks/mod_bridge.py` always exits 0. Hooks print nothing to stdout; the bridge prints exactly one JSON line.
 - Never write into a user's project, except the user-run `/voiceover:voice <name> --project` (existing behaviour).
 - Tests: the stdlib harness in `tests/_harness.py`, run by `bash tests/run_all.sh`; every test runs under `VOICEOVER_DATA_DIR` (a temp dir), `VOICEOVER_DRY_RUN=1` and, from Task 2 on, `VOICEOVER_NO_SPAWN=1`. Never run anything that plays audio, kills a process by pattern, or touches `~/.claude-voiceover`. The suite must be green at the end of every task.
 - Constants, verbatim from the spec: `QUEUE_MAX_AGE_SECONDS = 300`; `LEASE_TTL = 600.0`; `FALLBACK_LEASE_TTL = 120.0`; `POLL_SECONDS = 0.05`; `MAX_ENGINES = 2`; spawn backoff 3s (30s after a failed model load); drainer lock expiry 60s, refreshed once half of it has passed; project key = `sha1(str(resolved project root))[:12]`; session file names: `[^A-Za-z0-9_-]` → `_`, no session → `_all`; headless = `CLAUDE_CODE_ENTRYPOINT` starting with `sdk-`.
+- Mod: validate with `claude plugin validate ./.claude-plugin/plugin.json` (`claude plugin validate .` validates only marketplace.json); test with `claude plugin test .`; the engine refuses a module that stores `$`, puts it in an object, or passes it to a function in another file.
 - Target version: 1.4.0.
 - macOS `sed -i ''` syntax is used in mechanical edit steps (this machine is macOS).
 - Every commit message ends with:
@@ -3464,7 +3465,1380 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ---
 
-### Task 8: Live acceptance (main session, with the user)
+### Task 8: The mod's Python half — the bridge, the session mark, the stand-down
+
+The mod (Task 9) only captures text; everything it captures goes through `hooks/mod_bridge.py` into the same narrator actions the classic hooks use. This task adds the bridge, the session mark that makes the classic narrator paths stand down for a session the mod narrates, and the prose-cursor skip that keeps a later fallback from replaying what the mod spoke. Every code block below was run green in a scratch copy of the repo at `152f937` (full suite, Python 3.14), and the bridge was exercised by a real headless `claude -p --plugin-dir` session.
+
+**Files:**
+- Create: `hooks/mod_bridge.py`, `tests/test_mod_bridge.py`
+- Modify: `voiceover/narrator.py` (mod marker, `stands_down`, `cutover(warm=)`, `queue_dialog(utterance=)`), `voiceover/prose.py` (`skip_unread`), `hooks/user_prompt_submit.py`, `hooks/pre_tool_use.py`, `hooks/post_tool_use.py`, `hooks/stop.py` (stand down), `tts/engine_common.py` (the `sound` log line names the utterance)
+- Test: `tests/test_mod_bridge.py` (new), `tests/test_narrator_hooks.py` (stand-down block)
+
+**Interfaces:**
+- Consumes: `narrator.narrates/pin_cwd/repin/pinned_cwd/cutover/queue_dialog/turn_end/_write_record/_read_record/_drop_record`, `lease.release/hold`, `speech.enqueue_speech/ensure_drainer/prewarm`, `prose.peek_new_prose/commit_offset/clean_for_speech`
+- Produces:
+  - `narrator.mod_active(session) -> bool`, `narrator.mark_mod_session(session) -> None`, `narrator.unmark_mod_session(session) -> None` (record `data_dir()/mod_sessions/<slug>`), `narrator.stands_down(session, transcript_path) -> bool`
+  - `narrator.cutover(cwd, session, ttl=LEASE_TTL, warm=True)`; `narrator.queue_dialog(cwd, session, tool_name, tool_input, lead_in=None, shown=None, utterance=None)`
+  - `prose.skip_unread(transcript_path) -> None`
+  - `bash hooks/run.sh mod_bridge`: stdin `{"session": str, "cwd": str, "ops": [...]}` with ops `start`, `status`, `end-session`, `prompt {cutover}`, `hold`, `say {utterance, text, shown}`, `dialog {tool, input, utterance}`, `turn-end {spoken}`; stdout exactly one line `{"narrate": true|false|null}`; items it queues carry `source: "mod"`
+  - engine log line: `sound source=<s> utterance=<u> lag_created=… lag_shown=… chars=… :: …`
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `tests/test_mod_bridge.py`:
+
+```python
+"""The mod's bridge into the narrator: ops in, one JSON line out."""
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _harness import check, isolate, report, REPO_ROOT
+
+data_dir = isolate()
+from voiceover import lease, narrator, spool
+from voiceover.settings import set_setting
+
+set_setting("interaction_level", "narrator")
+set_setting("tts_engine", "kokoro")
+PROJECT = spool.queue_dir().parent
+
+
+def bridge(*ops, session="S1", stdin=None, **env):
+    payload = stdin if stdin is not None else json.dumps(
+        {"session": session, "cwd": str(REPO_ROOT), "ops": list(ops)})
+    return subprocess.run(["bash", str(REPO_ROOT / "hooks" / "run.sh"), "mod_bridge"],
+                          input=payload, capture_output=True, text=True,
+                          env=dict(os.environ, **env))
+
+
+def reply(proc):
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def items():
+    return [json.loads(p.read_text()) for p in sorted(spool.queue_dir().glob("*.json"))]
+
+
+def leased(session="S1"):
+    return (PROJECT / "leases" / (session + ".json")).exists()
+
+
+# --- prompt: the gate, the mark, the pin, the cutover without a warm-up -------------
+proc = bridge({"op": "prompt", "cutover": True})
+check("the bridge exits 0", proc.returncode == 0, proc.stderr)
+check("it prints exactly one line", len(proc.stdout.strip().splitlines()) == 1, proc.stdout)
+check("prompt reports narration on", reply(proc) == {"narrate": True}, proc.stdout)
+check("the batch marks the session", narrator.mod_active("S1"))
+check("the prompt pins the session to its root", narrator.pinned_cwd("S1", None) == str(REPO_ROOT))
+check("a cutover prompt files the session's stop request", (PROJECT / "stop" / "S1.json").exists())
+check("but holds no engine: turn.start warms it", not leased())
+
+spool.clear()
+spool.enqueue("Mid-sentence.", "kokoro", "bf_emma", session="S1")
+(PROJECT / "stop" / "S1.json").unlink()
+bridge({"op": "prompt", "cutover": False})
+check("a prompt that is not the user's own drops nothing", spool.pending_count() == 1)
+check("and stops nothing", not (PROJECT / "stop" / "S1.json").exists())
+
+# --- any op marks a session ---------------------------------------------------------------
+bridge({"op": "status"}, session="AFTER-CLEAR")
+check("a session id first seen in any op is marked", narrator.mod_active("AFTER-CLEAR"))
+
+# --- hold, say: cleaned, one message, tagged --------------------------------------------
+spool.clear()
+bridge({"op": "hold"})
+check("hold pre-warms: the session holds a lease", leased())
+bridge({"op": "say", "utterance": "T:0", "text": "**Reading** the loader. ", "shown": 100.5},
+       {"op": "say", "utterance": "T:0", "text": "---\n", "shown": 100.6},
+       {"op": "say", "utterance": "T:0", "text": "**Then. ", "shown": 100.7})
+queued = items()
+check("each speakable segment is queued, markdown cleaned, stray markers stripped",
+      [i["text"] for i in queued] == ["Reading the loader.", "Then."], queued)
+check("segments of one response share its utterance", {i["utterance"] for i in queued} == {"T:0"})
+check("the shown time and the source are kept for latency logging",
+      queued and queued[0]["shown"] == 100.5 and queued[0]["source"] == "mod", queued)
+
+# --- dialog: sticky, under the lead-in's utterance, lease released ------------------------
+spool.clear()
+bridge({"op": "dialog", "tool": "AskUserQuestion", "utterance": "T:0",
+        "input": {"questions": [{"question": "Which approach?", "options": [{"label": "A"}]}]}})
+alert = items()
+check("the dialog alert is queued sticky under the lead-in's message",
+      len(alert) == 1 and alert[0]["sticky"] is True and alert[0]["utterance"] == "T:0", alert)
+check("it reads the actual question", alert and "Which approach?" in alert[0]["text"], alert)
+check("the lease is released while the user decides", not leased())
+check("this session's echo is suppressed", narrator.dialog_recently_announced("S1"))
+
+# --- turn-end ---------------------------------------------------------------------------
+bridge({"op": "hold"})
+proc = bridge({"op": "turn-end", "spoken": False})
+check("turn-end releases the lease", not leased())
+check("a silent turn ends on the chime", "[voiceover] sound: decide" in proc.stderr, proc.stderr)
+
+# --- narration turned off mid-turn still releases --------------------------------------------
+bridge({"op": "hold"})
+set_setting("interaction_level", "concise")
+proc = bridge({"op": "turn-end", "spoken": True})
+check("a turn end after narration was turned off still releases the engine", not leased())
+lease.hold(None, "S1")
+bridge({"op": "dialog", "tool": "ExitPlanMode", "input": {}, "utterance": None})
+check("so does a dialog", not leased())
+
+# --- below the narrator level, only the gate, the mark and the pin act --------------------
+spool.clear()
+proc = bridge({"op": "prompt", "cutover": True},
+              {"op": "say", "utterance": "U", "text": "Not spoken."}, {"op": "hold"},
+              session="S2")
+check("concise: narration reported off", reply(proc) == {"narrate": False}, proc.stdout)
+check("concise: nothing queued", items() == [], items())
+check("concise: no lease taken", not leased("S2"))
+check("concise: the session is still marked", narrator.mod_active("S2"))
+set_setting("interaction_level", "narrator")
+
+# --- headless runs never narrate ------------------------------------------------------------
+spool.clear()
+proc = bridge({"op": "hold"}, {"op": "say", "utterance": "H", "text": "Nobody listens."},
+              session="H1", CLAUDE_CODE_ENTRYPOINT="sdk-cli")
+check("a headless run reports narration off", reply(proc) == {"narrate": False}, proc.stdout)
+check("and queues nothing, holds nothing", items() == [] and not leased("H1"), items())
+
+# --- end-session ------------------------------------------------------------------------
+bridge({"op": "hold"})
+bridge({"op": "end-session"})
+check("end-session unmarks the session", not narrator.mod_active("S1"))
+check("end-session releases its lease", not leased())
+
+# --- garbage in, one line out ------------------------------------------------------------
+proc = bridge(stdin="not json")
+check("a malformed batch still exits 0", proc.returncode == 0, proc.stderr)
+check("and still prints one JSON line", "narrate" in reply(proc), proc.stdout)
+
+report()
+```
+
+Append to `tests/test_narrator_hooks.py`, just before its final `report()`:
+
+```python
+# --- with the mod narrating this session, the classic narrator paths stand down ------
+spool.clear()
+narrator.mark_mod_session("MOD")
+path = write_transcript("mod.jsonl", [USER])
+commit_offset(str(path), path.stat().st_size)
+with open(path, "a") as handle:
+    handle.write(json.dumps(assistant("The mod speaks this, not the hook.")) + "\n")
+mod = {"cwd": str(REPO_ROOT), "transcript_path": str(path), "session_id": "MOD"}
+for hook in ("pre_tool_use", "post_tool_use"):
+    run_hook(hook, dict(mod, tool_name="Bash", tool_input={}))
+run_hook("stop", mod)
+check("no classic narrator path queues text for a mod session", queued_texts() == [], queued_texts())
+check("nor holds a lease for it", not lease_held("MOD"))
+from voiceover.prose import peek_new_prose
+check("the cursor moved past what the mod spoke", peek_new_prose(str(path))[0] is None)
+stop_dir = spool.queue_dir().parent / "stop"
+(stop_dir / "MOD.json").unlink(missing_ok=True)
+run_hook("user_prompt_submit", {"cwd": str(REPO_ROOT), "session_id": "MOD", "prompt": "go"})
+check("the prompt hook leaves the cutover to the mod", not (stop_dir / "MOD.json").exists())
+check("and leaves the pin to it too", narrator.pinned_cwd("MOD", None) is None)
+narrator.unmark_mod_session("MOD")
+check("unmarking ends the stand-down", not narrator.mod_active("MOD"))
+```
+
+- [ ] **Step 2: Run them to verify they fail**
+
+Run: `python3 tests/test_mod_bridge.py; python3 tests/test_narrator_hooks.py`
+Expected: FAIL — the bridge test cannot parse a reply (`run.sh` finds no `hooks/mod_bridge.py` and prints nothing: an `IndexError`/`JSONDecodeError`), and the narrator test fails with `AttributeError: module 'voiceover.narrator' has no attribute 'mark_mod_session'`.
+
+- [ ] **Step 3: Make the exact edits**
+
+Each edit replaces one exact, unique snippet. If a snippet is no longer found verbatim (a later fix touched it), make the equivalent change and say so in the report.
+
+**`voiceover/narrator.py`**
+
+1. Replace:
+
+```python
+from .projects import session_slug
+```
+
+   with:
+
+```python
+from .projects import session_slug
+from .prose import skip_unread
+```
+
+2. Replace:
+
+```python
+Per-session records live under data_dir(): pins/ (the project a session's
+turn stays in) and dialog_alert/ (a dialog was just announced).
+```
+
+   with:
+
+```python
+Per-session records live under data_dir(): pins/ (the project a session's
+turn stays in), dialog_alert/ (a dialog was just announced) and
+mod_sessions/ (the mod narrates this session; the classic paths stand
+down).
+```
+
+3. Replace:
+
+```python
+def unpin(session) -> None:
+    _drop_record("pins", session)
+```
+
+   with:
+
+```python
+def unpin(session) -> None:
+    _drop_record("pins", session)
+
+
+def mod_active(session) -> bool:
+    """True when the mod narrates this session, so the classic paths stand down."""
+    return _read_record("mod_sessions", session) is not None
+
+
+def mark_mod_session(session) -> None:
+    """Record that the mod narrates session (hooks/mod_bridge.py, every call)."""
+    _write_record("mod_sessions", session, "")
+
+
+def unmark_mod_session(session) -> None:
+    _drop_record("mod_sessions", session)
+
+
+def stands_down(session, transcript_path) -> bool:
+    """True when the mod narrates this session: the classic path does nothing
+    but move the prose cursor past what the mod already spoke, so a later
+    fallback never replays it."""
+    if not mod_active(session):
+        return False
+    skip_unread(transcript_path)
+    return True
+```
+
+4. Replace:
+
+```python
+def cutover(cwd, session, ttl=lease.LEASE_TTL) -> None:
+```
+
+   with:
+
+```python
+def cutover(cwd, session, ttl=lease.LEASE_TTL, warm=True) -> None:
+```
+
+5. Replace:
+
+```python
+    and the reply starts warm. Without a session id nothing is cleared or
+    stopped - an unscoped clear or stop would cut other sessions off.
+    """
+```
+
+   with:
+
+```python
+    and the reply starts warm. Without a session id nothing is cleared or
+    stopped - an unscoped clear or stop would cut other sessions off.
+    warm=False leaves the warm-up to the caller: the mod warms at turn.start,
+    so a prompt that never becomes a turn holds nothing.
+    """
+```
+
+6. Replace:
+
+```python
+    if narrates(cwd):
+        prewarm(cwd, session, ttl=ttl)
+
+
+def write_dialog_marker
+```
+
+   with:
+
+```python
+    if warm and narrates(cwd):
+        prewarm(cwd, session, ttl=ttl)
+
+
+def write_dialog_marker
+```
+
+7. Replace:
+
+```python
+def queue_dialog(cwd, session, tool_name, tool_input, lead_in=None, shown=None) -> bool:
+```
+
+   with:
+
+```python
+def queue_dialog(cwd, session, tool_name, tool_input, lead_in=None, shown=None,
+                 utterance=None) -> bool:
+```
+
+8. Replace:
+
+```python
+    otherwise the notification echo is the only thing that will speak.
+    """
+    alert = blocking_dialog_message
+```
+
+   with:
+
+```python
+    otherwise the notification echo is the only thing that will speak. The
+    mod passes the lead-in's utterance, so the alert continues that message
+    instead of preempting it.
+    """
+    alert = blocking_dialog_message
+```
+
+9. Replace:
+
+```python
+    queued = enqueue_speech(text, cwd=cwd, full=True, session=session, sticky=True,
+                            shown=shown, source="dialog")
+```
+
+   with:
+
+```python
+    queued = enqueue_speech(text, cwd=cwd, full=True, session=session, sticky=True,
+                            shown=shown, source="dialog", utterance=utterance)
+```
+
+**`voiceover/prose.py`**
+
+1. Replace:
+
+```python
+def _read_offset(transcript_path):
+```
+
+   with:
+
+```python
+def skip_unread(transcript_path) -> None:
+    """Mark everything written so far as narrated - someone else (the mod)
+    already spoke it - so a later fallback never replays it."""
+    _text, offset = peek_new_prose(transcript_path)
+    if offset:
+        commit_offset(transcript_path, offset)
+
+
+def _read_offset(transcript_path):
+```
+
+**`hooks/user_prompt_submit.py`**
+
+1. Replace:
+
+```python
+    cwd = payload.get("cwd")
+    session = payload.get("session_id")
+    narrator.repin(session, cwd)  # this turn's project, whatever it cds to
+    level = get_interaction_level(cwd)
+```
+
+   with:
+
+```python
+    cwd = payload.get("cwd")
+    session = payload.get("session_id")
+    if narrator.mod_active(session):
+        # The mod narrates this session: it pins the turn, cuts over and warms
+        # the engine itself. Only the other levels' clear is left to do here.
+        if get_interaction_level(narrator.pinned_cwd(session, cwd)) == "narrator":
+            return
+    else:
+        narrator.repin(session, cwd)  # this turn's project, whatever it cds to
+    level = get_interaction_level(cwd)
+```
+
+**`hooks/pre_tool_use.py`**
+
+1. Replace:
+
+```python
+        if narrator.headless():
+            return
+        from voiceover import lease
+        from voiceover.speech import ensure_drainer, enqueue_speech
+
+        transcript = payload.get("transcript_path", "")
+        tool_name
+```
+
+   with:
+
+```python
+        if narrator.headless():
+            return
+        transcript = payload.get("transcript_path", "")
+        if narrator.stands_down(session, transcript):
+            return  # the mod speaks this session's text as it streams
+        from voiceover import lease
+        from voiceover.speech import ensure_drainer, enqueue_speech
+
+        tool_name
+```
+
+**`hooks/post_tool_use.py`**
+
+1. Replace:
+
+```python
+        if narrator.headless():
+            return
+        from voiceover import lease, spool
+```
+
+   with:
+
+```python
+        if narrator.headless():
+            return
+        if narrator.stands_down(session, payload.get("transcript_path", "")):
+            return  # the mod speaks this session's text as it streams
+        from voiceover import lease, spool
+```
+
+**`hooks/stop.py`**
+
+1. Replace:
+
+```python
+    if level == "narrator":
+        if narrator.headless():
+            return
+        from voiceover.debuglog
+```
+
+   with:
+
+```python
+    if level == "narrator":
+        if narrator.headless():
+            return
+        if narrator.stands_down(session, transcript_path):
+            return  # the mod ends this turn itself (turn.complete)
+        from voiceover.debuglog
+```
+
+**`tts/engine_common.py`**
+
+1. Replace:
+
+```python
+    engine_log("sound", "source=%s lag_created=%.2f lag_shown=%s chars=%d :: %.60s" % (
+        item.get("source") or "-", now - float(item.get("created") or now),
+```
+
+   with:
+
+```python
+    engine_log("sound", "source=%s utterance=%s lag_created=%.2f lag_shown=%s chars=%d :: %.60s" % (
+        item.get("source") or "-", item.get("utterance") or "-",
+        now - float(item.get("created") or now),
+```
+
+- [ ] **Step 4: Create `hooks/mod_bridge.py`**
+
+```python
+#!/usr/bin/env python3
+"""The mod's bridge into the narrator: `run.sh mod_bridge`, a JSON batch on stdin.
+
+The mod (hooks/narrator.ts) only captures text; every narration policy lives
+here and in voiceover/narrator.py, shared with the classic hooks. Input:
+
+    {"session": str, "cwd": str, "ops": [op, ...]}      cwd = the session's root
+
+    {"op": "start"} / {"op": "status"}   pin the session's project
+    {"op": "end-session"}                release the lease, drop the mark
+    {"op": "prompt", "cutover": bool}    re-pin; the user's own prompt cuts over
+    {"op": "hold"}                       a turn or step began: hold, warm up
+    {"op": "say", "utterance": str, "text": str, "shown": float}
+    {"op": "dialog", "tool": str, "input": dict, "utterance": str | null}
+    {"op": "turn-end", "spoken": bool}
+
+Every batch marks the session first: /clear and resume change the id with
+no session.start, and the classic hooks must stand down for the new one from
+its very first op. Headless runs (CLAUDE_CODE_ENTRYPOINT=sdk-*) never narrate:
+narrator.narrates() says so. A turn end or a dialog releases the lease even
+when narration is off, so turning it off mid-turn never leaves an engine
+held. Prints exactly one line, {"narrate": bool} - the narrator gate as of
+this call (null after an internal error). Always exits 0.
+"""
+
+import json
+import re
+import sys
+from pathlib import Path
+
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PLUGIN_ROOT))
+
+_STRAY_MARKERS = re.compile(r"[*`]+")
+
+
+def speakable(text):
+    """A streamed segment as speech: markdown cleaned, and any * or backtick
+    a mid-markup split left unpaired removed."""
+    from voiceover.prose import clean_for_speech
+
+    return _STRAY_MARKERS.sub("", clean_for_speech(text or "")).strip()
+
+
+def run(payload):
+    """Execute one batch of ops in order; return the narrator gate."""
+    from voiceover import lease, narrator
+    from voiceover.debuglog import log as _log
+    from voiceover.speech import enqueue_speech, ensure_drainer, prewarm
+
+    session = payload.get("session")
+    cwd = payload.get("cwd")
+    ops = [op for op in (payload.get("ops") or []) if isinstance(op, dict)]
+    narrator.mark_mod_session(session)
+    narrate = narrator.narrates(cwd)
+    _log("bridge", "session=%s ops=%s narrate=%s" % (
+        session, ",".join(str(op.get("op")) for op in ops), narrate), cwd)
+    queued = False
+    for op in ops:
+        kind = op.get("op")
+        if kind == "end-session":
+            lease.release(cwd, session)
+            narrator.unmark_mod_session(session)
+        elif kind in ("start", "status"):
+            narrator.pin_cwd(session, cwd)
+        elif kind == "prompt":
+            narrator.repin(session, cwd)
+            if narrate and op.get("cutover"):
+                narrator.cutover(cwd, session, warm=False)  # turn.start's hold warms
+        elif kind == "turn-end":
+            if narrate:
+                narrator.turn_end(cwd, session, bool(op.get("spoken")))
+            else:
+                lease.release(cwd, session)
+        elif kind == "dialog":
+            if narrate:
+                narrator.queue_dialog(cwd, session, op.get("tool") or "", op.get("input") or {},
+                                      utterance=op.get("utterance"))
+            else:
+                lease.release(cwd, session)
+        elif not narrate:
+            continue
+        elif kind == "hold":
+            prewarm(cwd, session)
+        elif kind == "say":
+            text = speakable(op.get("text"))
+            if text and enqueue_speech(text, cwd=cwd, full=True, session=session,
+                                       utterance=op.get("utterance"), shown=op.get("shown"),
+                                       source="mod"):
+                queued = True
+    if queued:
+        ensure_drainer(cwd)
+    return narrate
+
+
+def main():
+    try:
+        narrate = run(json.load(sys.stdin))
+    except Exception:
+        narrate = None
+    print(json.dumps({"narrate": narrate}))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        pass
+    sys.exit(0)
+```
+
+- [ ] **Step 5: Run the tests and the suite**
+
+Run: `python3 tests/test_mod_bridge.py && python3 tests/test_narrator_hooks.py && bash tests/run_all.sh 2>&1 | grep -E "^FAIL|ALL TESTS|SOME TESTS"` and the two test files with `/usr/bin/python3`.
+Expected: `32/32 checks passed in test_mod_bridge.py`, `test_narrator_hooks.py` all passing, then `ALL TESTS PASSED`.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add hooks/mod_bridge.py voiceover/narrator.py voiceover/prose.py hooks/ tts/engine_common.py tests/
+git commit -m "feat: the mod's bridge into the narrator; classic hooks stand down for it
+
+Co-Authored-By: <your model> <noreply@anthropic.com>"
+```
+
+---
+
+### Task 9: The mod
+
+The TypeScript half: `hooks/narrator.ts` taps `turn.step` text chunks, `hooks/segment.ts` cuts them into sentences, `hooks/origin.ts` decides whose prompt it is, `hooks/bridge.ts` holds the op protocol. Declared in its own `hooks/mod.json`, named by the manifest, so a build that cannot read `modules` can fail only that file. Every file below passed `claude plugin validate ./.claude-plugin/plugin.json`, `claude plugin test .` (23/23) and `tsc` in a scratch copy, and loaded in a real `claude -p --plugin-dir` session.
+
+The engine refuses a module that stores `$`, puts it in an object, or hands it to a function in another file: `narrator.ts` keeps every `$`-using function at the top level of that file, taking `$` as a parameter, and its module state holds no `$`. Do not refactor that shape.
+
+**Files:**
+- Create: `hooks/origin.ts`, `hooks/segment.ts`, `hooks/bridge.ts`, `hooks/narrator.ts`, `hooks/mod.json`, `hooks/origin.test.ts`, `hooks/segment.test.ts`, `hooks/bridge.test.ts`, `hooks/narrator.test.ts`
+- Modify: `.claude-plugin/plugin.json` (`"hooks": "./hooks/mod.json"`), `tests/test_plugin_manifest.py`
+
+**Interfaces:**
+- Consumes: the bridge protocol (Task 8); events `session.start`, `session.end`, `prompt.submit`, `turn.start`, `turn.step`, `tool.call` (AskUserQuestion, ExitPlanMode), `turn.complete`; `$.process.run`, `$.session.id`, `$.session.root`, `$.plugin.root`, `$.ui.log`
+- Produces: `export const register: Register`; `isUsersOwnPrompt(origin)`; `createSegmenter(): { push(text): string[]; flush(): string[] }`; `type Op`, `parseReply(stdout): { narrate: boolean }`
+
+- [ ] **Step 1: Type-checking setup**
+
+Invoke the `plugin-authoring` skill; note its types file path as `<TYPES>`. Write `<SCRATCH>/tsconfig.json` (scratchpad, not the repo):
+
+```json
+{
+  "compilerOptions": {
+    "target": "es2023", "lib": ["es2023"], "types": [],
+    "module": "esnext", "moduleResolution": "bundler",
+    "strict": true, "noUncheckedIndexedAccess": true,
+    "noEmit": true, "skipLibCheck": true
+  },
+  "include": ["<TYPES>", "/Users/hanan/Projects/claude-voiceover/hooks/*.ts"]
+}
+```
+
+`claude plugin test` runs only while Claude Code's mods switch is on; if it prints "hooks modules are turned off", report BLOCKED.
+
+- [ ] **Step 2: Write the failing tests**
+
+`hooks/origin.test.ts`:
+
+```ts
+import { expect, test } from 'claude-code/testing'
+import { isUsersOwnPrompt } from './origin'
+
+test('the user typing, Remote Control, an SDK host, or an origin this build does not know is the user', () => {
+  for (const kind of ['composer', 'bridge', 'sdk', 'unclassified', 'something-new']) {
+    expect(isUsersOwnPrompt({ kind })).toBe(true)
+  }
+  expect(isUsersOwnPrompt(undefined)).toBe(true)
+})
+
+test('background work, schedules, other sessions and plugins are not', () => {
+  for (const kind of ['task-notification', 'scheduled-trigger', 'peer', 'peer-send-message', 'plugin', 'auto-continuation', 'observer']) {
+    expect(isUsersOwnPrompt({ kind })).toBe(false)
+  }
+})
+```
+
+`hooks/segment.test.ts`:
+
+````ts
+import { expect, test } from 'claude-code/testing'
+import { createSegmenter } from './segment'
+
+test('sentences are emitted as soon as they complete', () => {
+  const segmenter = createSegmenter()
+  expect(segmenter.push('Hello there. Sec')).toEqual(['Hello there. '])
+  expect(segmenter.push('ond one! Third')).toEqual(['Second one! '])
+  expect(segmenter.flush()).toEqual(['Third'])
+})
+
+test('a sentence end split across pieces waits for the next piece', () => {
+  const segmenter = createSegmenter()
+  expect(segmenter.push('Done.')).toEqual([])
+  expect(segmenter.push(' Next')).toEqual(['Done. '])
+})
+
+test('a newline ends a segment', () => {
+  const segmenter = createSegmenter()
+  expect(segmenter.push('A heading\n- an item\n')).toEqual(['A heading\n', '- an item\n'])
+})
+
+test('a fence at a line start is held until it closes, then emitted whole', () => {
+  const segmenter = createSegmenter()
+  expect(segmenter.push('Look:\n```ts\nconst a = 1. b\n')).toEqual(['Look:\n'])
+  expect(segmenter.push('```\nAfter.')).toEqual(['```ts\nconst a = 1. b\n```\n'])
+  expect(segmenter.flush()).toEqual(['After.'])
+})
+
+test('a fence marker split across pieces is still recognized', () => {
+  const segmenter = createSegmenter()
+  expect(segmenter.push('``')).toEqual([])
+  expect(segmenter.push('`\nx. y\n```\n')).toEqual(['```\nx. y\n```\n'])
+})
+
+test('backticks inside a line are not a fence, even right after a sentence', () => {
+  const segmenter = createSegmenter()
+  expect(segmenter.push('Wrap code in ``` marks. Then go.')).toEqual(['Wrap code in ``` marks. '])
+  const after = createSegmenter()
+  expect(after.push('Use triple backticks. ``` opens a block. Then go.'))
+    .toEqual(['Use triple backticks. ', '``` opens a block. '])
+})
+
+test('punctuation inside a word or number is not a boundary', () => {
+  const segmenter = createSegmenter()
+  expect(segmenter.push('v1.4.0 is out and e.g.this too')).toEqual([])
+  expect(segmenter.flush()).toEqual(['v1.4.0 is out and e.g.this too'])
+})
+
+test('a long fence streamed in small pieces is emitted once, whole', () => {
+  const segmenter = createSegmenter()
+  segmenter.push('```\n')
+  let emitted: string[] = []
+  for (let i = 0; i < 5000; i++) emitted = emitted.concat(segmenter.push('x = 1. y = 2;\n'))
+  expect(emitted).toEqual([])
+  const closed = segmenter.push('```\n')
+  expect(closed.length).toBe(1)
+  expect(closed[0]?.length).toBe(4 + 5000 * 14 + 4)
+})
+
+test('flushing only whitespace yields nothing', () => {
+  const segmenter = createSegmenter()
+  segmenter.push('Done. ')
+  expect(segmenter.flush()).toEqual([])
+})
+````
+
+`hooks/bridge.test.ts`:
+
+```ts
+import { expect, test } from 'claude-code/testing'
+import { parseReply } from './bridge'
+
+test('the reply is read from the last stdout line', () => {
+  expect(parseReply('noise\n{"narrate": true}\n')).toEqual({ narrate: true })
+  expect(parseReply('{"narrate": false}')).toEqual({ narrate: false })
+})
+
+test('a missing or broken reply reads as not narrating', () => {
+  expect(parseReply('')).toEqual({ narrate: false })
+  expect(parseReply('{"narrate": null}')).toEqual({ narrate: false })
+  expect(parseReply('not json')).toEqual({ narrate: false })
+})
+```
+
+`hooks/narrator.test.ts`:
+
+```ts
+import type { On } from 'claude-code'
+import { expect, test } from 'claude-code/testing'
+
+type SentOp = { op: string; session: string; text?: string; utterance?: string | null; spoken?: boolean; input?: unknown; cutover?: boolean }
+
+/** Stands beneath the mod for the engine: the bridge process, the session, the event bottoms. */
+function fakeEngine(on: On, narrate: boolean, options: { bridgeFails?: boolean; ids?: string[] } = {}) {
+  const ops: SentOp[] = []
+  const ids = [...(options.ids ?? ['S1'])]
+  const waiters: { check: (sent: SentOp[]) => boolean; done: () => void }[] = []
+  on('process.run', async (_$, e) => {
+    if (options.bridgeFails) throw new Error('bridge down')
+    const batch = JSON.parse(e.init?.stdin ?? '{}') as { session: string; ops?: Omit<SentOp, 'session'>[] }
+    ops.push(...(batch.ops ?? []).map(op => ({ ...op, session: batch.session })))
+    for (const waiter of waiters.splice(0)) {
+      if (waiter.check(ops)) waiter.done()
+      else waiters.push(waiter)
+    }
+    return { value: { exitCode: 0, stdout: `${JSON.stringify({ narrate })}\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  on('session.id', async () => ({ value: ids[0] ?? 'S1' }))
+  on('session.root', async () => ({ value: '/work/project' }))
+  on('ui.log', async () => ({ value: undefined }))
+  on('prompt.submit', async (_$, e) => ({ text: e.text }))
+  on('turn.start', async (_$, e) => ({ turnId: e.turnId }))
+  on('turn.complete', async () => ({ text: '' }))
+  on('session.start', async (_$, e) => ({ cwd: e.cwd }))
+  on('session.end', async () => {
+    const ended = ids.shift() ?? 'S1' // a /clear: the process goes on under the next id
+    return { sessionId: ended }
+  })
+  /** Resolves once the ops sent so far satisfy check. */
+  const until = (check: (sent: SentOp[]) => boolean): Promise<void> =>
+    check(ops) ? Promise.resolve() : new Promise<void>(done => { waiters.push({ check, done }) })
+  return { ops, until }
+}
+
+/** The model's response for every step: these chunks (by turnId), then a result. */
+function fakeStep(on: On, chunks: (turnId: string) => readonly unknown[]) {
+  on('turn.step', async function* (_$, e) {
+    for (const chunk of chunks(e.turnId)) yield chunk as never
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: null }
+  })
+}
+
+const text = (body: string, index = 0) => ({ kind: 'text', index, text: body })
+const stop = { kind: 'stop', stopReason: 'end_turn', usage: null }
+const prompt = (kind = 'composer') => ({ text: 'go', wait: false, origin: { kind } }) as never
+const step = (extra: { agentId?: string; turnId?: string } = {}) =>
+  ({ turnId: 'T', index: 0, model: 'm', messageCount: 1, ...extra })
+const turnEnd = (extra: { agentId?: string } = {}) =>
+  ({ turnId: 'T', answer: '', durationMs: 1, isAborted: false, reason: 'answer' as const, ...extra })
+
+async function collect<C>(stream: AsyncIterable<C>): Promise<C[]> {
+  const out: C[] = []
+  for await (const chunk of stream) out.push(chunk)
+  return out
+}
+
+const opsOf = (sent: SentOp[]) => sent.map(o => o.op)
+
+test('every chunk passes through unchanged, and each sentence is queued in order', async ($, on) => {
+  const engine = fakeEngine(on, true)
+  const chunks = [text('Reading the loader. Then'), text(' the tests.'), text(' A second block.', 2), stop]
+  fakeStep(on, () => chunks)
+  await $.prompt.submit(prompt())
+  expect(await collect($.turn.step(step()))).toEqual(chunks)
+  await engine.until(sent => sent.filter(o => o.op === 'say').length === 3)
+  const says = engine.ops.filter(o => o.op === 'say')
+  expect(says.map(o => o.text)).toEqual(['Reading the loader. ', 'Then the tests.', ' A second block.'])
+  expect(new Set(says.map(o => o.utterance))).toEqual(new Set(['T:0']))
+  expect(opsOf(engine.ops).slice(0, 2)).toEqual(['prompt', 'hold'])
+})
+
+test('the user\'s own prompt cuts over; a task notification does not; turn.start warms the engine', async ($, on) => {
+  const engine = fakeEngine(on, true)
+  await $.prompt.submit(prompt('composer'))
+  await $.turn.start({ text: 'go', turnId: 'T' })
+  await $.prompt.submit(prompt('task-notification'))
+  await engine.until(sent => sent.filter(o => o.op === 'prompt').length === 2 && sent.some(o => o.op === 'hold'))
+  expect(engine.ops.filter(o => o.op === 'prompt').map(o => o.cutover)).toEqual([true, false])
+  expect(opsOf(engine.ops)).toContain('hold')
+})
+
+test('a subagent step is never narrated', async ($, on) => {
+  const engine = fakeEngine(on, true)
+  fakeStep(on, () => [text('Some words. ')])
+  await $.prompt.submit(prompt())
+  await collect($.turn.step(step({ agentId: 'A1', turnId: 'SUB' })))
+  await collect($.turn.step(step()))
+  await engine.until(sent => sent.some(o => o.op === 'say'))
+  expect(engine.ops.filter(o => o.op === 'say').map(o => o.utterance)).toEqual(['T:0'])
+})
+
+test('an interrupted stream is not flushed', async ($, on) => {
+  const engine = fakeEngine(on, true)
+  fakeStep(on, turnId => [text(turnId === 'CUT' ? 'A partial thought with no end' : 'Done. ')])
+  await $.prompt.submit(prompt())
+  for await (const _chunk of $.turn.step(step({ turnId: 'CUT' }))) break
+  await collect($.turn.step(step()))
+  await engine.until(sent => sent.some(o => o.op === 'say'))
+  expect(engine.ops.filter(o => o.op === 'say').map(o => o.text)).toEqual(['Done. '])
+})
+
+test('with narration off only the gate, the turn end and the session end reach the bridge', async ($, on) => {
+  const engine = fakeEngine(on, false)
+  fakeStep(on, () => [text('Quiet now. ')])
+  await $.prompt.submit(prompt())
+  await collect($.turn.step(step()))
+  await $.turn.complete(turnEnd())
+  await $.session.end({ reason: 'other' } as never)
+  await engine.until(sent => sent.some(o => o.op === 'end-session'))
+  expect(opsOf(engine.ops)).toEqual(['prompt', 'turn-end', 'end-session'])
+})
+
+test('a new session id after /clear is used for every later op', async ($, on) => {
+  const engine = fakeEngine(on, true, { ids: ['S1', 'S2'] })
+  fakeStep(on, () => [text('Fresh start. ')])
+  await $.prompt.submit(prompt())
+  await $.session.end({ reason: 'clear' } as never)
+  await $.prompt.submit(prompt())
+  await collect($.turn.step(step()))
+  await engine.until(sent => sent.some(o => o.op === 'say'))
+  expect(engine.ops.filter(o => o.op === 'say').map(o => o.session)).toEqual(['S2'])
+})
+
+test('after a lost state the mod recovers the gate with a status op', async ($, on) => {
+  const engine = fakeEngine(on, true)
+  fakeStep(on, () => [text('Still here. ')])
+  await collect($.turn.step(step()))
+  await engine.until(sent => sent.some(o => o.op === 'say'))
+  expect(opsOf(engine.ops)[0]).toBe('status')
+})
+
+test('a failing bridge never breaks the stream', async ($, on) => {
+  fakeEngine(on, true, { bridgeFails: true })
+  const chunks = [text('Still shown. '), stop]
+  fakeStep(on, () => chunks)
+  await $.prompt.submit(prompt())
+  expect(await collect($.turn.step(step()))).toEqual(chunks)
+})
+
+test('a dialog is announced under the lead-in message before it opens; the answer re-warms the engine', async ($, on) => {
+  const engine = fakeEngine(on, true)
+  fakeStep(on, () => [text('Let me ask you. ')])
+  let opsWhenOpened: string[] = []
+  on('tool.call', { tool: 'AskUserQuestion' }, async () => {
+    opsWhenOpened = opsOf(engine.ops)
+    return { result: {} as never, text: 'answered' } as never
+  })
+  await $.prompt.submit(prompt())
+  await collect($.turn.step(step()))
+  await engine.until(sent => sent.some(o => o.op === 'say'))
+  const questions = [{ question: 'Which?', header: 'Pick', options: [], multiSelect: false }]
+  await $.tool.call({ tool: 'AskUserQuestion', questions } as never)
+  await engine.until(sent => sent.filter(o => o.op === 'hold').length === 2)
+  expect(opsWhenOpened).toContain('dialog')
+  expect(opsOf(engine.ops)).toEqual(['prompt', 'hold', 'say', 'dialog', 'hold'])
+  const dialog = engine.ops.find(o => o.op === 'dialog')
+  expect(dialog?.utterance).toBe('T:0')
+  expect(dialog?.input).toEqual({ questions })
+})
+
+test('the turn end says whether the last step spoke; a subagent turn end is ignored', async ($, on) => {
+  const engine = fakeEngine(on, true)
+  fakeStep(on, turnId => (turnId === 'MUTE' ? [text('---\n')] : [text('Done here. ')]))
+  await $.prompt.submit(prompt())
+  await collect($.turn.step(step()))
+  await $.turn.complete(turnEnd({ agentId: 'A1' }))
+  await $.turn.complete({ ...turnEnd(), isAborted: true, reason: 'aborted' })
+  await collect($.turn.step(step({ turnId: 'MUTE' })))
+  await $.turn.complete(turnEnd())
+  await engine.until(sent => sent.filter(o => o.op === 'turn-end').length === 2)
+  expect(engine.ops.filter(o => o.op === 'turn-end').map(o => o.spoken)).toEqual([true, false])
+})
+```
+
+In `tests/test_plugin_manifest.py` replace:
+
+```python
+check("the manifest does not declare a hooks path",
+      "hooks" not in manifest,
+      "plugin.json names hooks=%r; hooks/hooks.json is auto-discovered, and "
+      "declaring it makes Claude Code reject the plugin" % manifest.get("hooks"))
+```
+
+with:
+
+```python
+declared = manifest.get("hooks")
+check("the manifest never names the standard hooks file (it is auto-discovered)",
+      declared in (None, "./hooks/mod.json"),
+      "plugin.json names hooks=%r; naming hooks/hooks.json makes Claude Code load "
+      "it twice and reject the plugin" % declared)
+mod_json = json.loads((REPO_ROOT / "hooks" / "mod.json").read_text())
+check("the mod lives in its own hooks file", mod_json == {"modules": ["./narrator.ts"]}, mod_json)
+check("the mod's module file exists", (REPO_ROOT / "hooks" / "narrator.ts").is_file())
+check("the standard hooks file declares no module",
+      "modules" not in json.loads((REPO_ROOT / "hooks" / "hooks.json").read_text()))
+```
+
+and in its docstring add a sentence: an ADDITIONAL hooks file may be declared (the mod's `hooks/mod.json`); naming the standard one is the 1.3.0 defect.
+
+- [ ] **Step 3: Run them to verify they fail**
+
+Run: `claude plugin test .` and `python3 tests/test_plugin_manifest.py`
+Expected: FAIL — the test files cannot resolve `./origin`, `./segment`, `./bridge`; the manifest test cannot read `hooks/mod.json`.
+
+- [ ] **Step 4: Create the modules**
+
+`hooks/origin.ts`:
+
+```ts
+/**
+ * Whose prompt is it? Only the user's own prompt may cut narration off
+ * mid-sentence. Prompts the engine stamps as automated - a background
+ * task's notification, a schedule, another session, a plugin - never do.
+ * Anything else, including an origin this build does not know, counts as
+ * the user's: missing a cutover the user asked for costs more than one
+ * that was not needed.
+ */
+const AUTOMATED = new Set([
+  'task-notification',
+  'scheduled-trigger',
+  'peer',
+  'peer-send-message',
+  'projects-relay',
+  'channel',
+  'coordinator',
+  'observer',
+  'observer-activity',
+  'auto-continuation',
+  'plugin',
+])
+
+export function isUsersOwnPrompt(origin: { kind: string } | undefined): boolean {
+  return origin === undefined || !AUTOMATED.has(origin.kind)
+}
+```
+
+`hooks/segment.ts`:
+
+````ts
+/**
+ * Cuts streaming markdown into speakable segments: one per sentence or line,
+ * as soon as each completes. A fenced code block (``` at the start of a
+ * line) is held until it closes and emitted whole, so the bridge's cleaner
+ * turns it into the spoken code cue; ``` inside a line is text.
+ *
+ * Scanning resumes where the last push stopped, so a long fence streamed in
+ * small pieces costs linear, not quadratic, time.
+ */
+export type Segmenter = {
+  /** Appends streamed text; returns the segments it completed, in order. */
+  push(text: string): string[]
+  /** Returns what is left as a final segment (nothing when only whitespace). */
+  flush(): string[]
+}
+
+const FENCE = '```'
+const ENDS = new Set(['.', '!', '?'])
+
+export function createSegmenter(): Segmenter {
+  let buffer = ''
+  let scanned = 0 // buffer[0, scanned) holds no boundary
+  let inFence = false // fence state at `scanned`
+  let startsLine = true // whether buffer[0] begins a line
+
+  const atLineStart = (i: number): boolean => (i === 0 ? startsLine : buffer[i - 1] === '\n')
+
+  /** End (exclusive) of the first complete segment, or -1 (and remember how far it got). */
+  const boundary = (): number => {
+    let i = scanned
+    while (i < buffer.length) {
+      if (buffer[i] === '`' && atLineStart(i)) {
+        const marker = buffer.slice(i, i + FENCE.length)
+        if (marker === FENCE) {
+          inFence = !inFence
+          i += FENCE.length
+          continue
+        }
+        if (i + marker.length === buffer.length && FENCE.startsWith(marker)) break // a marker still arriving
+      }
+      const char = buffer[i]
+      if (inFence) {
+        i += 1
+        continue
+      }
+      if (char === '\n') return i + 1
+      if (char !== undefined && ENDS.has(char)) {
+        const following = buffer[i + 1]
+        if (following === undefined) break // the next piece decides
+        if (/\s/.test(following)) return i + 2
+      }
+      i += 1
+    }
+    scanned = i
+    return -1
+  }
+
+  const take = (): string[] => {
+    const out: string[] = []
+    for (let end = boundary(); end > 0; end = boundary()) {
+      const piece = buffer.slice(0, end)
+      buffer = buffer.slice(end)
+      startsLine = piece.endsWith('\n')
+      scanned = 0
+      inFence = false
+      if (piece.trim()) out.push(piece)
+    }
+    return out
+  }
+
+  return {
+    push(text) {
+      buffer += text
+      return take()
+    },
+    flush() {
+      const rest = buffer
+      buffer = ''
+      scanned = 0
+      inFence = false
+      startsLine = true
+      return rest.trim() ? [rest] : []
+    },
+  }
+}
+````
+
+`hooks/bridge.ts`:
+
+```ts
+/**
+ * The mod's protocol with hooks/mod_bridge.py: the ops it sends, and how the
+ * bridge's one-line answer is read. Pure: the channel that sends them lives
+ * in narrator.ts, which alone may hold the engine handle.
+ */
+export type Op =
+  | { op: 'start' }
+  | { op: 'status' }
+  | { op: 'end-session' }
+  | { op: 'prompt'; cutover: boolean }
+  | { op: 'hold' }
+  | { op: 'say'; utterance: string; text: string; shown: number }
+  | { op: 'dialog'; tool: string; input: unknown; utterance: string | null }
+  | { op: 'turn-end'; spoken: boolean }
+
+export type Reply = { narrate: boolean }
+
+/** The bridge's answer is its last stdout line: {"narrate": bool}. */
+export function parseReply(stdout: string): Reply {
+  const line = stdout.trim().split('\n').pop() ?? ''
+  try {
+    return { narrate: (JSON.parse(line) as { narrate?: unknown }).narrate === true }
+  } catch {
+    return { narrate: false }
+  }
+}
+```
+
+`hooks/narrator.ts`:
+
+```ts
+/**
+ * Claude Voiceover's mod: speaks Claude's prose as it streams.
+ *
+ * It only captures. Each sentence of the main loop's visible text goes, in
+ * order, to hooks/mod_bridge.py, which owns every narration policy - gating,
+ * cleaning, voices, the per-project queue and engine. The bridge marks the
+ * session on every call, and the classic hooks stand down for marked
+ * sessions at the narrator level, so nothing is spoken twice.
+ *
+ * Nothing here may delay what the user sees: every chunk is yielded before
+ * it is read, and only session.end and a question dialog wait on the bridge.
+ *
+ * The engine refuses a module that stores `$`, puts it in an object, or
+ * hands it to a function in another file: every function here that needs
+ * `$` takes it as a parameter and is declared at the top of this file, and
+ * the state kept between hooks holds no `$`.
+ */
+import type { EngineInterface, Register, TurnStepResult } from 'claude-code'
+import { parseReply, type Op } from './bridge'
+import { isUsersOwnPrompt } from './origin'
+import { createSegmenter, type Segmenter } from './segment'
+
+type Pending = { op: Op; settle: (narrate: boolean) => void }
+
+const SPEAKABLE = /[A-Za-z0-9]/
+
+let queue: Pending[] = []
+let pumping = false
+/** This turn's narrator gate; undefined until a start, a prompt or a recovery asks for it. */
+let gate: Promise<boolean> | undefined
+/** The utterance of the last text sent this turn: a dialog alert continues it. */
+let lastUtterance: string | null = null
+/** Whether the current main step queued speakable text (the end-of-turn chime rule). */
+let stepSpoke = false
+
+function debug($: EngineInterface, text: string): void {
+  void $.ui.log(`voiceover: ${text}`, { to: 'debug' })
+}
+
+/** One bridge call. The session id and root are read per call: /clear and resume change the id. */
+async function runBatch($: EngineInterface, ops: readonly Op[]): Promise<boolean> {
+  const [session, cwd] = await Promise.all([$.session.id(), $.session.root()])
+  const { stdout } = await $.process.run(
+    ['bash', `${$.plugin.root}/hooks/run.sh`, 'mod_bridge'],
+    { stdin: JSON.stringify({ session, cwd, ops }), timeoutMs: 5000 },
+  )
+  return parseReply(stdout).narrate
+}
+
+/** Delivers queued ops in order; ops queued while a call runs go together in the next one. */
+async function pump($: EngineInterface): Promise<void> {
+  pumping = true
+  while (queue.length > 0) {
+    const batch = queue
+    queue = []
+    let narrate = false
+    try {
+      narrate = await runBatch($, batch.map(entry => entry.op))
+    } catch (error) {
+      debug($, `bridge: ${String(error)}`)
+    }
+    for (const entry of batch) entry.settle(narrate)
+  }
+  pumping = false
+}
+
+/** Sends op to the bridge, after every op sent before it. Resolves with the gate; never rejects. */
+function send($: EngineInterface, op: Op): Promise<boolean> {
+  return new Promise<boolean>(settle => {
+    queue.push({ op, settle })
+    if (!pumping) void pump($)
+  })
+}
+
+/** This turn's gate; after a module reload lost it, ask the bridge with a status op. */
+function currentGate($: EngineInterface): Promise<boolean> {
+  gate ??= send($, { op: 'status' })
+  return gate
+}
+
+/** Sends op once the gate says this session narrates. */
+function whenNarrating($: EngineInterface, op: Op): void {
+  void currentGate($).then(narrate => (narrate ? send($, op) : undefined))
+}
+
+/** Sends op after the gate is known, whatever it says (the bridge releases when narration is off). */
+function always($: EngineInterface, op: Op): Promise<boolean> {
+  return currentGate($).then(() => send($, op))
+}
+
+function emit($: EngineInterface, utterance: string, pieces: readonly string[]): void {
+  if (pieces.length === 0) return
+  const shown = Date.now() / 1000
+  lastUtterance = utterance
+  if (pieces.some(text => SPEAKABLE.test(text))) stepSpoke = true
+  for (const text of pieces) whenNarrating($, { op: 'say', utterance, text, shown })
+}
+
+function questionsOf(e: unknown): unknown {
+  return (e as { questions?: unknown }).questions ?? []
+}
+
+export const register: Register = on => {
+  on('session.start', async ($, e, next) => {
+    const started = await next(e)
+    gate = send($, { op: 'start' })
+    return started
+  })
+
+  on('session.end', async ($, e, next) => {
+    await send($, { op: 'end-session' })
+    gate = undefined
+    return next(e)
+  })
+
+  on('prompt.submit', ($, e, next) => {
+    // Never awaited: the prompt is not delayed. The gate resolves long before
+    // the first text (no turn's first text came sooner than 1.84s after its
+    // prompt, across 169 measured turns).
+    gate = send($, { op: 'prompt', cutover: isUsersOwnPrompt(e.origin) })
+    return next(e)
+  })
+
+  on('turn.start', async ($, e, next) => {
+    lastUtterance = null
+    whenNarrating($, { op: 'hold' }) // pre-warm: the model loads while Claude thinks
+    return next(e)
+  })
+
+  on('turn.step', async function* ($, e, next) {
+    const stream = next(e)
+    if (e.agentId !== undefined) return yield* stream // a subagent's words are not narrated
+    const utterance = `${e.turnId}:${e.index}` // every block of one response is one message
+    const segmenters = new Map<number, Segmenter>()
+    let result: TurnStepResult | undefined
+    stepSpoke = false
+    whenNarrating($, { op: 'hold' })
+    try {
+      for (let step = await stream.next(); ; step = await stream.next()) {
+        if (step.done) {
+          result = step.value
+          return step.value
+        }
+        yield step.value
+        const chunk = step.value
+        if (chunk.kind !== 'text') continue
+        try {
+          let segmenter = segmenters.get(chunk.index)
+          if (!segmenter) {
+            segmenter = createSegmenter()
+            segmenters.set(chunk.index, segmenter)
+          }
+          emit($, utterance, segmenter.push(chunk.text))
+        } catch (error) {
+          debug($, `segmenter: ${String(error)}`)
+        }
+      }
+    } finally {
+      if (result === undefined) {
+        // Interrupted: close the stream beneath; a half-sentence is not worth hearing.
+        await stream.return(undefined as never)
+      } else if (result.stopReason !== null && !next.signal.aborted) {
+        for (const segmenter of segmenters.values()) emit($, utterance, segmenter.flush())
+      }
+    }
+  })
+
+  on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
+    // Awaited, so the alert is queued before the permission echo can speak.
+    await always($, { op: 'dialog', tool: 'AskUserQuestion', input: { questions: questionsOf(e) }, utterance: lastUtterance })
+    const result = await next(e)
+    whenNarrating($, { op: 'hold' })
+    return result
+  })
+
+  on('tool.call', { tool: 'ExitPlanMode' }, async ($, e, next) => {
+    await always($, { op: 'dialog', tool: 'ExitPlanMode', input: {}, utterance: lastUtterance })
+    const result = await next(e)
+    whenNarrating($, { op: 'hold' })
+    return result
+  })
+
+  on('turn.complete', async ($, e, next) => {
+    const result = await next(e)
+    // A subagent's turn ending is not ours: releasing there would unload the
+    // engine in the middle of the main turn.
+    if (e.agentId === undefined) void always($, { op: 'turn-end', spoken: stepSpoke })
+    return result
+  })
+}
+```
+
+`hooks/mod.json`:
+
+```json
+{ "modules": ["./narrator.ts"] }
+```
+
+In `.claude-plugin/plugin.json` add `"hooks": "./hooks/mod.json"` (beside `"license"`; keep everything else).
+
+- [ ] **Step 5: Validate, test, type-check, run the suite**
+
+```bash
+claude plugin validate ./.claude-plugin/plugin.json && claude plugin test . && npx -y -p typescript@5 tsc -p <SCRATCH>/tsconfig.json && bash tests/run_all.sh 2>&1 | grep -E "^FAIL|ALL TESTS|SOME TESTS"
+```
+
+Expected: validation lists `./narrator.ts hooks: session.start, session.end, prompt.submit, turn.start, turn.step, tool.call{tool=AskUserQuestion}, tool.call{tool=ExitPlanMode}, turn.complete` and calls `$.process.run (via runBatch), $.session.id (via runBatch), $.session.root (via runBatch), $.ui.log (via debug)`; `23 pass, 0 fail`; tsc prints nothing; `ALL TESTS PASSED`.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add hooks/*.ts hooks/mod.json .claude-plugin/plugin.json tests/test_plugin_manifest.py
+git commit -m "feat: the narrator mod - speak Claude's prose as it streams
+
+Co-Authored-By: <your model> <noreply@anthropic.com>"
+```
+
+---
+
+### Task 10: Docs for the mod
+
+**Files:**
+- Modify: `INTERFACES.md`, `README.md`, `CHANGELOG.md`
+
+- [ ] **Step 1: Update the three docs**
+
+- `INTERFACES.md`: add sections for `hooks/mod_bridge.py` (the op protocol and reply, as in its docstring), the mod (`hooks/mod.json`, `narrator.ts`, `segment.ts`, `origin.ts`, `bridge.ts` — what each does, the `$` rule), `narrator.mod_active/mark_mod_session/unmark_mod_session/stands_down`, `cutover(warm=)`, `queue_dialog(utterance=)`, `prose.skip_unread`, the `source="mod"` items and the `utterance=` field in the engine's `sound` log line; and `.claude-plugin/plugin.json` now names `./hooks/mod.json`. Fix the two deferred nits while there: the `stop` lease row (non-narrator levels call `lease.release` directly) and `level.md`'s range (0-4).
+- `README.md`: replace the "speaking as it streams is planned" sentence with: narration starts while Claude is still writing (the mod, Claude Code 2.1.287 or newer, mods on by default); on a build without mods the hooks narrate as before; installing or updating needs `/reload-plugins` or a restart.
+- `CHANGELOG.md` (1.4.0): add under Added "Narration starts as Claude writes: a Claude Code mod speaks each sentence as it streams, through the same per-project queue and engine; the hooks remain the fallback and stand down for sessions the mod narrates." Remove any sentence that says the mod is deferred.
+
+- [ ] **Step 2: Check and commit**
+
+Run: `bash tests/run_all.sh 2>&1 | tail -1 && claude plugin validate ./.claude-plugin/plugin.json`
+Expected: `ALL TESTS PASSED`; validation passes.
+
+```bash
+git add INTERFACES.md README.md CHANGELOG.md
+git commit -m "docs: the narrator mod in 1.4.0
+
+Co-Authored-By: <your model> <noreply@anthropic.com>"
+```
+
+---
+
+### Task 11: Live acceptance (main session, with the user)
 
 Runs in the MAIN session. It changes the user's machine settings, so every step that does needs the user's yes first.
 
@@ -3479,31 +4853,25 @@ Expected: each prints `Voice set to ... (project setting)`; `/Users/hanan/Projec
 
 - [ ] **Step 2: Restart every live session onto the branch (ask first)**
 
-List the running sessions (`ps -eo pid,lstart,command | grep -E "[c]laude( |$)|native-binary/claude"`) and tell the user each must be restarted or `/reload-plugins`-ed. Then load the branch: disable the installed copy for the test and start a terminal session on the branch:
+List the running sessions (`ps -eo pid,lstart,command | grep -E "[c]laude( |$)|native-binary/claude"`) and tell the user each must be restarted: a session started before mods were switched on keeps its cached "off", a 1.3 session left running interrupts 1.4 engines, and the new SessionEnd hook registers only at start. Load the branch: disable the installed copy for the test (`claude plugin disable voiceover@claude-voiceover`) and either start a terminal session with `claude --plugin-dir /Users/hanan/Projects/claude-voiceover` or, for the VS Code extension, set `CLAUDE_CODE_PLUGIN_DIRS=/Users/hanan/Projects/claude-voiceover` in the `env` block of `~/.claude/settings.json` and reopen the panel. Re-enable the installed copy (`claude plugin enable voiceover@claude-voiceover`) when done.
 
-```bash
-claude plugin disable voiceover@claude-voiceover
-claude --plugin-dir /Users/hanan/Projects/claude-voiceover
-```
+- [ ] **Step 3: Confirm the mod and the per-project engines**
 
-For the VS Code extension, the equivalent is `CLAUDE_CODE_PLUGIN_DIRS=/Users/hanan/Projects/claude-voiceover` in the `env` block of `~/.claude/settings.json`, followed by reopening the panel. Re-enable the installed copy (`claude plugin enable voiceover@claude-voiceover`) when done. Record whether `/reload-plugins` alone registered the new SessionEnd hook in a session already running.
-
-- [ ] **Step 3: Confirm the per-project engines**
-
-Run one prompt in each of the two projects at once. Expected: two voices (Nicole here, Emma in OrcaMCP) speak over each other; `ls ~/.claude-voiceover/projects/*/root.txt` shows both roots; `cat` of each `root.txt` names its project, not `/Users/hanan`.
+Send one prompt in this project, then: `grep " bridge " ~/.claude-voiceover/voiceover.log | tail -3` — expected `ops=prompt ... narrate=True` lines (the mod loaded from `hooks/mod.json` and the VS Code session is not mistaken for headless). Narration must start while Claude is still writing. Then run one prompt in each of the two projects at once: two voices (Nicole here, Emma in OrcaMCP) speak over each other; `cat ~/.claude-voiceover/projects/*/root.txt` names both projects, not `/Users/hanan`.
 
 - [ ] **Step 4: Measure**
 
-With `debug_log` on (it is), work normally in this project until at least 50 mid-turn lines have been spoken, then run:
+With `debug_log` on (it is), work normally until at least 50 messages have been spoken, then take the first sentence of each message the mod queued:
 
 ```bash
-grep " sound " ~/.claude-voiceover/voiceover.log | grep -E "source=(pre|post)_tool_use" \
-  | sed -E 's/.*lag_shown=([0-9.]+).*/\1/;t;d' | sort -n \
-  | awk '{a[NR]=$1} END {print "n=" NR, "median=" a[int(NR/2)+1], "p90=" a[int(NR*0.9)+1]}'
+grep " sound " ~/.claude-voiceover/voiceover.log | grep "source=mod" \
+  | awk '{for(i=1;i<=NF;i++){if($i~/^utterance=/)u=$i; if($i~/^lag_shown=/)l=substr($i,11)} if(!(u in seen)){seen[u]=1; print l}}' \
+  | grep -v '^-$' | sort -n \
+  | awk '{a[NR]=$1} END {print "messages=" NR, "median=" a[int(NR/2)+1], "p90=" a[int(NR*0.9)+1]}'
 ```
 
-This is the first word of each mid-turn line, measured from when its text was written to the transcript. The replay predicts median 3.6s and p90 8.4s for this design, against 4.8s and 15.2s today. Pass: `n ≥ 50`, median ≤ 4.0, p90 ≤ 9.0. Then end a turn and run `sleep 5; pgrep -fl "kokoro_voice.py --drain"`: expected no output (the engine unloaded once the last sentence played and the turn's lease was released).
+This is the first word of each message, measured from when its first sentence finished streaming. The replay predicts median 1.0s and p90 2.6s with the mod (today 4.8s / 15.2s). Pass: `messages ≥ 50`, median ≤ 1.5, p90 ≤ 3.0. Then end a turn and run `sleep 5; pgrep -fl "kokoro_voice.py --drain"`: expected no output (the engine unloaded once the last sentence played and the turn's lease was released).
 
 - [ ] **Step 5: Report**
 
-Tell the user the measured median and p90 against the targets and today's figures, whether the engine unloaded, whether `/reload-plugins` was enough, and anything that misbehaved. Do not merge or push without their go-ahead.
+Tell the user the measured median and p90 against the targets and today's figures, whether the engine unloaded, and anything that misbehaved. Do not merge or push without their go-ahead.

@@ -2,10 +2,10 @@
 
 Date: 2026-10-02
 Status: approved by the user 2026-10-02, after two adversarial review rounds.
-**Streaming capture (the mod, §8) is deferred**: Claude Code's rollout switch
-for mods in installed plugins is off on this account; 1.4.0 ships everything
-else on the classic hooks. The mod work is parked in
-`docs/superpowers/plans/2026-10-02-narrator-mod-deferred.md`.
+**The mod (§8) ships in 1.4.0.** Claude Code's rollout switch for mods was
+off on this account earlier on 2026-10-02 — so §1–§7 and §9 were built first
+on the classic hooks — and on later that day; the user then put the mod in
+the first release. Its round-2 fixes are folded into §8.
 Target version: 1.4.0
 Builds on: `2026-09-10-narration-queue-design.md` (the spool, the drain loop,
 the cutover hook). Everything that document settles stands unless this one
@@ -75,14 +75,14 @@ Settled with the user:
 | Sessions sharing a project | Share the queue and the voice; the newest message wins between them. |
 | Engine lifetime | **Per project, turn-scoped.** Loaded as a turn starts, released when it ends and while a question dialog waits on the user; the process exits once its queue is empty and no session holds it. |
 | Model | **Keep `kokoro-v1.0.onnx` (fp32).** Measured: int8 is 407MB vs 683MB but synthesizes a 78-character sentence in 1.72s vs 0.76s. |
-| Capture | **The classic hooks for 1.4.0.** A mod tapping `turn.step` text chunks was approved, but it only ships when Claude Code loads mods for installed plugins (off on this account, 2026-10-02); the user asked to be asked each new session whether to test for it. |
+| Capture | **A mod inside this plugin**, tapping `turn.step` text chunks, in 1.4.0; the classic hooks remain the fallback. Early-access API and TypeScript accepted. |
 
 Defaults chosen in the review round — the user may overrule any of them:
 
 | Question | Default |
 |---|---|
 | What "new text" means | A new **message**: one hook batch (with the mod: one model response). Its sentences play in order; only a different message preempts. |
-| Which prompts cut speech off | The user's own. The hooks cannot see a prompt's origin, so they skip only prompts that begin with `<task-notification>` (a background task finishing); such a prompt only holds the engine for its turn. (The mod would use the origin: `composer`, `bridge`, `sdk`.) |
+| Which prompts cut speech off | The user's own. The mod reads the prompt's origin and excludes only the kinds the engine stamps as automated (`task-notification`, `scheduled-trigger`, `peer`, `peer-send-message`, `projects-relay`, `channel`, `coordinator`, `observer`, `observer-activity`, `auto-continuation`, `plugin`); any other origin, including one this build does not know, counts as the user's — missing a cutover the user asked for costs more than an extra one. Measured: `claude -p` prompts are `sdk`; a background subagent's result arrives as a new turn with origin `task-notification`. The hooks cannot see an origin and skip only prompts that begin with `<task-notification>`. A skipped prompt only holds the engine for its turn. |
 | Dialog alerts and permission requests | **Sticky**: never dropped by the jump rule, and played whole once started. Only the user's own prompt stops one. |
 | Headless sessions (`claude -p`, the Agent SDK) | **Not narrated**: the hooks skip a session whose `CLAUDE_CODE_ENTRYPOINT` starts with `sdk-` (measured: `sdk-cli` for `claude -p`, `claude-vscode` for the VS Code extension). A headless run started from inside another session inherits that session's value and is not recognized; `MAX_ENGINES` bounds that case. |
 | Concurrent engines | **At most 2 machine-wide** (`MAX_ENGINES = 2`). A third project's engine steps aside until one exits; its items wait, and age out at the 300s cap. |
@@ -334,21 +334,60 @@ narrator engine or its playback, because another project may be narrating:
   `ffplay .*\.wav`); then it clears every project's lock, queue, leases, stop
   files and wavs.
 
-### 8. Deferred: streaming capture (the mod)
+### 8. The mod — `hooks/narrator.ts`, `segment.ts`, `origin.ts`, `bridge.ts`
 
-Approved, designed, reviewed twice — and deferred: on 2026-10-02 Claude Code
-2.1.287 refused to load function-hook modules for installed and
-`--plugin-dir` plugins on this account ("hooks modules are turned off for
-installed plugins in this process: the rollout switch served off"), and
-`claude plugin test` refuses for the same reason. The design (a TypeScript
-mod tapping `turn.step` text chunks, cutting them into sentences, and
-handing them through `hooks/mod_bridge.py` to the same narrator actions the
-hooks use) is §8 of this spec as committed in `7eee726`; the plan, the
-round-2 changes it must absorb, and the switch test are in
-`docs/superpowers/plans/2026-10-02-narrator-mod-deferred.md`. Everything in
-§1–§7 and §9 is built so the mod can be added later without reworking them:
-the queue, utterances, sticky items, `shown` stamps, leases, stop requests
-and narrator actions are what its bridge would call.
+Declared in its own hooks file, `hooks/mod.json` = `{"modules":
+["./narrator.ts"]}`, named by `.claude-plugin/plugin.json` as `"hooks":
+"./hooks/mod.json"`. The standard `hooks/hooks.json` stays as it is and is
+still auto-discovered (declaring an ADDITIONAL hooks file is allowed; naming
+the standard one is what broke 1.3.0), so a build that cannot read `modules`
+can fail only that file.
+
+Measured with a probe mod under `claude -p` on 2.1.287: text chunks arrive
+as the text streams (pieces of a few characters, ~25ms apart); a
+`$.process.run` a hook does not await completes after the hook returns;
+subagent steps and turn ends carry `agentId`; `turn.start` fires before the
+first step.
+
+| Hook | Behaviour |
+|---|---|
+| `session.start` | `start` op (its reply sets the gate, so a reloaded module resumes). |
+| `session.end` | `end-session` op, awaited. |
+| `prompt.submit` | `prompt` op with `cutover` = the origin is not automated (Decisions). Not awaited. The reply is this turn's `narrate` gate. |
+| `turn.start` | `hold` op (the pre-warm); resets the dialog lead-in. |
+| `turn.step` (main loop only) | Yields every chunk of `next(e)` unchanged, then feeds text chunks to the segmenter; every block of one response shares the utterance `<turnId>:<index>`; complete segments become `say` ops. Flushed only when the response completed (`stopReason` set, not aborted); an interrupted stream is closed beneath and not flushed. |
+| `tool.call` AskUserQuestion, ExitPlanMode | `dialog` op under the last utterance, awaited before `next(e)` so the permission echo finds the marker; then `hold`. |
+| `turn.complete` (main loop only) | `turn-end` op with `spoken` = the last step queued speakable text. |
+
+**The `$` rule.** The engine refuses a module that stores `$`, puts it in an
+object, or hands it to a function in another file. `narrator.ts` keeps every
+function that needs `$` at its top level, taking `$` as a parameter; its
+module state (the op queue, the gate, the last utterance) holds no `$`;
+`bridge.ts`, `segment.ts` and `origin.ts` are pure.
+
+**The channel.** One module-level queue: ops are delivered to
+`hooks/run.sh mod_bridge` in order; ops queued while a call runs go together
+in the next call. Each call reads the session id and root afresh (a `/clear`
+or resume changes the id with no `session.start`) and sends `cwd` =
+`$.session.root()`, which a shell `cd` does not move. A failed call settles
+its ops as "not narrating".
+
+**The bridge** (`hooks/mod_bridge.py`, stdlib) executes the ops through
+`voiceover/narrator.py`. Every batch marks the session (`mod_sessions/`), so
+the classic narrator paths stand down for it (and move the prose cursor past
+what the mod spoke). Headless runs never narrate: `narrator.narrates()`
+already excludes `CLAUDE_CODE_ENTRYPOINT=sdk-*`, so VS Code (`claude-vscode`)
+cannot be mistaken for headless. `prompt` re-pins and, for the user's own
+prompt, cuts over without warming (turn.start warms, so a prompt that never
+becomes a turn holds nothing); `turn-end` and `dialog` release the lease even
+when narration is off. It prints one JSON line, `{"narrate": bool}`.
+
+**The segmenter** emits a segment after `.`, `!` or `?` followed by
+whitespace and at each newline; a fence (```` ``` ```` at the start of a
+line, tracked across pieces) holds everything until it closes; an inline
+```` ``` ```` is text. Scanning resumes where the last piece stopped, so a long
+fence costs linear time. The bridge cleans each segment, strips any `*` or
+backtick a split left unpaired, and drops segments that clean to nothing.
 
 ### 9. The classic hooks
 
@@ -410,11 +449,20 @@ the system Python 3.9 and at the end of every task.
    at any level releases; the new SessionEnd hook; per-session dialog
    marker; sticky permission requests.
 
-Live acceptance, on the user's machine: the engine logs, per item, its
-first-sound time against the item's `shown` stamp and its `source`. Over a
-working session of at least 50 mid-turn lines (`pre_tool_use` /
-`post_tool_use`), first-word lag median ≤ 4.0s and p90 ≤ 9.0s; the engine
-process is gone within a few seconds of a turn's last sentence.
+Mod (`claude plugin test .`, `hooks/*.test.ts`): the segmenter (sentence
+ends, split pieces, line-start fences held whole, inline backticks, linear
+long fences); the stream tap (chunks unchanged, subagent steps ignored, no
+flush after an interrupt, a failing bridge harmless); cutover by origin;
+turn.start warming; /clear's new session id; recovery with `status`; the
+dialog announced before it opens; the turn-end `spoken` flag.
+
+Live acceptance, on the user's machine, in a VS Code session started after
+the update: the engine logs, per item, its first-sound time against the
+item's `shown` stamp, its `source` and its `utterance`. Over at least 50
+messages the mod queued, the first sentence of each message is heard at a
+median ≤ 1.5s and a p90 ≤ 3.0s after it finished streaming (replay: 1.0s /
+2.6s); the engine process is gone within a few seconds of a turn's last
+sentence.
 
 ## Rollout
 
@@ -424,8 +472,8 @@ process is gone within a few seconds of a turn's last sentence.
   rule of §4 limits the damage to the sentence being cut.) The new SessionEnd
   hook registers only after a restart.
 - Set the two project voices (Decisions).
-- Each new session in this project asks the user whether to test if mods now
-  load (`2026-10-02-narrator-mod-deferred.md` has the test).
+- Every live session must restart: one started before mods were switched on
+  keeps its cached "off".
 
 ## Files touched
 
@@ -446,7 +494,6 @@ machine-wide queue.
 
 ## Out of scope
 
-- The mod (§8), until Claude Code loads mods for installed plugins.
 - One engine shared by all projects.
 - A smaller or quantized model.
 - Speeding speech up when it falls behind.

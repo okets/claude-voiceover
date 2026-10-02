@@ -1,6 +1,6 @@
 # Narrator Mod (Streaming Capture) — Deferred
 
-**Status:** deferred on 2026-10-02. Not part of 1.4.0.
+**Status:** SUPERSEDED on 2026-10-02. Mods were switched on for this account later that day and the user put the mod in 1.4.0; its tasks are Tasks 8–10 of `2026-10-02-low-latency-narration.md`, with every change below folded in (and machine-checked with `claude plugin validate` and `claude plugin test`). Kept as the record of why and how it was deferred.
 
 **Why:** Claude Code 2.1.287 refuses to load function-hook modules for installed and `--plugin-dir` plugins on this account. A headless probe printed:
 
