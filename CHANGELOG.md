@@ -7,6 +7,10 @@ after updating.** A 1.3 session left running interrupts 1.4 engines, and the
 new SessionEnd hook only registers after a restart.
 
 ### Added
+- Narration starts as Claude writes: a Claude Code mod speaks each sentence as
+  it streams, through the same per-project queue and engine. It needs Claude
+  Code 2.1.287 or newer (mods are on by default); the hooks remain the
+  fallback and stand down for sessions the mod narrates.
 - Per-project narration: each project has its own queue, voice and engine, and
   may speak over one other project (two engines at most). Set a project's
   voice with `/voiceover:voice <name> --project`.

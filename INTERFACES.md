@@ -92,7 +92,7 @@ unloads once nobody needs it. Hooks WRITE leases; the engine READS them
 a crash backstop: holders renew at every tool hook and release at turn end.
 
 ```python
-LEASE_TTL = 600.0            # a holder whose turn end always arrives (the deferred mod)
+LEASE_TTL = 600.0            # a holder whose turn end always arrives (the mod)
 FALLBACK_LEASE_TTL = 120.0   # classic hooks: Stop does not fire on an interrupt
 
 def lease_dir(cwd=None) -> Path
@@ -103,10 +103,11 @@ def any_live(cwd=None) -> bool                   # any unexpired lease in the pr
 
 ## voiceover/narrator.py
 
-Narrator-level actions shared by the classic hooks (the deferred mod's bridge will call the
-same ones), so what a prompt, a dialog or a turn's end does to the queue, lease and engine
+Narrator-level actions shared by the classic hooks and the mod's bridge
+(`hooks/mod_bridge.py`), so what a prompt, a dialog or a turn's end does to the queue, lease and engine
 has one definition. Per-session records live under `data_dir()`: `pins/` (the project a
-session's turn stays in) and `dialog_alert/`; week-old records are pruned. Every function
+session's turn stays in), `dialog_alert/` and `mod_sessions/` (sessions the mod narrates);
+week-old records are pruned. Every function
 fails soft.
 
 ```python
@@ -115,17 +116,30 @@ DIALOG_TOOLS = ("AskUserQuestion", "ExitPlanMode")
 def headless() -> bool                    # CLAUDE_CODE_ENTRYPOINT startswith "sdk-" (claude -p, Agent SDK)
 def narrates(cwd=None) -> bool            # narrator level + tts enabled + engine != none + not headless
 def pin_cwd(session, cwd) -> None         # keep this session's turn in cwd's project
-def repin(session, cwd) -> None           # every prompt: release a lease held under a previous pin, then pin cwd
+def repin(session, cwd)                   # every prompt: release a lease held under a previous pin, then pin cwd;
+                                          # returns the previously pinned cwd when its PROJECT differs, else None
 def pinned_cwd(session, cwd)              # the pinned cwd, else cwd
 def unpin(session) -> None
 def is_users_prompt(prompt_text) -> bool  # False for a "<task-notification>" arriving as a prompt
-def cutover(cwd, session, ttl=lease.LEASE_TTL) -> None
-    # the user's own prompt: spool.clear(session) THEN request_stop (engine can't claim one more
-    # item between), then prewarm if narrating. No process is killed. No session -> no clear/stop.
+def mod_active(session) -> bool           # the mod narrates this session (it has a mod_sessions mark)
+def mod_owns_prompt(session, cwd) -> bool # mod_active and the level at the session's pinned cwd is narrator
+def mark_mod_session(session) -> None     # the bridge marks the session on every call
+def unmark_mod_session(session) -> None   # end-session and session_end.py drop the mark
+def stands_down(session, transcript_path) -> bool
+    # the mod narrates this session: calls prose.skip_unread(transcript_path) (the classic path
+    # does nothing else) and returns True; False when the mod does not narrate it
+def abandon(cwd, session) -> int
+    # spool.clear(session) THEN request_stop in cwd's project (engine can't claim one more item
+    # between); returns the items dropped. No session -> nothing cleared or stopped.
+def cutover(cwd, session, ttl=lease.LEASE_TTL, warm=True) -> None
+    # the user's own prompt: abandon(), then prewarm if warm and narrating. No process is killed.
+    # The mod passes warm=False: its turn.start hold warms, so a prompt that never becomes a turn
+    # holds nothing.
 def write_dialog_marker(session) -> None
 def dialog_recently_announced(session, within=30.0) -> bool   # notification.py's echo guard
-def queue_dialog(cwd, session, tool_name, tool_input, lead_in=None, shown=None) -> bool
-    # sticky, whole alert (lead-in prose first); marker only if it queued; ensure_drainer; release lease
+def queue_dialog(cwd, session, tool_name, tool_input, lead_in=None, shown=None, utterance=None) -> bool
+    # sticky, whole alert (lead-in prose first); marker only if it queued; ensure_drainer; release lease.
+    # utterance (the mod passes its lead-in's) makes the alert continue that message, not preempt it
 def dialog_answered(cwd, session, ttl=lease.LEASE_TTL) -> None   # prewarm again for the rest of the turn
 def turn_end(cwd, session, spoken) -> None   # release lease; decide chime if the turn said nothing
 ```
@@ -229,6 +243,9 @@ def peek_new_prose_stamped(transcript_path) -> tuple
     # (speech_text | None, new_offset, shown): shown = when the first unread prose row was
     # written (unix seconds, from its transcript timestamp), or None
 def commit_offset(transcript_path, offset) -> None   # advance the cursor after the text was queued
+def skip_unread(transcript_path) -> None
+    # mark everything written so far as narrated (the mod already spoke it), so a later
+    # fallback never replays it
 def clean_for_speech(markdown_text) -> str
 ```
 
@@ -255,7 +272,7 @@ Item filename `<epoch_ms:013d>-<pid>-<seq:02d>.json` — lexicographic order is
 play order. Item content `{"text", "engine", "voice", "created", "session", "utterance",
 "sticky", "shown", "source"}`: items sharing an `utterance` are one message; `sticky` items
 are never skipped and play whole; `shown` (when the text appeared on screen) and `source`
-(the hook that queued it) are for latency logging, or None.
+(the hook that queued it, or `"mod"` for the narrator mod) are for latency logging, or None.
 Writes are a temp file plus `os.rename`, so a reader never sees a partial item.
 `*.taken` is an item a reader has claimed; `*.tmp` is a write in flight. Only
 `*.json` counts as pending.
@@ -303,6 +320,10 @@ Speakers (`open_speaker()` returns one, or falsy on failed setup) provide
 a `Playback` has `poll() -> bool` (True once over) and `kill()`. `ProcessPlayback(process,
 cleanup=None)` wraps a child process; `DryRunSpeaker` prints `[voiceover] <sentence>`.
 `drain()` prefetches the next item's first sentence during an item's last one.
+
+Each spoken sentence logs (`engine_log("sound", ...)`, debug_log setting on):
+`source=<source> utterance=<utterance> lag_created=<s> lag_shown=<s or None> chars=<n> :: <first 60 chars>`.
+`utterance` is the item's message id, so a log reader can see which sentences were one message.
 
 `drain()` claims the lock BEFORE `open_speaker()` loads anything, and tracks ownership with
 an internal flag: it releases the lock only when it holds it, and never deletes one another
@@ -369,8 +390,13 @@ Lease table (narrator level; `FALLBACK_LEASE_TTL` unless noted):
 | user_prompt_submit (task notification) | held (pre-warm); nothing cut off |
 | pre_tool_use | held; released instead for a dialog tool (`queue_dialog`) |
 | post_tool_use | held; a dialog tool's answer re-holds via `dialog_answered` |
-| stop | released by `narrator.turn_end` (at any non-narrator level too) |
+| stop | narrator level: released by `narrator.turn_end` (not at all when the mod narrates the session; the mod's `turn-end` op does it). Any other level: `lease.release` directly |
 | session_end | released |
+
+Stand-down: at the narrator level `pre_tool_use`, `post_tool_use` and `stop` return after
+`narrator.stands_down(session, transcript)` when the mod narrates the session, and
+`user_prompt_submit` returns at once when `narrator.mod_owns_prompt(session, cwd)` is true (the mod's
+bridge re-pins and cuts over). Below the narrator level the classic hooks run as before, mod or not.
 
 - `pre_tool_use.py` — narrator: queue unread prose (`source="pre_tool_use"`), hold the lease,
   `ensure_drainer`; for `AskUserQuestion` / `ExitPlanMode` wait out the transcript flush race
@@ -390,8 +416,78 @@ Lease table (narrator level; `FALLBACK_LEASE_TTL` unless noted):
   narration: narrator level -> `narrator.cutover` (spool.clear(session) then request_stop, then
   pre-warm; a background task's notification only pre-warms); other levels -> spool.clear(session)
   then stop_speech() (one-shot speaker only).
-- `session_end.py` — releases the session's lease (under its pinned cwd) and drops its pin.
+- `session_end.py` — releases the session's lease (under its pinned cwd) and drops its pin and
+  its mod mark.
   A restart is needed for Claude Code to register a newly added hook event.
+
+## hooks/mod_bridge.py
+
+The mod's single entry into the narrator: `bash hooks/run.sh mod_bridge`, one JSON batch on
+stdin. The mod only captures text; every policy (gating, cleaning, voices, queue, engine)
+lives here and in `voiceover/narrator.py`, shared with the classic hooks.
+
+```
+{"session": str, "cwd": str, "ops": [op, ...]}      cwd = the session's root
+```
+
+| Op | Does |
+|----|------|
+| `{"op": "start"}` / `{"op": "status"}` | `narrator.pin_cwd`; `status` is also how the mod re-asks the gate |
+| `{"op": "end-session"}` | `lease.release`, `narrator.unmark_mod_session` |
+| `{"op": "prompt", "cutover": bool}` | acts only when `narrator.mod_owns_prompt(session, cwd)`; then `narrator.repin`, and with `cutover` and narration on: `narrator.abandon(previous, session)` when the project moved, then `narrator.cutover(cwd, session, warm=False)` |
+| `{"op": "hold"}` | a turn or step began: `prewarm` (narration on only) |
+| `{"op": "say", "utterance", "text", "shown"}` | `speakable(text)`, then `enqueue_speech(full=True, source="mod", utterance=, shown=)`; `ensure_drainer` once per batch if anything queued (narration on only) |
+| `{"op": "dialog", "tool", "input", "utterance"}` | narration on: `narrator.queue_dialog(..., utterance=)`; off: `lease.release` |
+| `{"op": "turn-end", "spoken": bool}` | narration on: `narrator.turn_end`; off: `lease.release` |
+
+Every batch first calls `narrator.mark_mod_session(session)` (`/clear` and resume change the id
+with no `session.start`, and the classic hooks must stand down from the new session's first op),
+then reads the gate `narrator.narrates(cwd)` once. Ops other than the ones that release run only
+when the gate is on. `speakable` cleans markdown with `prose.clean_for_speech` and strips any `*`
+or backtick a mid-markup split left unpaired.
+
+Reply: exactly one stdout line, `{"narrate": true|false|null}` - the gate as of the call; `null`
+after an internal error. Always exits 0.
+
+## The mod (hooks/mod.json and the .ts files)
+
+`.claude-plugin/plugin.json` names `"hooks": "./hooks/mod.json"`, an ADDITIONAL hook file beside
+the auto-discovered `hooks/hooks.json`. `hooks/mod.json` is `{ "modules": ["./narrator.ts"] }`.
+Claude Code 2.1.287+ loads it (mods on by default); older builds, or builds with mods off, ignore
+it and the classic hooks narrate. TypeScript tests sit beside the sources (`*.test.ts`).
+
+- `narrator.ts` - registers the mod's event handlers: `session.start` (open the gate with a
+  `start` op), `session.end` (`end-session`, awaited), `prompt.submit` (`prompt` op, never
+  awaited, `cutover` from `isUsersOwnPrompt`), `turn.start` (`hold`), `turn.step` (main loop
+  only, never a subagent: every text chunk is yielded first, then fed to one segmenter per block;
+  each completed segment is a `say` op; on a clean stop the rest is flushed, on an interrupt a
+  half sentence is dropped), `tool.call` for `AskUserQuestion` / `ExitPlanMode` (a `dialog` op,
+  awaited so the alert queues before the permission echo can speak; then `hold`), and
+  `turn.complete` (`turn-end` with whether the step queued speakable text; main loop only).
+  One utterance id per response: `<turnId>:<step index>`. A single queue sends ops to the bridge
+  in order, batching those that arrive during a call (timeout 5s).
+  - The gate: `openGate` sends an op; if the answer is unknown (`null`) it asks once more with
+    `status`, and if still unknown it reads as off and leaves no gate, so the next op asks again.
+    `currentGate` reuses the turn's gate or opens one with `status`. One failed bridge call never
+    silences a turn.
+  - The `$` rule: the engine refuses a module that stores the engine handle `$`, puts it in an
+    object, or passes it to a function in another file. Every function that needs `$` takes it as a
+    parameter and lives in `narrator.ts`; module state holds no `$`. Other files are pure.
+- `segment.ts` - `createSegmenter()` with `push(text)` and `flush()`: cuts streamed markdown at
+  `.` `!` `?` followed by whitespace, and at newlines. A fenced block (a ``` that opens a line,
+  after any spaces or tabs, so list-item code counts) is held until it closes and emitted whole;
+  ``` inside a line is text. Scanning resumes where it stopped (linear time).
+- `origin.ts` - `isUsersOwnPrompt(origin)`: false for the automated origins (task-notification,
+  scheduled-trigger, peer, peer-send-message, projects-relay, channel, coordinator, observer,
+  observer-activity, auto-continuation, plugin); true for anything else, including an unknown or
+  missing origin. Only the user's own prompt cuts narration off.
+- `bridge.ts` - the `Op` type for the table above, and `parseReply(stdout)`, which reads the last
+  stdout line. It returns `{ narrate: boolean | null }`; null (no output, a crash, bad JSON, the
+  bridge's own null) means unknown.
+
+While a session is marked, the classic hooks do not speak or queue for it (see Stand-down under
+hooks/), and Stop does not end its turn; `turn.complete` does. Items the mod queues have
+`source="mod"` and go through the same project queue, lease and engine as the hooks' items.
 
 ## scripts/ (used by slash commands; argparse CLIs, stdlib only)
 
@@ -417,13 +513,14 @@ All commands invoke scripts with `"${CLAUDE_PLUGIN_ROOT}/scripts/<script>.py"` p
 
 ## .claude-plugin/
 
-- `plugin.json` — name "voiceover", displayName "Claude Voiceover", version 1.0.0,
+- `plugin.json` — name "voiceover", displayName "Claude Voiceover", version 1.4.0,
   description packed with search terms (voice, text-to-speech, TTS, narration, notification
   sounds, Kokoro, offline, local), author Hanan (okets), homepage/repository
   https://github.com/okets/claude-voiceover, license MIT.
   It must NOT declare "hooks" or "commands" paths: Claude Code auto-discovers
   hooks/hooks.json and commands/, and naming either one makes it load the file
   twice and refuse the plugin ("Duplicate hooks file detected"). Declaring
-  manifest.hooks is only for ADDITIONAL hook files beyond the standard one.
+  manifest.hooks is only for ADDITIONAL hook files beyond the standard one: it names
+  `./hooks/mod.json` (the narrator mod), which is not `hooks/hooks.json`.
 - `marketplace.json` — marketplace name "claude-voiceover", owner okets, one plugin entry
   with source "./" so `/plugin marketplace add okets/claude-voiceover` works directly.
