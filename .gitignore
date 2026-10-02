@@ -5,3 +5,4 @@ uv.lock
 *.egg-info/
 .venv/
 .superpowers/
+.claude/voiceover.json

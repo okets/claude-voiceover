@@ -43,6 +43,8 @@ Set with `/voiceover:level` — per machine, or per project.
 | verbose | 3 | Full play-by-play of every tool Claude uses, including subagent completions |
 | narrator | 4 | Claude's actual words read aloud as it works, with fluent speech between sentences (model loads once per turn, not per sentence) — tool chatter stays quiet, code blocks become a spoken "…code snippet…" cue |
 
+After updating to 1.4, restart every running Claude Code session (or run `/reload-plugins` in it): a session left on 1.3 interrupts the new engines, and the new SessionEnd hook only registers after a restart.
+
 Upgrading to narrator's queued narration also needs one Claude Code restart to fully take effect (the hook that clears an abandoned turn's narration only registers after a restart). Until then, if you send a new message before Claude finishes speaking the last one, you'll hear the old turn's narration all the way through before the new answer starts — the opposite of what this feature is for. Restart once after upgrading and it goes away.
 
 ## Voices
@@ -60,7 +62,13 @@ Set with `/voiceover:voice <name>`. Kokoro voices are local neural TTS; the defa
 | `echo` | American Male | `default-male` | macOS Daniel, zero setup |
 | `puck` | American Male | | |
 
-No voice picked? Each project gets a stable voice of its own, so you can tell your sessions apart by ear.
+No voice picked? Each project gets a stable voice of its own, so you can tell your sessions apart by ear. Pick one for just the current project with `/voiceover:voice <name> --project`.
+
+### Narrator, per project
+
+Each project has its own queue and voice, and may speak over one other project (two engines at most). A new message from Claude preempts the old one at the end of the current sentence; question alerts and permission requests always play whole. The engine is loaded only while a turn runs, so nothing sits in memory between turns. Headless (`claude -p`) runs are not narrated.
+
+Next: speaking Claude's text as it streams needs Claude Code to enable mods for installed plugins, and is planned for when it does.
 
 ## The Narration output style
 

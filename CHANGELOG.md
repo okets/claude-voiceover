@@ -1,8 +1,41 @@
 # Changelog
 
-## Unreleased
+## 1.4.0 - 2026-10-02
+
+**Restart every running Claude Code session (or run `/reload-plugins` in it)
+after updating.** A 1.3 session left running interrupts 1.4 engines, and the
+new SessionEnd hook only registers after a restart.
+
+### Added
+- Per-project narration: each project has its own queue, voice and engine, and
+  may speak over one other project (two engines at most). Set a project's
+  voice with `/voiceover:voice <name> --project`.
+- Sentence-boundary preemption: a new message from Claude ends the previous
+  one at the end of its current sentence and drops what was queued between.
+  Question alerts and permission requests are sticky - never dropped, always
+  played whole - and are retired when the tool they asked about finishes.
+- Prefetch: the next sentence is synthesized while the current one plays.
+- A turn-scoped engine: a session holds a lease on its project's engine while
+  a turn runs, the engine is pre-warmed on the prompt, and it unloads once the
+  turn's speech has played. Adds a SessionEnd hook (the seventh event) that
+  releases the lease.
+
+### Changed
+- Headless runs (`claude -p`, the Agent SDK) are no longer narrated.
+- `~/.claude` is no longer a project marker, so projects without a `.claude`
+  of their own no longer all resolve to the home directory and share one
+  queue and voice.
+- The one-shot interrupt only matches the one-shot speaker's processes.
+- The machine-wide 1.3 queue directory is removed.
+- `tts_controller.py stop` stops every project's engine and clears every
+  project's state.
 
 ### Fixed
+- A one-shot interrupt (concise-level speech, a tool announcement) no longer
+  kills another project's narration.
+- A dead engine no longer silences its project: a lock whose owner process has
+  died is treated as free, so the next hook starts a new engine.
+- Windows playback no longer holds 30s per clip.
 - The end-of-turn summary no longer parrots the request back. The legacy
   "You instructed me to: <truncated request>. Done!" line is gone, and so is
   the truncated request that prefixed the outcome summary ("2 files updated,
