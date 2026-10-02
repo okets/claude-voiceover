@@ -89,16 +89,29 @@ def detect_project_root(cwd=None) -> Path:
 
 
 def _search_up_for(start: Path, marker: str):
-    """Walk up from start looking for a directory named marker (depth-limited)."""
+    """Walk up from start looking for a directory named marker (depth-limited).
+
+    ~/.claude is Claude Code's own user configuration, not a project marker:
+    accepting it makes every project without a .claude of its own resolve to
+    the home directory, so they would all share one queue and one voice.
+    """
+    home = _resolved(Path.home())
     current = start
     for _ in range(10):
         candidate = current / marker
-        if candidate.is_dir():
+        if candidate.is_dir() and not (marker == ".claude" and _resolved(current) == home):
             return current
         if current.parent == current:
             break
         current = current.parent
     return None
+
+
+def _resolved(path: Path) -> Path:
+    try:
+        return path.resolve()
+    except OSError:
+        return path
 
 
 def _global_settings_path() -> Path:
