@@ -15,6 +15,7 @@ data_dir = isolate()
 from voiceover import spool
 sys.path.insert(0, str(REPO_ROOT / "tts"))
 import engine_common
+ROOT = spool.queue_dir().parent  # this repo's project dir
 
 
 def run_drain(engine="macos", timeout=None):
@@ -26,20 +27,34 @@ def run_drain(engine="macos", timeout=None):
     test is to bound a suspected hang.
     """
     if engine == "macos":
-        command = [sys.executable, str(REPO_ROOT / "tts" / "macos_say.py"), "--drain"]
+        command = [sys.executable, str(REPO_ROOT / "tts" / "macos_say.py"), "--drain", str(ROOT)]
     else:
         command = ["uv", "run", "--project", str(REPO_ROOT / "tts"),
-                   str(REPO_ROOT / "tts" / "kokoro_voice.py"), "--drain"]
+                   str(REPO_ROOT / "tts" / "kokoro_voice.py"), "--drain", str(ROOT)]
     proc = subprocess.run(command, capture_output=True, text=True,
                           env=os.environ.copy(), cwd=str(REPO_ROOT / "tts"),
                           timeout=timeout)
     return proc.stderr, proc.returncode
 
 
+class Collect:
+    """A speaker that records each sentence and finishes it at once."""
+
+    def __init__(self, sink):
+        self.sink = sink
+
+    def prefetch(self, sentence, voice):
+        pass
+
+    def begin(self, sentence, voice, upcoming=None):
+        self.sink.append(sentence)
+        return engine_common.Playback()
+
+
 # --- drains the whole spool, in order --------------------------------------
 spool.clear()
 for word in ("first line", "second line", "third line"):
-    spool.enqueue(word, "macos-female", "Samantha")
+    spool.enqueue(word, "macos-female", "Samantha", utterance="U1")
     time.sleep(0.002)
 stderr, code = run_drain("macos")
 spoken = [line.split("[voiceover] ", 1)[1].strip()
@@ -48,7 +63,7 @@ check("drain exits 0", code == 0, "code=%d stderr=%s" % (code, stderr))
 check("every queued item was spoken, in order",
       spoken == ["first line", "second line", "third line"], spoken)
 check("the spool is empty afterwards", spool.pending_count() == 0)
-check("the lock is released afterwards", engine_common.lock_is_live() is False)
+check("the lock is released afterwards", engine_common.lock_is_live(ROOT) is False)
 check("no .taken leftovers", list(spool.queue_dir().glob("*.taken")) == [])
 
 # --- an empty spool is a clean no-op ---------------------------------------
@@ -59,13 +74,13 @@ check("draining an empty spool says nothing", "[voiceover] " not in stderr, stde
 # --- a held lock makes the drainer step aside ------------------------------
 spool.clear()
 spool.enqueue("must survive", "macos-female", "Samantha")
-engine_common.tts_lock_path().write_text(
+engine_common.tts_lock_path(ROOT).write_text(
     json.dumps({"expiry": time.time() + 60, "pid": os.getpid()}))
 stderr, code = run_drain("macos")
 check("a second drainer exits 0 when the lock is held", code == 0, code)
 check("it speaks nothing", "[voiceover] " not in stderr, stderr)
 check("the item is left for the lock holder", spool.pending_count() == 1)
-engine_common.remove_tts_lock()
+engine_common.remove_tts_lock(ROOT)
 
 # --- a foreign-engine item is SKIPPED, never a roadblock -------------------
 # It keeps its place for its own engine, but it must not stop this engine
@@ -76,9 +91,9 @@ engine_common.remove_tts_lock()
 spool.clear()
 spool.enqueue("kokoro only", "kokoro", "bf_emma")
 time.sleep(0.002)
-spool.enqueue("mine to speak", "macos-female", "Samantha")
+spool.enqueue("mine to speak", "macos-female", "Samantha", utterance="U2")
 time.sleep(0.002)
-spool.enqueue("mine as well", "macos-female", "Samantha")
+spool.enqueue("mine as well", "macos-female", "Samantha", utterance="U2")
 stderr, code = run_drain("macos")
 spoken = [line.split("[voiceover] ", 1)[1].strip()
           for line in stderr.splitlines() if "[voiceover] " in line]
@@ -94,7 +109,7 @@ check("the surviving item is the foreign one",
 check("no .taken leftover from the skipped item",
       list(spool.queue_dir().glob("*.taken")) == [])
 check("the lock is released so the right engine can claim it",
-      engine_common.lock_is_live() is False)
+      engine_common.lock_is_live(ROOT) is False)
 
 # --- items past the age cap are dropped, not spoken ------------------------
 spool.clear()
@@ -116,7 +131,7 @@ check("stale items are dropped, fresh ones spoken", spoken == ["current"], spoke
 spool.clear()
 spool.enqueue("before", "macos-female", "Samantha")
 proc = subprocess.Popen(
-    [sys.executable, str(REPO_ROOT / "tts" / "macos_say.py"), "--drain"],
+    [sys.executable, str(REPO_ROOT / "tts" / "macos_say.py"), "--drain", str(ROOT)],
     stderr=subprocess.PIPE, text=True, env=os.environ.copy(),
     cwd=str(REPO_ROOT / "tts"))
 time.sleep(0.05)
@@ -148,8 +163,7 @@ def take_empty_first(*args):
 engine_common.take_oldest = take_empty_first
 spoken_items = []
 try:
-    code = engine_common.drain(
-        lambda item: spoken_items.append(item["text"]) or True, {"macos-female"})
+    code = engine_common.drain(ROOT, lambda: Collect(spoken_items), {"macos-female"})
 finally:
     engine_common.take_oldest = real_take
 
@@ -170,7 +184,7 @@ check("no orphaned .taken file is left behind",
 # is ever reached.
 spool.clear()
 spool.enqueue("appended in the gap", "macos-female", "Samantha")
-foreign_payload = json.dumps({"expiry": time.time() + 300, "pid": 999999})
+foreign_payload = json.dumps({"expiry": time.time() + 300, "pid": os.getpid()})
 
 real_take = engine_common.take_oldest
 looks = {"n": 0}
@@ -181,18 +195,18 @@ def take_empty_first(*args):
         return None, None          # first look: spool appears empty
     # Simulate another engine winning the lock in the gap between our
     # release and our re-check.
-    engine_common.tts_lock_path().write_text(foreign_payload)
+    engine_common.tts_lock_path(ROOT).write_text(foreign_payload)
     return real_take(*args)        # second look: the appended item is there
 
 engine_common.take_oldest = take_empty_first
 try:
-    code = engine_common.drain(lambda item: True, {"macos-female"})
+    code = engine_common.drain(ROOT, lambda: Collect([]), {"macos-female"})
 finally:
     engine_common.take_oldest = real_take
 
 check("drain exits 0 when it loses the lock race", code == 0, code)
 check("drain does NOT delete a lock it does not own",
-      engine_common.tts_lock_path().read_text() == foreign_payload,
+      engine_common.tts_lock_path(ROOT).read_text() == foreign_payload,
       "lock was deleted or overwritten")
 check("the item is put back, not lost", spool.pending_count() == 1,
       spool.pending_count())
@@ -204,7 +218,7 @@ check("the item is put back, not lost", spool.pending_count() == 1,
 # whole time. Run this under a hard timeout: against the unfixed code
 # drain() never returns, and a naive in-process call here would hang the
 # whole suite rather than fail this one test.
-engine_common.remove_tts_lock()  # clear the foreign lock the previous test left
+engine_common.remove_tts_lock(ROOT)  # clear the foreign lock the previous test left
 spool.clear()
 spool.enqueue("no engine at all", "macos-female", "Samantha")
 path = sorted(spool.queue_dir().glob("*.json"))[0]
@@ -220,7 +234,7 @@ try:
     timed_out = False
 except subprocess.TimeoutExpired:
     timed_out = True
-    engine_common.remove_tts_lock()  # the killed process never released it
+    engine_common.remove_tts_lock(ROOT)  # the killed process never released it
 
 check("drain does not livelock on an item with no engine field",
       not timed_out, "drain() never returned within 10s")
@@ -236,6 +250,16 @@ if not timed_out:
     check("the surviving item is the kokoro one",
           json.loads(sorted(spool.queue_dir().glob("*.json"))[0].read_text())["text"]
           == "kokoro only, must survive")
-    check("the lock is released afterwards", engine_common.lock_is_live() is False)
+    check("the lock is released afterwards", engine_common.lock_is_live(ROOT) is False)
+
+# --- separate messages queued together: only the newest is heard ---------------
+spool.clear()
+for word in ("stale one", "stale two", "the newest"):
+    spool.enqueue(word, "macos-female", "Samantha")
+    time.sleep(0.002)
+stderr, code = run_drain("macos")
+spoken = [line.split("[voiceover] ", 1)[1].strip()
+          for line in stderr.splitlines() if "[voiceover] " in line]
+check("the jump rule holds end to end", spoken == ["the newest"], spoken)
 
 report()

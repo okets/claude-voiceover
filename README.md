@@ -19,6 +19,7 @@ Since March 2026 Claude Code has native `/voice` dictation, but it is input-only
 ```
 /plugin marketplace add okets/claude-voiceover
 /plugin install voiceover@claude-voiceover
+/reload-plugins
 /voiceover:setup
 ```
 
@@ -43,8 +44,6 @@ Set with `/voiceover:level` — per machine, or per project.
 | verbose | 3 | Full play-by-play of every tool Claude uses, including subagent completions |
 | narrator | 4 | Claude's actual words read aloud as it works, with fluent speech between sentences (model loads once per turn, not per sentence) — tool chatter stays quiet, code blocks become a spoken "…code snippet…" cue |
 
-Upgrading to narrator's queued narration also needs one Claude Code restart to fully take effect (the hook that clears an abandoned turn's narration only registers after a restart). Until then, if you send a new message before Claude finishes speaking the last one, you'll hear the old turn's narration all the way through before the new answer starts — the opposite of what this feature is for. Restart once after upgrading and it goes away.
-
 ## Voices
 
 Set with `/voiceover:voice <name>`. Kokoro voices are local neural TTS; the default voices use macOS system speech and work instantly.
@@ -60,7 +59,15 @@ Set with `/voiceover:voice <name>`. Kokoro voices are local neural TTS; the defa
 | `echo` | American Male | `default-male` | macOS Daniel, zero setup |
 | `puck` | American Male | | |
 
-No voice picked? Each project gets a stable voice of its own, so you can tell your sessions apart by ear.
+No voice picked? Each project gets a stable voice of its own, so you can tell your sessions apart by ear. Pick one for just the current project with `/voiceover:voice <name> --project`.
+
+### Narrator, per project
+
+Each project has its own queue and voice, and may speak over one other project (two engines at most). A new message from Claude preempts the old one at the end of the current sentence; question alerts and permission requests always play whole. The engine is loaded only while a turn runs, so nothing sits in memory between turns. Headless (`claude -p`) runs are not narrated.
+
+### Narration starts as Claude writes
+
+At the narrator level, narration starts while Claude is still writing: a Claude Code mod speaks each sentence as it streams, through the same per-project queue and engine. It needs Claude Code 2.1.287 or newer, where mods are on by default. On a build without mods, the hooks narrate as before; Claude Code may log that it could not load `hooks/mod.json`, which is expected. After installing or updating, run `/reload-plugins` or restart Claude Code.
 
 ## The Narration output style
 
@@ -77,11 +84,26 @@ Narrator level tells you what Claude wrote; the bundled **Narration** output sty
 
 ## Requirements
 
+- **Claude Code 2.1.287 or newer** — for narration that starts as Claude writes (mods are on by default there). Older builds narrate through the hooks.
 - **python3** (3.9+) — that's it for macOS system voices and notification sounds.
 - **[uv](https://docs.astral.sh/uv/)** — only if you opt into Kokoro neural voices.
 - **~300MB model download** — only if you opt into Kokoro. One time, stored in `~/.kokoro-tts`, reused if you already have it (e.g. from smarter-claude).
 
 Nothing phones home. All speech is generated on your machine.
+
+## Install and update
+
+Install with the Quickstart commands above. The reload loads the hooks and the mod. If narration doesn't start, restart Claude Code.
+
+To update to a new version:
+
+1. `/plugin marketplace update claude-voiceover` refreshes the catalog.
+2. `/plugin update voiceover@claude-voiceover` updates the plugin. From a terminal, run `claude plugin update voiceover@claude-voiceover`; it applies after a restart.
+3. Restart every running Claude Code session, or run `/reload-plugins` in each one, so it loads the new hooks and mod. Coming from 1.3, a 1.3 session left running interrupts 1.4 engines, so restart them all.
+
+To give a project its own voice, run `/voiceover:voice <name> --project`.
+
+The narrator mod is code that runs inside Claude Code on your machine, with the same access Claude Code has, written by its publisher, not Anthropic. Install Voiceover only if you trust it, as with any plugin.
 
 ## Migrating from smarter-claude
 

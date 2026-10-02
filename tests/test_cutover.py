@@ -15,6 +15,7 @@ from voiceover import spool
 from voiceover.settings import set_setting
 
 set_setting("interaction_level", "narrator")
+set_setting("tts_engine", "kokoro")
 
 
 def run_hook(payload):
@@ -46,12 +47,15 @@ remaining = [json.loads(p.read_text())["text"]
              for p in sorted(spool.queue_dir().glob("*.json"))]
 check("only the typing session's items are dropped", remaining == ["theirs"], remaining)
 
-# --- playback is stopped, so the answer is heard immediately ------------
+# --- the session's sentence is stopped, the engine is NOT killed ---------------
 spool.clear()
-lock.write_text(json.dumps({"expiry": time.time() + 300, "pid": 999999}))
+project = spool.queue_dir().parent
+(project / "tts.lock").write_text(json.dumps({"expiry": time.time() + 300, "pid": os.getpid()}))
 run_hook({"cwd": str(REPO_ROOT), "session_id": "S1", "prompt": "new question"})
-check("the tts lock is cleared so a new drainer can start now",
-      not lock.exists(), "lock still present")
+check("a stop request is filed for the typing session", (project / "stop" / "S1.json").exists())
+check("the engine's lock is left alone: it stays loaded for the reply",
+      (project / "tts.lock").exists())
+(project / "tts.lock").unlink()
 
 # --- Ordering is a real invariant: clear must precede stop ---------------
 # Drive main() in-process so the two calls can be observed in order.
@@ -67,61 +71,38 @@ ups = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ups)          # __main__ guard keeps main() from running
 
 order = []
-real_clear, real_stop = voiceover.spool.clear, voiceover.speech.stop_speech
-real_ensure = voiceover.speech.ensure_drainer
+import voiceover.narrator
+real = (voiceover.spool.clear, voiceover.narrator.request_stop,
+        voiceover.narrator.prewarm, voiceover.speech.stop_speech)
 real_stdin = sys.stdin
 
 
-def record_clear(session=None):
-    order.append("clear")
-    return 0
-
-
-def record_stop():
-    order.append("stop")
-
-
-def record_ensure(cwd=None):
-    order.append("restart")
-    return True
-
-
-def run_main_recording(level):
+def run_main_recording(level, prompt="new question"):
     """Drive main() in-process at one level; return the calls it made, in order."""
     del order[:]
     set_setting("interaction_level", level)
-    voiceover.spool.clear = record_clear
-    voiceover.speech.stop_speech = record_stop
-    voiceover.speech.ensure_drainer = record_ensure
-    global_stdin = sys.stdin
+    voiceover.spool.clear = lambda session=None, cwd=None: order.append("clear") or 0
+    voiceover.narrator.request_stop = lambda cwd=None, session=None: order.append("stop")
+    voiceover.narrator.prewarm = lambda cwd=None, session=None, ttl=None: order.append("prewarm") or True
+    voiceover.speech.stop_speech = lambda: order.append("stop_speech")
     sys.stdin = io.StringIO(json.dumps(
-        {"cwd": str(REPO_ROOT), "session_id": "S1", "prompt": "new question"}))
+        {"cwd": str(REPO_ROOT), "session_id": "S1", "prompt": prompt}))
     try:
         ups.main()
     finally:
-        voiceover.spool.clear = real_clear
-        voiceover.speech.stop_speech = real_stop
-        voiceover.speech.ensure_drainer = real_ensure
-        sys.stdin = global_stdin
+        (voiceover.spool.clear, voiceover.narrator.request_stop,
+         voiceover.narrator.prewarm, voiceover.speech.stop_speech) = real
+        sys.stdin = real_stdin
     return list(order)
 
 
-calls = run_main_recording("narrator")
-check("the clear runs before playback is stopped",
-      calls[:2] == ["clear", "stop"], calls)
-
-# --- stop_speech() is global, so the drainer must be restarted ------------
-# It kills the shared drainer, which may be part-way through ANOTHER
-# session's items. Nothing else restarts it: their narration would sit until
-# this session's next hook happened to call ensure_drainer, or be dropped at
-# the age cap - and when it did restart, their stale backlog would be spoken
-# ahead of the answer to the message just sent.
-check("a drainer is restarted after the global stop",
-      calls == ["clear", "stop", "restart"], calls)
-
-calls = run_main_recording("silent")
-check("a silenced session neither stops nor restarts anything",
-      calls == ["clear"], calls)
+check("narrator: clear, then stop the sentence, then warm the engine",
+      run_main_recording("narrator") == ["clear", "stop", "prewarm"], order)
+check("narrator, a task notification: only warm the engine",
+      run_main_recording("narrator", "<task-notification>x</task-notification>") == ["prewarm"], order)
+check("concise: clear, then stop the one-shot speaker",
+      run_main_recording("concise") == ["clear", "stop_speech"], order)
+check("silent: only the clear", run_main_recording("silent") == ["clear"], order)
 set_setting("interaction_level", "narrator")
 
 # --- a queue stranded by a level change is cleared even at silent level ----

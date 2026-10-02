@@ -121,11 +121,25 @@ check("the session id is recorded", item["session"] == "S1", item)
 spool.clear()
 check("no drainer is spawned for an empty spool", speech.ensure_drainer() is False)
 speech.enqueue_speech("something to say", full=True)
-speech.lock_path().write_text(json.dumps({"expiry": time.time() + 60, "pid": 1}))
+speech.project_lock_path().write_text(json.dumps({"expiry": time.time() + 60, "pid": 1}))
 check("no drainer is spawned while one already holds the lock",
       speech.ensure_drainer() is False)
-speech.lock_path().unlink()
+speech.project_lock_path().unlink()
 check("a drainer is spawned for a non-empty spool with a free lock",
       speech.ensure_drainer() is True)
+
+# --- the drainer is started for THIS project ----------------------------------
+spawned = []
+real_spawn = speech._spawn_detached
+speech._spawn_detached = lambda command: spawned.append(command) or True
+try:
+    spool.clear()
+    speech.enqueue_speech("project scoped", full=True)
+    (spool.queue_dir().parent / "spawned.json").unlink(missing_ok=True)
+    speech.ensure_drainer()
+finally:
+    speech._spawn_detached = real_spawn
+check("ensure_drainer drains this project's directory",
+      spawned and spawned[0][-2:] == ["--drain", str(spool.queue_dir().parent)], spawned)
 
 report()

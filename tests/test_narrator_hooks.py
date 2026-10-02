@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _harness import check, isolate, report, REPO_ROOT
 
 data_dir = isolate()
-from voiceover import spool
+from voiceover import lease, narrator, spool
 from voiceover.settings import set_setting
 
 set_setting("interaction_level", "narrator")
@@ -75,7 +75,7 @@ path = write_transcript("locked.jsonl", [USER])
 commit_offset(str(path), path.stat().st_size)
 with open(path, "a") as handle:
     handle.write(json.dumps(assistant("This must not be lost.")) + "\n")
-(Path(os.environ["VOICEOVER_DATA_DIR"]) / "tts.lock").write_text(
+(spool.queue_dir().parent / "tts.lock").write_text(
     json.dumps({"expiry": time.time() + 60, "pid": 1}))
 proc = run_hook("post_tool_use", {"cwd": str(REPO_ROOT), "transcript_path": str(path),
                                   "tool_name": "Bash", "tool_input": {},
@@ -90,7 +90,7 @@ proc = run_hook("post_tool_use", {"cwd": str(REPO_ROOT), "transcript_path": str(
                                   "session_id": "S1"})
 check("the same prose is not queued a second time",
       queued_texts() == ["This must not be lost."], queued_texts())
-(Path(os.environ["VOICEOVER_DATA_DIR"]) / "tts.lock").unlink()
+(spool.queue_dir().parent / "tts.lock").unlink()
 
 # --- pre_tool_use queues too ----------------------------------------------
 spool.clear()
@@ -146,7 +146,7 @@ item = json.loads(sorted(spool.queue_dir().glob("*.json"))[0].read_text())
 check("the hook records its session id", item["session"] == "SESSION-XYZ", item)
 
 # --- the dialog branch announces and marks --------------------------------
-dialog_marker = Path(os.environ["VOICEOVER_DATA_DIR"]) / "dialog_alert.json"
+dialog_marker = Path(os.environ["VOICEOVER_DATA_DIR"]) / "dialog_alert" / "S1"
 dialog_marker.unlink(missing_ok=True)
 spool.clear()
 path = write_transcript("dialog.jsonl", [USER])
@@ -201,7 +201,7 @@ check("notification queued its permission text", len(queued_texts()) == 1, queue
 
 # ... and stays quiet when a fresh dialog marker says it was just announced
 spool.clear()
-dialog_marker.write_text(json.dumps({"ts": time.time()}))
+narrator.write_dialog_marker("S1")
 proc = run_hook("notification", {
     "cwd": str(REPO_ROOT), "transcript_path": str(path),
     "message": "Claude needs your permission to use Bash",
@@ -210,5 +210,229 @@ check("notification (echo-suppressed) exits 0", proc.returncode == 0, proc.stder
 check("notification queues nothing when the dialog was just announced",
       queued_texts() == [], queued_texts())
 dialog_marker.unlink(missing_ok=True)
+
+def run_hook_env(name, payload, **env):
+    """run_hook with extra environment variables for the hook process."""
+    return subprocess.run(
+        [sys.executable, str(REPO_ROOT / "hooks" / (name + ".py"))],
+        input=json.dumps(payload), capture_output=True, text=True,
+        env=dict(os.environ, **env))
+
+
+def lease_held(session="S1", cwd=None):
+    return (spool.queue_dir(cwd).parent / "leases" / (session + ".json")).exists()
+
+
+def pending_items():
+    return [json.loads(p.read_text()) for p in sorted(spool.queue_dir().glob("*.json"))]
+
+
+# --- the lease table, and an answered alert is retired (Review Focus 5) -----------------
+spool.clear()
+path = write_transcript("lease.jsonl", [USER])
+commit_offset(str(path), path.stat().st_size)
+base = {"cwd": str(REPO_ROOT), "transcript_path": str(path), "session_id": "S1"}
+run_hook("pre_tool_use", dict(base, tool_name="Bash", tool_input={}))
+check("a tool call holds the project's engine", lease_held())
+run_hook("pre_tool_use", dict(base, tool_name="AskUserQuestion",
+                              tool_input={"questions": [{"question": "Which?", "options": []}]}))
+check("a question dialog releases it while the user decides", not lease_held())
+items = pending_items()
+check("the dialog alert is queued sticky", items and items[-1]["sticky"] is True, items)
+check("and tagged as a dialog", items and items[-1]["source"] == "dialog", items)
+run_hook("post_tool_use", dict(base, tool_name="AskUserQuestion", tool_input={}))
+check("the answer takes it back", lease_held())
+check("an alert answered before it played is retired",
+      not any(i["sticky"] for i in pending_items()), pending_items())
+run_hook("stop", base)
+check("the turn's end lets it go", not lease_held())
+
+# --- prose items carry their source and when they appeared ---------------------------
+spool.clear()
+with open(path, "a") as handle:
+    entry = assistant("Stamped prose.")
+    entry["timestamp"] = "2026-10-02T12:00:00.000Z"
+    handle.write(json.dumps(entry) + "\n")
+run_hook("pre_tool_use", dict(base, tool_name="Bash", tool_input={}))
+items = pending_items()
+check("a mid-turn item names the hook that queued it",
+      items and items[0]["source"] == "pre_tool_use", items)
+check("and when its prose appeared", items and isinstance(items[0]["shown"], float), items)
+lease.release(None, "S1")
+
+# --- the pin survives a cd (Review Focus 2) -------------------------------------------
+from _harness import temp_dir
+elsewhere = temp_dir("vo-elsewhere-")
+(elsewhere / ".git").mkdir()
+spool.clear()
+run_hook("user_prompt_submit", {"cwd": str(REPO_ROOT), "session_id": "S1", "prompt": "go"})
+run_hook("pre_tool_use", dict(base, cwd=str(elsewhere), tool_name="Bash", tool_input={}))
+check("a tool call after a cd still holds the turn's own project", lease_held())
+check("and holds nothing in the directory it moved to", not lease_held(cwd=str(elsewhere)))
+run_hook("session_end", {"cwd": str(elsewhere), "session_id": "S1", "reason": "other"})
+check("SessionEnd releases the lease where it was held", not lease_held())
+check("and drops the pin", narrator.pinned_cwd("S1", None) is None)
+
+# --- a background task's notification does not cut over (Review Focus 3) --------------
+spool.clear()
+spool.enqueue("Still talking.", "kokoro", "bf_emma", session="S1")
+stop_dir = spool.queue_dir().parent / "stop"
+for old in stop_dir.glob("*.json"):
+    old.unlink()
+run_hook("user_prompt_submit", {"cwd": str(REPO_ROOT), "session_id": "S1",
+                                "prompt": "<task-notification>build finished</task-notification>"})
+check("a task notification leaves the queue alone", spool.pending_count() == 1)
+check("and requests no stop", not (stop_dir / "S1.json").exists())
+check("but warms the engine for its turn", lease_held())
+lease.release(None, "S1")
+run_hook("user_prompt_submit", {"cwd": str(REPO_ROOT), "prompt": "no session id"})
+check("a prompt without a session id stops no one", not (stop_dir / "_all.json").exists())
+
+# --- permission requests are sticky; the dialog echo marker is per session --------------
+spool.clear()
+dialog_marker.unlink(missing_ok=True)   # the lease-table dialog above marked S1
+narrator.write_dialog_marker("OTHER")
+path = write_transcript("perm.jsonl", [USER])
+commit_offset(str(path), path.stat().st_size)
+run_hook("notification", {"cwd": str(REPO_ROOT), "transcript_path": str(path),
+                          "message": "Claude needs your permission to use Bash",
+                          "session_id": "S1"})
+items = pending_items()
+check("another session's dialog does not silence this session's permission request",
+      len(items) == 1, items)
+check("the permission request is sticky", items and items[0]["sticky"] is True, items)
+
+# --- headless runs are not narrated -----------------------------------------------------
+spool.clear()
+path = write_transcript("headless.jsonl", [USER])
+commit_offset(str(path), path.stat().st_size)
+with open(path, "a") as handle:
+    handle.write(json.dumps(assistant("Nobody is listening.")) + "\n")
+headless = {"cwd": str(REPO_ROOT), "transcript_path": str(path), "session_id": "H1"}
+run_hook_env("user_prompt_submit", dict(headless, prompt="go"), CLAUDE_CODE_ENTRYPOINT="sdk-cli")
+run_hook_env("pre_tool_use", dict(headless, tool_name="Bash", tool_input={}),
+             CLAUDE_CODE_ENTRYPOINT="sdk-cli")
+check("a headless run queues nothing", spool.pending_count() == 0, pending_items())
+check("and holds no engine", not lease_held("H1"))
+
+# --- a turn's end releases the engine at any level ----------------------------------------
+lease.hold(None, "S1")
+set_setting("interaction_level", "concise")
+run_hook("stop", {"cwd": str(REPO_ROOT), "transcript_path": str(path), "session_id": "S1"})
+set_setting("interaction_level", "narrator")
+check("a stop after narration was turned off still releases the engine", not lease_held())
+
+# --- every prompt re-pins its session, at any level ---------------------------------------
+spool.clear()
+set_setting("interaction_level", "silent", scope="project", cwd=str(elsewhere))
+run_hook("user_prompt_submit", {"cwd": str(REPO_ROOT), "session_id": "S1", "prompt": "go"})
+run_hook("user_prompt_submit", {"cwd": str(elsewhere), "session_id": "S1", "prompt": "go"})
+check("a prompt from another project re-pins the session, at any level",
+      narrator.pinned_cwd("S1", None) == str(elsewhere), narrator.pinned_cwd("S1", None))
+path = write_transcript("repin.jsonl", [USER])
+commit_offset(str(path), path.stat().st_size)
+with open(path, "a") as handle:
+    handle.write(json.dumps(assistant("Nobody asked.")) + "\n")
+run_hook("pre_tool_use", {"cwd": str(elsewhere), "transcript_path": str(path),
+                          "session_id": "S1", "tool_name": "Bash", "tool_input": {}})
+check("a silent project's session is not narrated by a stale pin",
+      spool.pending_count() == 0 and spool.pending_count(cwd=str(elsewhere)) == 0)
+(elsewhere / ".claude" / "voiceover.json").unlink()
+narrator.unpin("S1")
+lease.release(None, "S1")
+
+# --- re-pinning releases the lease an interrupted turn left behind --------------------------
+run_hook("user_prompt_submit", {"cwd": str(REPO_ROOT), "session_id": "S1", "prompt": "go"})
+check("a prompt warms the engine in its project", lease_held())
+run_hook("user_prompt_submit", {"cwd": str(elsewhere), "session_id": "S1", "prompt": "go"})
+check("re-pinning releases the lease an interrupted turn left behind", not lease_held())
+narrator.unpin("S1")
+lease.release(None, "S1")
+lease.release(str(elsewhere), "S1")
+
+# --- the user's prompt stops the old turn even after the session moved project -------------
+other = temp_dir("vo-moved-")
+(other / ".git").mkdir()
+spool.clear()
+run_hook("user_prompt_submit", {"cwd": str(REPO_ROOT), "session_id": "S1", "prompt": "go"})
+spool.enqueue("Old turn, still talking.", "kokoro", "bf_emma", session="S1", cwd=str(REPO_ROOT))
+check("a cd within the same project is no move",
+      narrator.repin("S1", str(REPO_ROOT / "tests")) is None)
+narrator.pin_cwd("S1", str(REPO_ROOT))
+spool.enqueue("Old turn, still talking.", "kokoro", "bf_emma", session="S1", cwd=str(REPO_ROOT))
+old_stop = spool.queue_dir(cwd=str(REPO_ROOT)).parent / "stop" / "S1.json"
+if old_stop.exists():
+    old_stop.unlink()
+run_hook("user_prompt_submit", {"cwd": str(other), "session_id": "S1", "prompt": "new question"})
+check("a prompt from another project drops the old project's pending items",
+      spool.pending_count(cwd=str(REPO_ROOT)) == 0, spool.pending_count(cwd=str(REPO_ROOT)))
+check("and files the stop request in the old project too", old_stop.exists())
+narrator.unpin("S1")
+lease.release(None, "S1")
+lease.release(str(other), "S1")
+
+# --- a narrator-level stop always lets the engine go ---------------------------------------
+lease.hold(None, "S1")
+run_hook("stop", {"cwd": str(REPO_ROOT), "session_id": "S1"})
+check("a stop with no transcript path still releases the engine", not lease_held())
+lease.hold(None, "S1")
+run_hook("stop", {"cwd": str(REPO_ROOT), "transcript_path": str(transcripts / "missing.jsonl"),
+                  "session_id": "S1"})
+check("a stop whose transcript cannot be read still releases the engine", not lease_held())
+
+# --- tool hooks never hold an engine for a project that does not narrate ----------------------
+set_setting("tts_enabled", False)
+for hook_name in ("pre_tool_use", "post_tool_use"):
+    run_hook(hook_name, dict(base, tool_name="Bash", tool_input={}, tool_response={}))
+    check(hook_name + " holds no lease while TTS is off", not lease_held())
+set_setting("tts_enabled", True)
+
+# --- with the mod narrating this session, the classic narrator paths stand down ------
+spool.clear()
+narrator.mark_mod_session("MOD")
+path = write_transcript("mod.jsonl", [USER])
+commit_offset(str(path), path.stat().st_size)
+with open(path, "a") as handle:
+    handle.write(json.dumps(assistant("The mod speaks this, not the hook.")) + "\n")
+mod = {"cwd": str(REPO_ROOT), "transcript_path": str(path), "session_id": "MOD"}
+for hook in ("pre_tool_use", "post_tool_use"):
+    run_hook(hook, dict(mod, tool_name="Bash", tool_input={}))
+run_hook("stop", mod)
+check("no classic narrator path queues text for a mod session", queued_texts() == [], queued_texts())
+check("nor holds a lease for it", not lease_held("MOD"))
+from voiceover.prose import peek_new_prose
+check("the cursor moved past what the mod spoke", peek_new_prose(str(path))[0] is None)
+stop_dir = spool.queue_dir().parent / "stop"
+(stop_dir / "MOD.json").unlink(missing_ok=True)
+run_hook("user_prompt_submit", {"cwd": str(REPO_ROOT), "session_id": "MOD", "prompt": "go"})
+check("the prompt hook leaves the cutover to the mod", not (stop_dir / "MOD.json").exists())
+check("and leaves the pin to it too", narrator.pinned_cwd("MOD", None) is None)
+narrator.unmark_mod_session("MOD")
+check("unmarking ends the stand-down", not narrator.mod_active("MOD"))
+
+# --- an answered alert is retired in a mod session too; the chime never blocks ------------
+spool.clear()
+narrator.mark_mod_session("S7")
+spool.enqueue("Which approach?", "kokoro", "bf_emma", session="S7", sticky=True)
+check("the mod session's alert is pending", any(i["sticky"] for i in pending_items()), pending_items())
+run_hook("post_tool_use", {"cwd": str(REPO_ROOT), "session_id": "S7", "tool_name": "Bash", "tool_input": {}})
+check("a finished tool retires the alert in a mod session", not any(i["sticky"] for i in pending_items()), pending_items())
+narrator.unmark_mod_session("S7")
+
+import voiceover.speech as speech
+played, spawned = [], []
+saved = (speech.play_audio_file, speech._spawn_detached, os.environ.get("VOICEOVER_DRY_RUN"))
+speech.play_audio_file = lambda *a, **k: played.append(a) or True
+speech._spawn_detached = lambda command: spawned.append(command) or True
+try:
+    del os.environ["VOICEOVER_DRY_RUN"]
+    narrator.turn_end(str(REPO_ROOT), "S8", spoken=False)
+finally:
+    speech.play_audio_file, speech._spawn_detached = saved[0], saved[1]
+    if saved[2] is not None:
+        os.environ["VOICEOVER_DRY_RUN"] = saved[2]
+check("the turn-end chime does not wait on the player", played == [], played)
+check("it starts the player detached", len(spawned) == 1, spawned)
+check("and runs audio_player.py", spawned and spawned[0][1].endswith("audio_player.py"), spawned)
 
 report()

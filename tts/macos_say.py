@@ -17,7 +17,7 @@ import os
 import subprocess
 import sys
 
-from engine_common import remove_tts_lock, try_claim_lock, update_lock_expiry
+from engine_common import ProcessPlayback, data_dir, remove_tts_lock, try_claim_lock
 
 DRY_RUN = bool(os.environ.get("VOICEOVER_DRY_RUN"))
 DEFAULT_VOICE = "Samantha"
@@ -44,12 +44,12 @@ def say_once(voice, text) -> bool:
 
 def speak(voice, text):
     """Single-utterance path: claim the lock, speak, release it."""
-    if not try_claim_lock(estimate_duration(text)):
+    if not try_claim_lock(data_dir(), estimate_duration(text)):
         return True  # another narration is playing - skip quietly
     try:
         return say_once(voice, text)
     finally:
-        remove_tts_lock()
+        remove_tts_lock(data_dir())
 
 
 # --- CLI ---------------------------------------------------------------------
@@ -69,24 +69,41 @@ def parse_args(argv):
     return voice, " ".join(text_parts).strip()
 
 
+class SaySpeaker:
+    """Plays each sentence with `say --voice=<Name>`, the text on stdin.
+
+    The --voice= spelling is deliberate: the one-shot interrupt matches
+    `say -v <Name>`, and must never reach a drainer's sentence.
+    """
+
+    def prefetch(self, sentence, voice):
+        pass  # `say` starts speaking within ~0.1s: nothing to win
+
+    def begin(self, sentence, voice, upcoming=None):
+        process = subprocess.Popen(["say", "--voice=" + (voice or DEFAULT_VOICE)],
+                                   stdin=subprocess.PIPE, text=True)
+        try:
+            process.stdin.write(sentence)
+            process.stdin.close()
+        except OSError:
+            pass
+        return ProcessPlayback(process, deadline=estimate_duration(sentence) + 10)
+
+
 def main():
     if "--drain" in sys.argv[1:]:
-        from engine_common import drain
+        from engine_common import DryRunSpeaker, drain, drain_root
 
-        def speak_one(item):
-            text = item["text"]
-            voice = item.get("voice") or DEFAULT_VOICE
-            if DRY_RUN:
-                print("[voiceover] " + text, file=sys.stderr)
-                return True
-            if sys.platform != "darwin":
-                return False
-            # Extend the lock to this item's real length before speaking, so a
-            # long utterance cannot let the lock expire under a sibling engine.
-            update_lock_expiry(estimate_duration(text) + 5.0)
-            return say_once(voice, text)
-
-        return drain(speak_one, {"macos-female", "macos-male"})
+        root = drain_root(sys.argv)
+        if root is None:
+            print("Usage: macos_say.py --drain <project dir>", file=sys.stderr)
+            return 0
+        engines = {"macos-female", "macos-male"}
+        if DRY_RUN:
+            return drain(root, DryRunSpeaker, engines)
+        if sys.platform != "darwin":
+            return 0
+        return drain(root, SaySpeaker, engines)
 
     voice, text = parse_args(sys.argv[1:])
     if not text:

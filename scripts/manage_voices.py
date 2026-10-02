@@ -141,7 +141,7 @@ def speak_sample(engine, voice, text):
     if engine == "kokoro":
         command = [
             "uv", "run", "--project", str(PLUGIN_ROOT / "tts"),
-            str(PLUGIN_ROOT / "tts" / "kokoro_voice.py"), voice, text,
+            str(PLUGIN_ROOT / "tts" / "kokoro_voice.py"), "--voice", voice, text,
         ]
     elif engine in MACOS_SAY_VOICES:
         command = [

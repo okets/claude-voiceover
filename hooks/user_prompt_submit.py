@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """UserPromptSubmit hook: cut narration over to the new message.
 
-When the user types, the previous turn is over from their point of view.
-Anything still queued from it is dropped and playback is stopped, so the
-next thing heard is the answer to the question just asked rather than the
-tail of the last one. This is the ONLY place narrator mode interrupts, and
-it is the user who triggers it - Claude's own narration never cuts itself
-off. Never blocks, never prints to stdout, always exits 0.
+When the user types, the previous turn is over from their point of view. At
+the narrator level the user's own prompt drops the session's queued text,
+stops its sentence and pre-warms the engine for the reply; a background
+task's notification only pre-warms, and headless runs are left alone. Other
+levels clear the session's queue and stop the one-shot speaker. This is the
+ONLY place narrator mode interrupts, and it is the user who triggers it -
+Claude's own narration never cuts itself off. Never blocks, never prints to
+stdout, always exits 0.
 """
 
 import json
@@ -20,37 +22,44 @@ sys.path.insert(0, str(PLUGIN_ROOT))
 def main():
     payload = json.load(sys.stdin)
 
+    from voiceover import lease, narrator
     from voiceover.debuglog import log as _log
     from voiceover.settings import get_interaction_level
-    from voiceover.speech import ensure_drainer, stop_speech
     from voiceover.spool import clear
 
     cwd = payload.get("cwd")
     session = payload.get("session_id")
-
-    # Clear BEFORE stopping: the other order leaves a window in which the
-    # drainer claims one more item and speaks it after the cut-over. This
-    # runs at EVERY level, including silent - a queue stranded by a level
-    # change would otherwise be drained later and speak an abandoned turn.
-    dropped = 0
-    if session:
-        dropped = clear(session=session)
-    # With no session id we cannot tell which items are ours, and an
-    # unscoped clear would wipe every other session's pending narration.
-    _log("cutover", "dropped=%d pending items on a new prompt" % dropped, cwd)
-
-    if get_interaction_level(cwd) == "silent":
-        # stop_speech() is global, not per-session: a silenced session must
-        # never be able to kill another session's live playback.
+    if narrator.mod_owns_prompt(session, cwd):
+        # The mod narrates this session: it pins the turn, cuts over and warms
+        # the engine itself. Only the other levels' clear is left to do here.
         return
-    stop_speech()
-    # ...and because it is global, it may have killed a drainer part-way
-    # through ANOTHER session's items. Nothing else would restart it: their
-    # narration would sit until one of this session's later hooks happened to
-    # call ensure_drainer, or be dropped at the age cap - and whenever it did
-    # restart, their stale backlog would be spoken ahead of the answer to the
-    # message just sent. This turns an unbounded stall into a sub-second gap.
-    ensure_drainer(cwd)
+    # This turn's project, whatever it cds to; the old one when it moved.
+    previous = narrator.repin(session, cwd)
+    level = get_interaction_level(cwd)
+
+    if level == "narrator":
+        if narrator.headless():
+            return
+        if narrator.is_users_prompt(payload.get("prompt")):
+            if previous:
+                narrator.abandon(previous, session)  # the old turn, in its own project
+            narrator.cutover(cwd, session, ttl=lease.FALLBACK_LEASE_TTL)
+        elif narrator.narrates(cwd):
+            # A background task's turn: warm the engine, cut nothing off.
+            narrator.prewarm(cwd, session, ttl=lease.FALLBACK_LEASE_TTL)
+        return
+
+    # Clear at every other level, silent included: a queue stranded by a level
+    # change would otherwise be drained later and speak an abandoned turn.
+    # With no session id we cannot tell which items are ours.
+    dropped = clear(session=session, cwd=cwd) if session else 0
+    if previous and session:
+        clear(session=session, cwd=previous)  # the old turn's queue, in its own project
+    _log("cutover", "dropped=%d pending items on a new prompt" % dropped, cwd)
+    if level == "silent":
+        return
+    from voiceover.speech import stop_speech
+    stop_speech()  # the one-shot speaker only: process_utils scopes it
 
 
 if __name__ == "__main__":

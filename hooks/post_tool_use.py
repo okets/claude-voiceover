@@ -21,18 +21,35 @@ def main():
     from voiceover.speech import speak
     from voiceover.templates import post_tool_announcement
 
-    if get_interaction_level(payload.get("cwd")) == "narrator":
+    from voiceover import narrator
+
+    session = payload.get("session_id")
+    cwd = narrator.pinned_cwd(session, payload.get("cwd"))
+    if get_interaction_level(cwd) == "narrator":
         # No '- done' chatter. Prose written just before this tool call
-        # (which pre-tool can miss by a flush race) is queued here instead,
-        # at the tool's completion.
-        from voiceover.prose import commit_offset, peek_new_prose
+        # (which pre-tool can miss by a flush race) is queued here instead.
+        if narrator.headless():
+            return
+        from voiceover import spool
+
+        # A tool finished: whatever this session's pending alert or
+        # permission request asked has been answered - do not read it out
+        # (the mod's sessions too: retiring is not narrating).
+        spool.clear_sticky(session, cwd=cwd)
+        if narrator.stands_down(session, payload.get("transcript_path", "")):
+            return  # the mod speaks this session's text as it streams
+        from voiceover import lease
+        from voiceover.prose import commit_offset, peek_new_prose_stamped
         from voiceover.speech import ensure_drainer, enqueue_speech
 
+        if payload.get("tool_name") in narrator.DIALOG_TOOLS:
+            narrator.dialog_answered(cwd, session, ttl=lease.FALLBACK_LEASE_TTL)
+        elif narrator.narrates(cwd):  # TTS off or no engine: never hold one
+            lease.hold(cwd, session, ttl=lease.FALLBACK_LEASE_TTL)
         transcript = payload.get("transcript_path", "")
-        cwd = payload.get("cwd")
-        text, offset = peek_new_prose(transcript)
-        if text and enqueue_speech(text, cwd=cwd, full=True,
-                                   session=payload.get("session_id")):
+        text, offset, shown = peek_new_prose_stamped(transcript)
+        if text and enqueue_speech(text, cwd=cwd, full=True, session=session,
+                                   shown=shown, source="post_tool_use"):
             # Queued means it WILL be spoken, so the cursor can advance now.
             commit_offset(transcript, offset)
         ensure_drainer(cwd)
@@ -48,7 +65,7 @@ def main():
 
     text = post_tool_announcement(tool_name, tool_input, tool_response)
     if text:
-        speak(text, min_level="verbose", cwd=payload.get("cwd"))
+        speak(text, min_level="verbose", cwd=cwd)
 
 
 if __name__ == "__main__":

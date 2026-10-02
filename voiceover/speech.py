@@ -3,7 +3,7 @@
 speak() gates on settings, truncates, honors the TTS lock, then spawns the
 resolved engine as a DETACHED subprocess (never waits):
 
-    kokoro       -> uv run --project <plugin>/tts <plugin>/tts/kokoro_voice.py <voice> <text>
+    kokoro       -> uv run --project <plugin>/tts <plugin>/tts/kokoro_voice.py --voice <voice> --stream <text>
     macos-female -> python3 <plugin>/tts/macos_say.py --voice Samantha <text>
     macos-male   -> python3 <plugin>/tts/macos_say.py --voice Daniel <text>
     none         -> no-op
@@ -19,7 +19,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import process_utils, spool
+from . import lease, process_utils, spool
 from .audio_player import play_audio_file
 from .settings import (
     data_dir,
@@ -31,6 +31,7 @@ from .settings import (
 )
 from .templates import truncate_to_words
 from .debuglog import log as _log
+from .projects import project_dir, session_slug
 
 _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 _TTS_DIR = _PLUGIN_ROOT / "tts"
@@ -38,6 +39,7 @@ _SOUNDS_DIR = Path(__file__).resolve().parent / "sounds"
 
 _LOCK_FILE_NAME = "tts.lock"
 _FULL_TEXT_CAP = 6000
+_SPAWN_BACKOFF_SECONDS = 3.0
 
 _MACOS_VOICES = {"macos-female": "Samantha", "macos-male": "Daniel"}
 
@@ -94,7 +96,8 @@ def speak(text, min_level="concise", cwd=None, interrupt=False, full=False) -> b
         return False
 
 
-def enqueue_speech(text, min_level="concise", cwd=None, full=False, session=None) -> bool:
+def enqueue_speech(text, min_level="concise", cwd=None, full=False, session=None,
+                   utterance=None, sticky=False, shown=None, source=None) -> bool:
     """Queue text to be spoken. True when it was queued.
 
     The queued counterpart of speak(): identical gating and identical
@@ -119,9 +122,11 @@ def enqueue_speech(text, min_level="concise", cwd=None, full=False, session=None
         # macOS engines take a `say -v <Name>` voice, and get_voice() only
         # ever returns a kokoro id.
         voice = _MACOS_VOICES.get(engine) or get_voice(cwd)
-        queued = spool.enqueue(message, engine, voice, session=session)
+        queued = spool.enqueue(message, engine, voice, session=session,
+                               utterance=utterance, sticky=sticky, shown=shown,
+                               source=source, cwd=cwd)
         _log("queue", "queued=%s pending=%d chars=%d :: %.60s" % (
-            queued, spool.pending_count(), len(message),
+            queued, spool.pending_count(cwd), len(message),
             message.replace("\n", " ")), cwd)
         return queued
     except Exception:
@@ -129,34 +134,91 @@ def enqueue_speech(text, min_level="concise", cwd=None, full=False, session=None
 
 
 def ensure_drainer(cwd=None) -> bool:
-    """Start an engine draining the spool unless one is already speaking.
+    """Start the project's engine unless it is already up or starting.
 
-    Called unconditionally by every narrator hook path, so a spool left
-    behind by a crashed engine is picked up by the next hook rather than
-    sitting there. Racing hooks are harmless: the engine's own atomic lock
-    claim admits exactly one drainer.
+    Starts it when the queue has items OR a session holds a lease (the
+    pre-warm). Called unconditionally by every narrator path, so a spool
+    left behind by a crashed engine is picked up by the next hook. A lock
+    whose engine has died is treated as free. After a spawn it backs off for
+    a few seconds - until the new engine claims its lock and clears
+    spawned.json (tts/engine_common.py) - so a burst of calls during uv's
+    start-up spawns one engine, not one per call. Racing callers are
+    harmless: the engine's atomic lock claim admits exactly one drainer per
+    project.
     """
     try:
-        if spool.pending_count() == 0:
+        spool.remove_legacy_queue()
+        if spool.pending_count(cwd) == 0 and not lease.any_live(cwd):
             return False
-        if lock_is_live():
-            return False  # a drainer is already working through the queue
+        lock = project_lock_path(cwd)
+        if lock_is_live(lock) and process_utils.lock_owner_is_running(lock):
+            return False  # this project's drainer is already working
+        if _recently_spawned(cwd):
+            return False  # one is starting up
         engine = resolve_engine(cwd)
-        if engine == "kokoro":
-            command = [
-                "uv", "run", "--project", str(_TTS_DIR),
-                str(_TTS_DIR / "kokoro_voice.py"), "--drain",
-            ]
-        elif engine in _MACOS_VOICES:
-            command = ["python3", str(_TTS_DIR / "macos_say.py"), "--drain"]
-        else:
+        command = _drain_command(engine, project_dir(cwd))
+        if command is None:
             return False
+        _mark_spawned(cwd)
         spawned = _spawn_detached(command)
         _log("queue", "drainer spawned=%s engine=%s pending=%d" % (
-            spawned, engine, spool.pending_count()), cwd)
+            spawned, engine, spool.pending_count(cwd)), cwd)
         return spawned
     except Exception:
         return False
+
+
+def _recently_spawned(cwd) -> bool:
+    try:
+        ts = float(json.loads((project_dir(cwd) / "spawned.json").read_text()).get("ts"))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+    return time.time() - ts < _SPAWN_BACKOFF_SECONDS
+
+
+def _mark_spawned(cwd) -> None:
+    try:
+        (project_dir(cwd) / "spawned.json").write_text(json.dumps({"ts": time.time()}))
+    except OSError:
+        pass
+
+
+def prewarm(cwd=None, session=None, ttl=lease.LEASE_TTL) -> bool:
+    """Hold the project's engine for session's turn and start it now, so the
+    model has loaded by the time the first sentence arrives (first text came
+    at least 1.84s after the prompt in 169 measured turns; a cold engine
+    needs about 1.8s including its warm-up)."""
+    if not lease.hold(cwd, session, ttl=ttl):
+        return False
+    return ensure_drainer(cwd)
+
+
+def request_stop(cwd=None, session=None) -> None:
+    """Ask the project's engine to stop session's sentence now (None: any).
+
+    The engine stops only items queued before this request, so a stale
+    request can never cut the reply that follows. One file per session -
+    <project>/stop/<slug or _all>.json, {"ts"} - written atomically.
+    """
+    try:
+        directory = project_dir(cwd) / "stop"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / ((session_slug(session) or "_all") + ".json")
+        temp = path.with_name("%s.%d.tmp" % (path.name, os.getpid()))
+        temp.write_text(json.dumps({"ts": time.time()}))
+        os.replace(str(temp), str(path))
+    except OSError:
+        pass
+
+
+def _drain_command(engine, root):
+    """The argv that drains root's spool with engine, or None for no engine."""
+    if engine == "kokoro":
+        return ["uv", "run", "--project", str(_TTS_DIR),
+                str(_TTS_DIR / "kokoro_voice.py"), "--drain", str(root)]
+    if engine in _MACOS_VOICES:
+        return ["python3", str(_TTS_DIR / "macos_say.py"), "--drain", str(root)]
+    return None
 
 
 def stop_speech() -> None:
@@ -169,8 +231,9 @@ def stop_speech() -> None:
     _clear_lock()
 
 
-def play_sound(name, cwd=None) -> None:
-    """Play a bundled mp3 ping ('notification' | 'decide'), if allowed."""
+def play_sound(name, cwd=None, wait=True) -> None:
+    """Play a bundled mp3 ping ('notification' | 'decide'), if allowed.
+    wait=False starts the player detached and returns at once."""
     try:
         if not get_setting("notification_sounds", cwd):
             return
@@ -180,8 +243,13 @@ def play_sound(name, cwd=None) -> None:
             _dry_print("sound: {}".format(name))
             return
         sound_file = _SOUNDS_DIR / "{}.mp3".format(name)
-        if sound_file.is_file():
+        if not sound_file.is_file():
+            return
+        if wait:
             play_audio_file(str(sound_file), timeout=10)
+        else:
+            _spawn_detached([sys.executable, str(Path(__file__).resolve().parent / "audio_player.py"),
+                             str(sound_file)])
     except Exception:
         pass
 
@@ -218,6 +286,11 @@ def _dispatch(message, engine, cwd) -> None:
 
 def _spawn_detached(command) -> bool:
     """Start the engine process without ever waiting on it."""
+    if os.environ.get("VOICEOVER_NO_SPAWN"):
+        # Set by the test harness: report success, start nothing, so no test
+        # races a real drainer for the queue it is inspecting (and, from
+        # Task 4 on, no test leaves an engine waiting on a lease).
+        return True
     try:
         kwargs = {
             "cwd": str(_TTS_DIR),
@@ -242,13 +315,19 @@ def _spawn_detached(command) -> bool:
 # Lock file (read/clear only - the engine subprocess creates and removes it)
 # ---------------------------------------------------------------------------
 
-def _lock_expiry():
-    """The lock's expiry timestamp, or None when there is no readable lock.
+def project_lock_path(cwd=None) -> Path:
+    """The project's drainer lock. The engine creates and removes it."""
+    return project_dir(cwd) / _LOCK_FILE_NAME
 
-    Lock content is JSON {"expiry", "pid"}; pre-1.1 locks were a bare float.
+
+def _lock_expiry(path=None):
+    """A lock's expiry timestamp, or None when there is no readable lock.
+
+    path defaults to the one-shot speaker's lock. Lock content is JSON
+    {"expiry", "pid"}; pre-1.1 locks were a bare float.
     """
     try:
-        raw = lock_path().read_text().strip()
+        raw = (path or lock_path()).read_text().strip()
     except OSError:
         return None
     try:
@@ -260,7 +339,7 @@ def _lock_expiry():
             return None
 
 
-def lock_is_live() -> bool:
+def lock_is_live(path=None) -> bool:
     """True while an unexpired lock exists. Read-only: never deletes anything.
 
     ensure_drainer() asks this from a HOOK, about a lock a live engine holds.
@@ -268,7 +347,7 @@ def lock_is_live() -> bool:
     lock it does not own - and it applies just as much from outside: a hook
     that deletes a working drainer's lock lets a rival start beside it.
     """
-    expiry = _lock_expiry()
+    expiry = _lock_expiry(path)
     return expiry is not None and time.time() < expiry
 
 

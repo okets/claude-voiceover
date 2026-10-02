@@ -61,4 +61,21 @@ speech, offset = prose.peek_new_prose(tp)
 check("second peek reads the new prose even with a full state file",
       speech == "Browser closed. Here is the recap.", speech)
 
+# --- the stamped peek says when the unread prose appeared ------------------------
+import datetime
+directory = temp_dir("vo-stamped-")
+stamped = make_transcript(directory, "stamped.jsonl", [assistant_line("Before.")])
+prose.commit_offset(str(stamped), stamped.stat().st_size)
+with open(stamped, "a", encoding="utf-8") as handle:
+    handle.write('{"type": "assistant", "timestamp": "2026-10-02T12:00:00.500Z", "message": '
+                 '{"role": "assistant", "content": [{"type": "text", "text": "First."}]}}\n')
+    handle.write('{"type": "assistant", "timestamp": "2026-10-02T12:00:03.000Z", "message": '
+                 '{"role": "assistant", "content": [{"type": "text", "text": "Second."}]}}\n')
+text, offset, shown = prose.peek_new_prose_stamped(str(stamped))
+expected = datetime.datetime(2026, 10, 2, 12, 0, 0, 500000, tzinfo=datetime.timezone.utc).timestamp()
+check("shown is when the first unread prose row was written",
+      shown is not None and abs(shown - expected) < 0.001, shown)
+check("the stamped peek reads the same text and offset as the plain one",
+      prose.peek_new_prose(str(stamped)) == (text, offset), (text, offset))
+
 report()

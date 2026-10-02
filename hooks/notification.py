@@ -43,38 +43,35 @@ def main():
     if payload.get("message") == IDLE_MESSAGE:
         return  # generic idle ping: nothing worth narrating
 
+    from voiceover import narrator
     from voiceover.settings import get_interaction_level
     from voiceover.speech import play_sound, speak
     from voiceover.templates import permission_request_message
 
-    cwd = payload.get("cwd")
+    session = payload.get("session_id")
+    cwd = narrator.pinned_cwd(session, payload.get("cwd"))
     level = get_interaction_level(cwd)
     if level == "silent":
         return
     if level == "quiet":
         play_sound("notification", cwd=cwd)
         return
-
-    from voiceover.settings import data_dir, get_interaction_level
-    if get_interaction_level(cwd) == "narrator":
-        # If the pre-tool hook announced a blocking dialog moments ago, this
-        # notification is its "needs permission" echo - speaking it would cut
-        # the real announcement mid-sentence. Marker-based: the message text
-        # is not reliably parseable for the tool name.
-        try:
-            import time as _time
-            with open(data_dir() / "dialog_alert.json") as handle:
-                if _time.time() - float(json.load(handle).get("ts", 0)) < 30:
-                    return
-        except Exception:
-            pass
+    if level == "narrator":
+        if narrator.headless():
+            return
+        # If this session's dialog was announced moments ago, this is its
+        # "needs permission" echo - speaking it would repeat the alert.
+        if narrator.dialog_recently_announced(session):
+            return
 
     text = permission_request_message(payload)
     if text:
         if level == "narrator":
             from voiceover.speech import ensure_drainer, enqueue_speech
-            enqueue_speech(text, min_level="concise", cwd=cwd,
-                           session=payload.get("session_id"))
+            # Sticky: the session is blocked on this answer, so no newer
+            # message may drop it or cut it short.
+            enqueue_speech(text, min_level="concise", cwd=cwd, session=session,
+                           sticky=True, source="notification")
             ensure_drainer(cwd)
         else:
             speak(text, min_level="concise", cwd=cwd, interrupt=True)
