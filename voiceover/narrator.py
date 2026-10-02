@@ -126,6 +126,11 @@ def mod_active(session) -> bool:
     return _read_record("mod_sessions", session) is not None
 
 
+def mod_owns_prompt(session, cwd) -> bool:
+    """True when the mod, not the classic prompt hook, handles this session's prompt."""
+    return mod_active(session) and get_interaction_level(pinned_cwd(session, cwd)) == "narrator"
+
+
 def mark_mod_session(session) -> None:
     """Record that the mod narrates session (hooks/mod_bridge.py, every call)."""
     _write_record("mod_sessions", session, "")

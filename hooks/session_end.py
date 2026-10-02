@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SessionEnd hook: let go of the session's engine lease and its pin.
+"""SessionEnd hook: let go of the session's lease, its pin and the mod mark.
 
 The fallback's only reliable end for a session: Stop does not fire when the
 user interrupts, and an exit would otherwise hold the lease until its TTL.
@@ -22,6 +22,7 @@ def main():
     session = payload.get("session_id")
     lease.release(narrator.pinned_cwd(session, payload.get("cwd")), session)
     narrator.unpin(session)
+    narrator.unmark_mod_session(session)
 
 
 if __name__ == "__main__":

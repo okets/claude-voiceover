@@ -8,7 +8,10 @@ here and in voiceover/narrator.py, shared with the classic hooks. Input:
 
     {"op": "start"} / {"op": "status"}   pin the session's project
     {"op": "end-session"}                release the lease, drop the mark
-    {"op": "prompt", "cutover": bool}    re-pin; the user's own prompt cuts over
+    {"op": "prompt", "cutover": bool}    narrator level only: re-pin; the user's own
+                                         prompt stops the old turn (in the old project
+                                         too, after a move) and cuts over. The classic
+                                         prompt hook keeps the other levels.
     {"op": "hold"}                       a turn or step began: hold, warm up
     {"op": "say", "utterance": str, "text": str, "shown": float}
     {"op": "dialog", "tool": str, "input": dict, "utterance": str | null}
@@ -64,8 +67,12 @@ def run(payload):
         elif kind in ("start", "status"):
             narrator.pin_cwd(session, cwd)
         elif kind == "prompt":
-            narrator.repin(session, cwd)
+            if not narrator.mod_owns_prompt(session, cwd):
+                continue  # below the narrator level the classic prompt hook re-pins and clears
+            previous = narrator.repin(session, cwd)
             if narrate and op.get("cutover"):
+                if previous:
+                    narrator.abandon(previous, session)  # the old turn, in its own project
                 narrator.cutover(cwd, session, warm=False)  # turn.start's hold warms
         elif kind == "turn-end":
             if narrate:

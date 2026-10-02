@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _harness import check, isolate, report, REPO_ROOT
+from _harness import check, isolate, report, temp_dir, REPO_ROOT
 
 data_dir = isolate()
 from voiceover import lease, narrator, spool
@@ -127,5 +127,41 @@ check("end-session releases its lease", not leased())
 proc = bridge(stdin="not json")
 check("a malformed batch still exits 0", proc.returncode == 0, proc.stderr)
 check("and still prints one JSON line", "narrate" in reply(proc), proc.stdout)
+
+# --- a prompt after a move to another project stops the old project's turn ------------------
+other = temp_dir("vo-moved-")
+(other / ".git").mkdir()
+
+
+def bridge_from(cwd, session, *ops):
+    return bridge(stdin=json.dumps({"session": session, "cwd": str(cwd), "ops": list(ops)}))
+
+
+spool.clear()
+bridge_from(REPO_ROOT, "S1", {"op": "start"})
+spool.enqueue("Old turn, still talking.", "kokoro", "bf_emma", session="S1", cwd=str(REPO_ROOT))
+old_stop = PROJECT / "stop" / "S1.json"
+if old_stop.exists():
+    old_stop.unlink()
+bridge_from(other, "S1", {"op": "prompt", "cutover": True})
+check("a prompt from another project drops the old project's pending items",
+      spool.pending_count(cwd=str(REPO_ROOT)) == 0, spool.pending_count(cwd=str(REPO_ROOT)))
+check("and files the stop request in the old project", old_stop.exists())
+
+# --- below the narrator level the classic prompt hook owns the pin --------------------------
+set_setting("interaction_level", "concise")
+bridge_from(REPO_ROOT, "S2", {"op": "start"})
+bridge_from(other, "S2", {"op": "prompt", "cutover": True})
+check("a prompt op below the narrator level leaves the pin alone",
+      narrator.pinned_cwd("S2", None) == str(REPO_ROOT), narrator.pinned_cwd("S2", None))
+set_setting("interaction_level", "narrator")
+
+# --- SessionEnd drops the mark even when the mod never says so -----------------------------
+narrator.mark_mod_session("S3")
+proc = subprocess.run(["bash", str(REPO_ROOT / "hooks" / "run.sh"), "session_end"],
+                      input=json.dumps({"session_id": "S3", "cwd": str(REPO_ROOT)}),
+                      capture_output=True, text=True, env=dict(os.environ))
+check("the session_end hook exits 0", proc.returncode == 0, proc.stderr)
+check("session end drops the mod mark", not narrator.mod_active("S3"))
 
 report()

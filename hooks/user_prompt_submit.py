@@ -29,8 +29,7 @@ def main():
 
     cwd = payload.get("cwd")
     session = payload.get("session_id")
-    if narrator.mod_active(session) and \
-            get_interaction_level(narrator.pinned_cwd(session, cwd)) == "narrator":
+    if narrator.mod_owns_prompt(session, cwd):
         # The mod narrates this session: it pins the turn, cuts over and warms
         # the engine itself. Only the other levels' clear is left to do here.
         return
