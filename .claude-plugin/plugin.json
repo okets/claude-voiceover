@@ -10,6 +10,7 @@
   "homepage": "https://github.com/okets/claude-voiceover",
   "repository": "https://github.com/okets/claude-voiceover",
   "license": "MIT",
+  "hooks": "./hooks/mod.json",
   "keywords": [
     "voice",
     "tts",

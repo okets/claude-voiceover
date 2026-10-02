@@ -11,6 +11,9 @@ the plugin outright:
 The plugin shipped that way from 1.0.0 through 1.3.0. Nothing in the Python
 suite could see it, because the defect is in the manifest rather than the
 code - hence this file.
+
+An ADDITIONAL hooks file may be declared (the mod's `hooks/mod.json`); naming
+the standard one is the 1.3.0 defect.
 """
 
 import json
@@ -26,10 +29,16 @@ manifest_path = REPO_ROOT / ".claude-plugin" / "plugin.json"
 manifest = json.loads(manifest_path.read_text())
 
 # --- the defect that broke 1.3.0 on install -------------------------------
-check("the manifest does not declare a hooks path",
-      "hooks" not in manifest,
-      "plugin.json names hooks=%r; hooks/hooks.json is auto-discovered, and "
-      "declaring it makes Claude Code reject the plugin" % manifest.get("hooks"))
+declared = manifest.get("hooks")
+check("the manifest never names the standard hooks file (it is auto-discovered)",
+      declared in (None, "./hooks/mod.json"),
+      "plugin.json names hooks=%r; naming hooks/hooks.json makes Claude Code load "
+      "it twice and reject the plugin" % declared)
+mod_json = json.loads((REPO_ROOT / "hooks" / "mod.json").read_text())
+check("the mod lives in its own hooks file", mod_json == {"modules": ["./narrator.ts"]}, mod_json)
+check("the mod's module file exists", (REPO_ROOT / "hooks" / "narrator.ts").is_file())
+check("the standard hooks file declares no module",
+      "modules" not in json.loads((REPO_ROOT / "hooks" / "hooks.json").read_text()))
 
 check("the manifest does not declare a commands path",
       "commands" not in manifest,
