@@ -4821,6 +4821,7 @@ Co-Authored-By: <your model> <noreply@anthropic.com>"
 - [ ] **Step 1: Update the three docs**
 
 - `INTERFACES.md`: add sections for `hooks/mod_bridge.py` (the op protocol and reply, as in its docstring), the mod (`hooks/mod.json`, `narrator.ts`, `segment.ts`, `origin.ts`, `bridge.ts` — what each does, the `$` rule), `narrator.mod_active/mark_mod_session/unmark_mod_session/stands_down`, `cutover(warm=)`, `queue_dialog(utterance=)`, `prose.skip_unread`, the `source="mod"` items and the `utterance=` field in the engine's `sound` log line; and `.claude-plugin/plugin.json` now names `./hooks/mod.json`. Fix the two deferred nits while there: the `stop` lease row (non-narrator levels call `lease.release` directly) and `level.md`'s range (0-4).
+- `README.md` install and update section, rewritten for 1.4.0 (the user asked for it): requirements (Claude Code 2.1.287 or newer for streaming narration — mods are on by default there; older builds narrate through the hooks; Python 3.9+; `uv` for Kokoro voices; macOS `say` needs nothing); install (`/plugin marketplace add okets/claude-voiceover`, `/plugin install voiceover@claude-voiceover`, `/voiceover:setup`); update (`/plugin marketplace update claude-voiceover`, then restart every running Claude Code session or run `/reload-plugins` in each — a session left on 1.3 interrupts 1.4 engines); per-project voices (`/voiceover:voice <name> --project`); a one-line trust note (a mod is code that runs inside Claude Code, like any plugin). Check each command against `README.md`'s current install text and `.claude-plugin/marketplace.json` and keep what is already right.
 - `README.md`: replace the "speaking as it streams is planned" sentence with: narration starts while Claude is still writing (the mod, Claude Code 2.1.287 or newer, mods on by default); on a build without mods the hooks narrate as before; installing or updating needs `/reload-plugins` or a restart.
 - `CHANGELOG.md` (1.4.0): add under Added "Narration starts as Claude writes: a Claude Code mod speaks each sentence as it streams, through the same per-project queue and engine; the hooks remain the fallback and stand down for sessions the mod narrates." Remove any sentence that says the mod is deferred.
 
@@ -4875,3 +4876,31 @@ This is the first word of each message, measured from when its first sentence fi
 - [ ] **Step 5: Report**
 
 Tell the user the measured median and p90 against the targets and today's figures, whether the engine unloaded, and anything that misbehaved. Do not merge or push without their go-ahead.
+
+---
+
+### Task 12: Publish 1.4.0 to the marketplace (main session, with the user)
+
+Runs in the MAIN session after Task 11 passes. It pushes to the shared GitHub repository the marketplace serves (`okets/claude-voiceover`, `.claude-plugin/marketplace.json` source `./`), so show the user the exact commands and get their yes first.
+
+- [ ] **Step 1: Merge and tag**
+
+```bash
+git checkout main && git pull --ff-only
+git merge --no-ff feature/low-latency-narration -m "Merge 1.4.0: low-latency narration and the narrator mod"
+git tag -a v1.4.0 -m "1.4.0: low-latency narration and the narrator mod"
+bash tests/run_all.sh | tail -1 && claude plugin validate ./.claude-plugin/plugin.json
+```
+
+(`feature/low-latency-narration` contains `fix/completion-no-parrot`.) Expected: `ALL TESTS PASSED`, validation passes.
+
+- [ ] **Step 2: Push**
+
+```bash
+git push origin main --follow-tags
+```
+
+- [ ] **Step 3: Verify the published plugin installs and loads its mod**
+
+In a fresh Claude Code session (not this one): `/plugin marketplace update claude-voiceover`, update the plugin, `/reload-plugins`; then `grep " bridge " ~/.claude-voiceover/voiceover.log | tail -2` after one prompt — expected `narrate=True` lines from the installed copy (the cache path under `~/.claude/plugins/cache/claude-voiceover/voiceover/1.4.0`). Tell the user the release is live and that their other machines update the same way.
+
