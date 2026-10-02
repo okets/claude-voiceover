@@ -1,0 +1,131 @@
+"""The mod's bridge into the narrator: ops in, one JSON line out."""
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _harness import check, isolate, report, REPO_ROOT
+
+data_dir = isolate()
+from voiceover import lease, narrator, spool
+from voiceover.settings import set_setting
+
+set_setting("interaction_level", "narrator")
+set_setting("tts_engine", "kokoro")
+PROJECT = spool.queue_dir().parent
+
+
+def bridge(*ops, session="S1", stdin=None, **env):
+    payload = stdin if stdin is not None else json.dumps(
+        {"session": session, "cwd": str(REPO_ROOT), "ops": list(ops)})
+    return subprocess.run(["bash", str(REPO_ROOT / "hooks" / "run.sh"), "mod_bridge"],
+                          input=payload, capture_output=True, text=True,
+                          env=dict(os.environ, **env))
+
+
+def reply(proc):
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def items():
+    return [json.loads(p.read_text()) for p in sorted(spool.queue_dir().glob("*.json"))]
+
+
+def leased(session="S1"):
+    return (PROJECT / "leases" / (session + ".json")).exists()
+
+
+# --- prompt: the gate, the mark, the pin, the cutover without a warm-up -------------
+proc = bridge({"op": "prompt", "cutover": True})
+check("the bridge exits 0", proc.returncode == 0, proc.stderr)
+check("it prints exactly one line", len(proc.stdout.strip().splitlines()) == 1, proc.stdout)
+check("prompt reports narration on", reply(proc) == {"narrate": True}, proc.stdout)
+check("the batch marks the session", narrator.mod_active("S1"))
+check("the prompt pins the session to its root", narrator.pinned_cwd("S1", None) == str(REPO_ROOT))
+check("a cutover prompt files the session's stop request", (PROJECT / "stop" / "S1.json").exists())
+check("but holds no engine: turn.start warms it", not leased())
+
+spool.clear()
+spool.enqueue("Mid-sentence.", "kokoro", "bf_emma", session="S1")
+(PROJECT / "stop" / "S1.json").unlink()
+bridge({"op": "prompt", "cutover": False})
+check("a prompt that is not the user's own drops nothing", spool.pending_count() == 1)
+check("and stops nothing", not (PROJECT / "stop" / "S1.json").exists())
+
+# --- any op marks a session ---------------------------------------------------------------
+bridge({"op": "status"}, session="AFTER-CLEAR")
+check("a session id first seen in any op is marked", narrator.mod_active("AFTER-CLEAR"))
+
+# --- hold, say: cleaned, one message, tagged --------------------------------------------
+spool.clear()
+bridge({"op": "hold"})
+check("hold pre-warms: the session holds a lease", leased())
+bridge({"op": "say", "utterance": "T:0", "text": "**Reading** the loader. ", "shown": 100.5},
+       {"op": "say", "utterance": "T:0", "text": "---\n", "shown": 100.6},
+       {"op": "say", "utterance": "T:0", "text": "**Then. ", "shown": 100.7})
+queued = items()
+check("each speakable segment is queued, markdown cleaned, stray markers stripped",
+      [i["text"] for i in queued] == ["Reading the loader.", "Then."], queued)
+check("segments of one response share its utterance", {i["utterance"] for i in queued} == {"T:0"})
+check("the shown time and the source are kept for latency logging",
+      queued and queued[0]["shown"] == 100.5 and queued[0]["source"] == "mod", queued)
+
+# --- dialog: sticky, under the lead-in's utterance, lease released ------------------------
+spool.clear()
+bridge({"op": "dialog", "tool": "AskUserQuestion", "utterance": "T:0",
+        "input": {"questions": [{"question": "Which approach?", "options": [{"label": "A"}]}]}})
+alert = items()
+check("the dialog alert is queued sticky under the lead-in's message",
+      len(alert) == 1 and alert[0]["sticky"] is True and alert[0]["utterance"] == "T:0", alert)
+check("it reads the actual question", alert and "Which approach?" in alert[0]["text"], alert)
+check("the lease is released while the user decides", not leased())
+check("this session's echo is suppressed", narrator.dialog_recently_announced("S1"))
+
+# --- turn-end ---------------------------------------------------------------------------
+bridge({"op": "hold"})
+proc = bridge({"op": "turn-end", "spoken": False})
+check("turn-end releases the lease", not leased())
+check("a silent turn ends on the chime", "[voiceover] sound: decide" in proc.stderr, proc.stderr)
+
+# --- narration turned off mid-turn still releases --------------------------------------------
+bridge({"op": "hold"})
+set_setting("interaction_level", "concise")
+proc = bridge({"op": "turn-end", "spoken": True})
+check("a turn end after narration was turned off still releases the engine", not leased())
+lease.hold(None, "S1")
+bridge({"op": "dialog", "tool": "ExitPlanMode", "input": {}, "utterance": None})
+check("so does a dialog", not leased())
+
+# --- below the narrator level, only the gate, the mark and the pin act --------------------
+spool.clear()
+proc = bridge({"op": "prompt", "cutover": True},
+              {"op": "say", "utterance": "U", "text": "Not spoken."}, {"op": "hold"},
+              session="S2")
+check("concise: narration reported off", reply(proc) == {"narrate": False}, proc.stdout)
+check("concise: nothing queued", items() == [], items())
+check("concise: no lease taken", not leased("S2"))
+check("concise: the session is still marked", narrator.mod_active("S2"))
+set_setting("interaction_level", "narrator")
+
+# --- headless runs never narrate ------------------------------------------------------------
+spool.clear()
+proc = bridge({"op": "hold"}, {"op": "say", "utterance": "H", "text": "Nobody listens."},
+              session="H1", CLAUDE_CODE_ENTRYPOINT="sdk-cli")
+check("a headless run reports narration off", reply(proc) == {"narrate": False}, proc.stdout)
+check("and queues nothing, holds nothing", items() == [] and not leased("H1"), items())
+
+# --- end-session ------------------------------------------------------------------------
+bridge({"op": "hold"})
+bridge({"op": "end-session"})
+check("end-session unmarks the session", not narrator.mod_active("S1"))
+check("end-session releases its lease", not leased())
+
+# --- garbage in, one line out ------------------------------------------------------------
+proc = bridge(stdin="not json")
+check("a malformed batch still exits 0", proc.returncode == 0, proc.stderr)
+check("and still prints one JSON line", "narrate" in reply(proc), proc.stdout)
+
+report()

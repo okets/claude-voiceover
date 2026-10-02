@@ -98,6 +98,14 @@ def commit_offset(transcript_path, offset) -> None:
         pass
 
 
+def skip_unread(transcript_path) -> None:
+    """Mark everything written so far as narrated - someone else (the mod)
+    already spoke it - so a later fallback never replays it."""
+    _text, offset = peek_new_prose(transcript_path)
+    if offset:
+        commit_offset(transcript_path, offset)
+
+
 def _read_offset(transcript_path):
     """Stored offset, or None when this transcript was never narrated."""
     state = _load_state()

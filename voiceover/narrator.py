@@ -4,7 +4,9 @@ The hooks parse their own input and call these, so what a prompt, a question
 dialog or a turn's end does to the queue, the lease and the engine has
 exactly one definition (the deferred mod's bridge will call the same ones).
 Per-session records live under data_dir(): pins/ (the project a session's
-turn stays in) and dialog_alert/ (a dialog was just announced).
+turn stays in), dialog_alert/ (a dialog was just announced) and
+mod_sessions/ (the mod narrates this session; the classic paths stand
+down).
 Stdlib only; every function fails soft.
 """
 
@@ -15,6 +17,7 @@ import time
 from . import lease, spool
 from .debuglog import log as _log
 from .projects import project_key, session_slug
+from .prose import skip_unread
 from .settings import data_dir, get_interaction_level, is_tts_enabled, resolve_engine
 from .speech import enqueue_speech, ensure_drainer, play_sound, prewarm, request_stop
 from .templates import blocking_dialog_message
@@ -118,6 +121,30 @@ def unpin(session) -> None:
     _drop_record("pins", session)
 
 
+def mod_active(session) -> bool:
+    """True when the mod narrates this session, so the classic paths stand down."""
+    return _read_record("mod_sessions", session) is not None
+
+
+def mark_mod_session(session) -> None:
+    """Record that the mod narrates session (hooks/mod_bridge.py, every call)."""
+    _write_record("mod_sessions", session, "")
+
+
+def unmark_mod_session(session) -> None:
+    _drop_record("mod_sessions", session)
+
+
+def stands_down(session, transcript_path) -> bool:
+    """True when the mod narrates this session: the classic path does nothing
+    but move the prose cursor past what the mod already spoke, so a later
+    fallback never replays it."""
+    if not mod_active(session):
+        return False
+    skip_unread(transcript_path)
+    return True
+
+
 def is_users_prompt(prompt_text) -> bool:
     """False for a background task's notification arriving as a prompt."""
     return not str(prompt_text or "").lstrip().startswith(_TASK_NOTIFICATION_PREFIX)
@@ -139,12 +166,14 @@ def abandon(cwd, session) -> int:
     return dropped
 
 
-def cutover(cwd, session, ttl=lease.LEASE_TTL) -> None:
+def cutover(cwd, session, ttl=lease.LEASE_TTL, warm=True) -> None:
     """The user's own new prompt: drop this session's pending text, stop its
     sentence mid-word, and warm the engine for the reply. No process is
-    killed: the engine stays loaded and the reply starts warm."""
+    killed: the engine stays loaded and the reply starts warm. warm=False
+    leaves the warm-up to the caller: the mod warms at turn.start, so a
+    prompt that never becomes a turn holds nothing."""
     abandon(cwd, session)
-    if narrates(cwd):
+    if warm and narrates(cwd):
         prewarm(cwd, session, ttl=ttl)
 
 
@@ -162,18 +191,21 @@ def dialog_recently_announced(session, within=30.0) -> bool:
         return False
 
 
-def queue_dialog(cwd, session, tool_name, tool_input, lead_in=None, shown=None) -> bool:
+def queue_dialog(cwd, session, tool_name, tool_input, lead_in=None, shown=None,
+                 utterance=None) -> bool:
     """Announce a dialog that is about to block the session on the user.
 
     The alert is sticky - never dropped, played whole - and the lease is
     released, so the engine unloads once the alert has played while the user
     decides. The marker is written only when the alert actually queued:
-    otherwise the notification echo is the only thing that will speak.
+    otherwise the notification echo is the only thing that will speak. The
+    mod passes the lead-in's utterance, so the alert continues that message
+    instead of preempting it.
     """
     alert = blocking_dialog_message(tool_name, tool_input or {})
     text = (lead_in + "\n" + alert) if lead_in else alert
     queued = enqueue_speech(text, cwd=cwd, full=True, session=session, sticky=True,
-                            shown=shown, source="dialog")
+                            shown=shown, source="dialog", utterance=utterance)
     if queued:
         write_dialog_marker(session)
     ensure_drainer(cwd)

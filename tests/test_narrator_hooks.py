@@ -387,4 +387,27 @@ for hook_name in ("pre_tool_use", "post_tool_use"):
     check(hook_name + " holds no lease while TTS is off", not lease_held())
 set_setting("tts_enabled", True)
 
+# --- with the mod narrating this session, the classic narrator paths stand down ------
+spool.clear()
+narrator.mark_mod_session("MOD")
+path = write_transcript("mod.jsonl", [USER])
+commit_offset(str(path), path.stat().st_size)
+with open(path, "a") as handle:
+    handle.write(json.dumps(assistant("The mod speaks this, not the hook.")) + "\n")
+mod = {"cwd": str(REPO_ROOT), "transcript_path": str(path), "session_id": "MOD"}
+for hook in ("pre_tool_use", "post_tool_use"):
+    run_hook(hook, dict(mod, tool_name="Bash", tool_input={}))
+run_hook("stop", mod)
+check("no classic narrator path queues text for a mod session", queued_texts() == [], queued_texts())
+check("nor holds a lease for it", not lease_held("MOD"))
+from voiceover.prose import peek_new_prose
+check("the cursor moved past what the mod spoke", peek_new_prose(str(path))[0] is None)
+stop_dir = spool.queue_dir().parent / "stop"
+(stop_dir / "MOD.json").unlink(missing_ok=True)
+run_hook("user_prompt_submit", {"cwd": str(REPO_ROOT), "session_id": "MOD", "prompt": "go"})
+check("the prompt hook leaves the cutover to the mod", not (stop_dir / "MOD.json").exists())
+check("and leaves the pin to it too", narrator.pinned_cwd("MOD", None) is None)
+narrator.unmark_mod_session("MOD")
+check("unmarking ends the stand-down", not narrator.mod_active("MOD"))
+
 report()

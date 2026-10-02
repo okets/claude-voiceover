@@ -32,10 +32,12 @@ def main():
         # narration. Tool play-by-play stays silent, and nothing interrupts.
         if narrator.headless():
             return
+        transcript = payload.get("transcript_path", "")
+        if narrator.stands_down(session, transcript):
+            return  # the mod speaks this session's text as it streams
         from voiceover import lease
         from voiceover.speech import ensure_drainer, enqueue_speech
 
-        transcript = payload.get("transcript_path", "")
         tool_name = payload.get("tool_name", "")
         text, offset, shown = peek_new_prose_stamped(transcript)
         if tool_name in narrator.DIALOG_TOOLS:

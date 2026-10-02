@@ -30,6 +30,8 @@ def main():
         # (which pre-tool can miss by a flush race) is queued here instead.
         if narrator.headless():
             return
+        if narrator.stands_down(session, payload.get("transcript_path", "")):
+            return  # the mod speaks this session's text as it streams
         from voiceover import lease, spool
         from voiceover.prose import commit_offset, peek_new_prose_stamped
         from voiceover.speech import ensure_drainer, enqueue_speech

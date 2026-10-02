@@ -53,6 +53,8 @@ def main():
     if level == "narrator":
         if narrator.headless():
             return
+        if narrator.stands_down(session, transcript_path):
+            return  # the mod ends this turn itself (turn.complete)
         from voiceover.debuglog import log as _log
         from voiceover.prose import commit_offset, peek_new_prose_stamped
         from voiceover.speech import ensure_drainer, enqueue_speech
