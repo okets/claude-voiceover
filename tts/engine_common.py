@@ -14,6 +14,12 @@ Every lock and spool helper takes `root`, the directory its state lives in:
 a project's directory for a drainer, data_dir() for the one-shot speaker's
 lock.
 
+The drainer plays a project's spool one sentence at a time. Between sentences
+it applies the jump rule (a newer message ends the current one and drops what
+was queued between), it honours per-session stop requests, it prefetches the
+next sentence while one plays, and it claims its lock before open_speaker()
+loads anything.
+
 The spool it reads is written by voiceover/spool.py. The shared contract is
 just this: pending items are `*.json` files in <root>/queue/ whose
 filenames sort chronologically, each holding
@@ -22,11 +28,20 @@ filenames sort chronologically, each holding
 
 import json
 import os
+import re
+import sys
 import time
 from pathlib import Path
 
 _QUEUE_DIR_NAME = "queue"
 _TAKEN_SUFFIX = ".taken"
+_STOP_DIR_NAME = "stop"
+_ALL_SESSIONS = "_all"
+_UNSAFE = re.compile(r"[^A-Za-z0-9_-]")
+POLL_SECONDS = 0.05
+_SENTENCE_BREAK = re.compile(r"(?<=[.!?])\s+|\n+")
+_LOG_MAX_BYTES = 200_000
+_debug = None
 
 
 # --- data dir / tts.lock ----------------------------------------------------
@@ -69,14 +84,46 @@ def _parse_lock_expiry(raw):
             return None
 
 
+def _parse_lock_pid(raw):
+    try:
+        return int(json.loads(raw).get("pid"))
+    except Exception:
+        return None
+
+
+def _pid_alive(pid) -> bool:
+    """True unless pid is known to have exited.
+
+    Unknown answers are True: taking over a live engine's lock would put two
+    voices on the speaker. Windows always answers unknown - os.kill(pid, 0)
+    there would signal the process instead of probing it.
+    """
+    if pid is None or sys.platform == "win32":
+        return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+
+
+def _lock_held(raw) -> bool:
+    """True when a lock's content is unexpired AND its engine still runs."""
+    expiry = _parse_lock_expiry(raw)
+    if expiry is None or time.time() >= expiry:
+        return False
+    return _pid_alive(_parse_lock_pid(raw))
+
+
 def lock_is_live(root) -> bool:
-    """True while an unexpired lock exists. Read-only: never clears anything."""
+    """True while an unexpired lock held by a running engine exists. Read-only: never clears anything."""
     try:
         raw = tts_lock_path(root).read_text().strip()
     except OSError:
         return False
-    expiry = _parse_lock_expiry(raw)
-    return expiry is not None and time.time() < expiry
+    return _lock_held(raw)
 
 
 def try_claim_lock(root, duration):
@@ -107,13 +154,13 @@ def try_claim_lock(root, duration):
                 return True
             except FileExistsError:
                 try:
-                    expiry = _parse_lock_expiry(lock_file.read_text().strip())
+                    raw = lock_file.read_text().strip()
                 except OSError:
-                    expiry = None
-                if expiry is not None and time.time() < expiry:
-                    return False  # someone else is speaking
+                    raw = ""
+                if _lock_held(raw):
+                    return False  # a live engine is speaking
                 try:
-                    lock_file.unlink()  # stale - retry the atomic claim once
+                    lock_file.unlink()  # expired, or its engine has died
                 except OSError:
                     return False
             except OSError:
@@ -254,45 +301,326 @@ def put_back(taken_path) -> None:
         pass
 
 
+# --- logging ----------------------------------------------------------------
+
+def _debug_enabled():
+    """The global debug_log setting, read once per engine process."""
+    global _debug
+    if _debug is None:
+        try:
+            with open(data_dir() / "settings.json", encoding="utf-8") as handle:
+                _debug = bool(json.load(handle).get("debug_log"))
+        except Exception:
+            _debug = False
+    return _debug
+
+
+def engine_log(tag, message):
+    """Append to data_dir()/voiceover.log in voiceover/debuglog.py's line
+    format, when the global debug_log setting is on. Never raises."""
+    try:
+        if not _debug_enabled():
+            return
+        path = data_dir() / "voiceover.log"
+        try:
+            if path.stat().st_size > _LOG_MAX_BYTES:
+                path.unlink()
+        except OSError:
+            pass
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write("%.2f %d %-10s %s\n" % (time.time(), os.getpid(), tag, message))
+    except Exception:
+        pass
+
+
+# --- sentences and the jump rule --------------------------------------------
+
+def split_sentences(text):
+    """Text -> its sentences: split after . ! ? + whitespace and at newlines."""
+    return [piece.strip() for piece in _SENTENCE_BREAK.split(text or "")
+            if piece and piece.strip()]
+
+
+def _read_json(path):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            loaded = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def _owned(item, engine_names):
+    """True unless the item names a real engine outside engine_names."""
+    engine = item.get("engine")
+    return engine_names is None or not engine or engine in engine_names
+
+
+def _own_pending(root, engine_names):
+    """(path, item) for this engine's readable pending items, oldest first."""
+    own = []
+    for path in sorted(queue_dir(root).glob("*.json")):
+        item = _read_json(path)
+        if item is not None and _owned(item, engine_names):
+            own.append((path, item))
+    return own
+
+
+def _survives(item, newest):
+    """Whether the jump rule keeps item, given the newest own pending item."""
+    if item is newest or item.get("sticky"):
+        return True
+    utterance = newest.get("utterance")
+    return utterance is not None and item.get("utterance") == utterance
+
+
+def drop_superseded(root, engine_names=None) -> int:
+    """The jump rule: finish unspoken every own item a newer message supersedes.
+
+    The newest own pending item's message is the one to speak; every older
+    own item of another message is dropped unless it is sticky. Foreign items
+    are not this engine's to judge and keep their place. Returns how many.
+    """
+    own = _own_pending(root, engine_names)
+    if len(own) < 2:
+        return 0
+    newest = own[-1][1]
+    dropped = 0
+    for path, item in own[:-1]:
+        if _survives(item, newest):
+            continue
+        try:
+            path.unlink()
+            dropped += 1
+        except OSError:
+            pass  # cleared or claimed meanwhile
+    return dropped
+
+
+def next_item(root, engine_names=None):
+    """Apply the jump rule, then claim the oldest remaining own item."""
+    dropped = drop_superseded(root, engine_names)
+    if dropped:
+        engine_log("jump", "dropped=%d superseded items" % dropped)
+    return take_oldest(root, engine_names)
+
+
+def peek_next(root, engine_names=None):
+    """The item next_item() would play, read WITHOUT claiming it.
+
+    Never claim ahead: a .taken item is invisible to spool.clear() and would
+    survive the user's cutover."""
+    own = _own_pending(root, engine_names)
+    if not own:
+        return None
+    newest = own[-1][1]
+    for _path, item in own:
+        if _survives(item, newest):
+            return item
+    return None
+
+
+def newer_utterance_pending(root, utterance, engine_names=None) -> bool:
+    """True when an own pending item belongs to a different message."""
+    for _path, item in _own_pending(root, engine_names):
+        if utterance is None or item.get("utterance") != utterance:
+            return True
+    return False
+
+
+# --- stop requests ------------------------------------------------------------
+
+def _stop_file_name(session):
+    """voiceover/projects.session_slug's rule; '_all' for no session."""
+    slug = _UNSAFE.sub("_", str(session or ""))
+    return (slug or _ALL_SESSIONS) + ".json"
+
+
+def stop_requested(root, item) -> bool:
+    """True when a stop for item's session - or for every session - was
+    requested after item was queued. A stop can therefore never cut a reply
+    queued after it, and each session's request is a file of its own."""
+    try:
+        created = float(item.get("created") or 0)
+    except (TypeError, ValueError):
+        created = 0.0
+    directory = Path(root) / _STOP_DIR_NAME
+    for name in {_stop_file_name(item.get("session")), _stop_file_name(None)}:
+        request = _read_json(directory / name)
+        try:
+            if request and float(request.get("ts")) > created:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+# --- playback ---------------------------------------------------------------
+
+class Playback:
+    """A sentence that is already over - what a dry run plays."""
+
+    def poll(self) -> bool:
+        return True
+
+    def kill(self) -> None:
+        pass
+
+
+class ProcessPlayback(Playback):
+    """A sentence playing in a child process; cleanup is a file to delete."""
+
+    def __init__(self, process, cleanup=None):
+        self._process = process
+        self._cleanup = cleanup
+
+    def poll(self) -> bool:
+        if self._process.poll() is None:
+            return False
+        self._remove()
+        return True
+
+    def kill(self) -> None:
+        try:
+            self._process.terminate()
+            self._process.wait(timeout=1)
+        except Exception:
+            try:
+                self._process.kill()
+            except Exception:
+                pass
+        self._remove()
+
+    def _remove(self):
+        if self._cleanup is not None:
+            try:
+                Path(self._cleanup).unlink()
+            except OSError:
+                pass
+            self._cleanup = None
+
+
+class DryRunSpeaker:
+    """Prints each sentence as '[voiceover] <sentence>' instead of playing it."""
+
+    def prefetch(self, sentence, voice):
+        pass
+
+    def begin(self, sentence, voice, upcoming=None):
+        print("[voiceover] " + sentence, file=sys.stderr, flush=True)
+        return Playback()
+
+
+class _LockKeeper:
+    """Refreshes the drainer's lock whenever half its expiry has passed."""
+
+    def __init__(self, root, seconds):
+        self._root, self._seconds = root, seconds
+        self._last = time.time()
+
+    def keep(self):
+        now = time.time()
+        if now - self._last >= self._seconds / 2:
+            update_lock_expiry(self._root, self._seconds)
+            self._last = now
+
+    def reset(self):
+        self._last = time.time()
+
+
+def _log_first_sound(item):
+    now = time.time()
+    shown = item.get("shown")
+    text = item.get("text") or ""
+    engine_log("sound", "source=%s lag_created=%.2f lag_shown=%s chars=%d :: %.60s" % (
+        item.get("source") or "-", now - float(item.get("created") or now),
+        ("%.2f" % (now - float(shown))) if isinstance(shown, (int, float)) else "-",
+        len(text), text.replace("\n", " ")))
+
+
+def _prefetch_next(root, speaker, engine_names) -> bool:
+    """Have the speaker synthesize the next item's first sentence now.
+    True once there was a next item to prefetch."""
+    upcoming = peek_next(root, engine_names)
+    if upcoming is None:
+        return False
+    first = split_sentences(upcoming.get("text"))
+    if first:
+        speaker.prefetch(first[0], upcoming.get("voice"))
+    return True
+
+
+def _speak_item(root, speaker, item, engine_names, keeper, poll_seconds):
+    """Play item sentence by sentence until it ends, is stopped or superseded.
+
+    A sticky item (a dialog alert, a permission request) plays whole: only a
+    stop request - the user's own prompt - ends it early.
+    """
+    utterance, sticky = item.get("utterance"), bool(item.get("sticky"))
+    sentences = split_sentences(item.get("text"))
+    for index, sentence in enumerate(sentences):
+        last = index == len(sentences) - 1
+        playback = speaker.begin(sentence, item.get("voice"), None if last else sentences[index + 1])
+        if index == 0:
+            _log_first_sound(item)
+        prefetched = not last  # within the item, begin() already prefetched
+        while not playback.poll():
+            keeper.keep()
+            if stop_requested(root, item):
+                playback.kill()
+                engine_log("stop", "session=%s" % item.get("session"))
+                return
+            if not prefetched:
+                prefetched = _prefetch_next(root, speaker, engine_names)
+            time.sleep(poll_seconds)
+        keeper.keep()
+        if stop_requested(root, item):
+            return
+        if not sticky and newer_utterance_pending(root, utterance, engine_names):
+            return
+
+
 # --- the drain loop ---------------------------------------------------------
 
 QUEUE_MAX_AGE_SECONDS = 300  # must match voiceover/spool.py
 
 
-def drain(root, speak_item, engine_names, lock_seconds=60.0, prepare=None) -> int:
-    """Speak the spool dry, one item at a time. Returns a process exit code.
+def drain(root, open_speaker, engine_names, lock_seconds=60.0,
+          poll_seconds=POLL_SECONDS) -> int:
+    """Speak root's spool one sentence at a time. Returns a process exit code.
 
-    speak_item(item) -> bool is called for each item this engine owns;
-    engine_names is the set of item["engine"] values it can handle. Items
-    belonging to any other engine are skipped and left in the spool with
-    their ordering intact, so a foreign item never blocks this engine's own.
+    open_speaker() -> speaker | falsy is the engine's one-time setup (loading
+    a speech model). It runs only AFTER the lock is ours: opening first would
+    leave the lock free for the whole spin-up, and every hook firing in that
+    window would spawn another engine that loads its model and then exits on
+    the lock. A falsy speaker releases the lock and exits 0.
 
-    prepare() is the engine's one-time setup - loading a speech model, say.
-    It runs only AFTER the lock is ours, so the expensive part happens with
-    every other engine already locked out; doing it first would leave the
-    lock free for the whole spin-up, and every hook firing in that window
-    would spawn another engine that loads its model and then exits on the
-    lock. Returning falsy from prepare() releases the lock and exits 0.
+    Between sentences the jump rule applies: a different message ends the
+    current one at its next sentence boundary and everything queued between
+    is dropped, sticky items excepted. A stop request newer than the item
+    kills its sentence mid-word - only the user's own prompt sends one. On an
+    item's last sentence the next item's first sentence is prefetched.
 
-    The loop holds the TTS lock for as long as it has work, so the model is
-    loaded once per drain rather than once per utterance. When the spool runs
-    dry it releases the lock and checks ONCE more before exiting: that closes
-    the race against a hook that appended an item a moment earlier and saw
-    the lock still held, which would otherwise strand that item until the
-    next hook fired.
+    When the spool runs dry the lock is released and the spool checked ONCE
+    more before exiting: that closes the race against a hook that appended an
+    item a moment earlier and saw the lock still held. A lock this drain does
+    not own is never deleted.
     """
+    root = Path(root)
     if not try_claim_lock(root, lock_seconds):
-        return 0  # another engine is already draining
+        return 0  # another engine is already draining this project
     owns_lock = True
+    keeper = _LockKeeper(root, lock_seconds)
     try:
-        if prepare is not None and not prepare():
+        speaker = open_speaker()
+        if not speaker:
             return 0  # setup failed; the finally below hands the lock back
         while True:
-            item, taken_path = take_oldest(root, engine_names)
+            item, taken_path = next_item(root, engine_names)
             if item is None:
                 remove_tts_lock(root)
                 owns_lock = False
-                item, taken_path = take_oldest(root, engine_names)
+                item, taken_path = next_item(root, engine_names)
                 if item is None:
                     return 0
                 if not try_claim_lock(root, lock_seconds):
@@ -301,22 +629,18 @@ def drain(root, speak_item, engine_names, lock_seconds=60.0, prepare=None) -> in
                     put_back(taken_path)
                     return 0
                 owns_lock = True
-                # Fall through and speak the item we just claimed. A continue
-                # here would re-scan the spool, and this item is already
-                # renamed to .taken - invisible to that scan, so it would be
-                # silently lost.
-            # No engine re-check here: take_oldest() already guarantees any
-            # item it returns is either ours or gets put back / dropped
-            # itself, so every item reaching this point is ours to speak.
+                keeper.reset()
+                # Fall through and speak the item just claimed: it is renamed
+                # to .taken, invisible to a re-scan, and would be lost.
             age = time.time() - float(item.get("created") or 0)
-            if age > QUEUE_MAX_AGE_SECONDS:
-                finish(taken_path)     # too stale to be worth hearing
+            if age > QUEUE_MAX_AGE_SECONDS or stop_requested(root, item):
+                finish(taken_path)  # too stale, or queued before the user's prompt
                 continue
-            update_lock_expiry(root, lock_seconds)
+            keeper.keep()
             try:
-                speak_item(item)
+                _speak_item(root, speaker, item, engine_names, keeper, poll_seconds)
             except Exception:
-                pass
+                pass  # a failed sentence skips the rest of its item
             finish(taken_path)
     finally:
         if owns_lock:

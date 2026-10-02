@@ -17,14 +17,17 @@ Honors VOICEOVER_DRY_RUN: prints '[voiceover] <text>' to stderr and exits
 without loading models, downloading anything, or producing audio.
 """
 
+import concurrent.futures
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 from pathlib import Path
 
-from engine_common import data_dir, remove_tts_lock, try_claim_lock, update_lock_expiry
+from engine_common import Playback, ProcessPlayback, data_dir, remove_tts_lock, try_claim_lock, update_lock_expiry
 
 DRY_RUN = bool(os.environ.get("VOICEOVER_DRY_RUN"))
 
@@ -91,25 +94,6 @@ def _play_windows(file_path, timeout):
         winsound.PlaySound(file_path, winsound.SND_FILENAME)
         return True
     except Exception:
-        return _play_windows_powershell(file_path, timeout)
-
-
-def _play_windows_powershell(file_path, timeout):
-    escaped = file_path.replace("'", "''")
-    script = (
-        "Add-Type -AssemblyName presentationCore; "
-        "$p = New-Object System.Windows.Media.MediaPlayer; "
-        "$p.Open([Uri]'" + escaped + "'); $p.Play(); "
-        "Start-Sleep -Seconds " + str(min(timeout, 60))
-    )
-    try:
-        subprocess.run(
-            ["powershell", "-NoProfile", "-Command", script],
-            capture_output=True,
-            timeout=timeout + 2,
-        )
-        return True
-    except Exception:
         return False
 
 
@@ -171,7 +155,7 @@ def play_chunk(samples, sample_rate, root):
 
     duration = len(samples) / float(sample_rate) if sample_rate else 0.0
     update_lock_expiry(root, duration + 20.0)  # this chunk plus headroom for the next
-    tmp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp_file = tempfile.NamedTemporaryFile(prefix="voiceover-oneshot-", suffix=".wav", delete=False)
     tmp_path = tmp_file.name
     tmp_file.close()
     try:
@@ -191,7 +175,7 @@ def play_samples(samples, sample_rate):
     duration = len(samples) / float(sample_rate) if sample_rate else 0.0
     update_lock_expiry(data_dir(), duration)
     # delete=False + manual cleanup avoids Windows file-locking issues.
-    tmp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp_file = tempfile.NamedTemporaryFile(prefix="voiceover-oneshot-", suffix=".wav", delete=False)
     tmp_path = tmp_file.name
     tmp_file.close()
     try:
@@ -199,23 +183,6 @@ def play_samples(samples, sample_rate):
         return play_audio_file(tmp_path, timeout=max(30, int(duration) + 10))
     finally:
         remove_tts_lock(data_dir())
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-
-
-def _play_samples_keeping_lock(samples, sample_rate, duration):
-    """Play samples WITHOUT removing the tts lock - the drain loop owns it."""
-    import soundfile as sf
-
-    tmp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    tmp_path = tmp_file.name
-    tmp_file.close()
-    try:
-        sf.write(tmp_path, samples, sample_rate)
-        return play_audio_file(tmp_path, timeout=max(30, int(duration) + 10))
-    finally:
         try:
             os.unlink(tmp_path)
         except OSError:
@@ -234,25 +201,6 @@ def speak_standard(kokoro, text, voice):
         trim=settings["trim"],
     )
     return play_samples(samples, sample_rate)
-
-
-def _speak_whole_keeping_lock(kokoro, text, voice, root):
-    """Synthesize the whole text, then play it, WITHOUT removing the lock.
-
-    The non-streaming fallback for a caller that owns the lock across several
-    utterances (the drain loop).
-    """
-    settings = get_voice_settings(voice)
-    samples, sample_rate = kokoro.create(
-        text=text,
-        voice=voice,
-        speed=settings["speed"],
-        lang=settings["lang"],
-        trim=settings["trim"],
-    )
-    duration = len(samples) / float(sample_rate) if sample_rate else 0.0
-    update_lock_expiry(root, duration + 20.0)
-    return _play_samples_keeping_lock(samples, sample_rate, duration)
 
 
 def stream_chunks(kokoro, text, voice, root) -> bool:
@@ -317,6 +265,144 @@ def speak_streaming(kokoro, text, voice):
         return speak_standard(kokoro, text, voice)
     finally:
         remove_tts_lock(data_dir())
+
+
+def playback_command(path):
+    """The player for one sentence's wav (macOS/Linux), as an argv Popen can
+    poll and kill."""
+    if sys.platform == "darwin":
+        return ["afplay", path]
+    if shutil.which("aplay"):
+        return ["aplay", "-q", path]
+    return ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", path]
+
+
+class WinsoundPlayback(Playback):
+    """Windows: play in-process and asynchronously, so a stop is instant and
+    no player process can outlive the engine. Done once the clip's length
+    has passed."""
+
+    def __init__(self, path, duration):
+        import winsound
+
+        self._winsound, self._path = winsound, Path(path)
+        winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_ASYNC)
+        self._ends = time.time() + duration
+
+    def poll(self) -> bool:
+        if time.time() < self._ends:
+            return False
+        self._remove()
+        return True
+
+    def kill(self) -> None:
+        try:
+            self._winsound.PlaySound(None, 0)
+        except Exception:
+            pass
+        self._remove()
+
+    def _remove(self):
+        try:
+            self._path.unlink()
+        except OSError:
+            pass
+
+
+def play_file(path, duration):
+    """Start playing one sentence's wav; the Playback polls and kills it."""
+    if sys.platform == "win32":
+        return WinsoundPlayback(path, duration)
+    process = subprocess.Popen(playback_command(str(path)),
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return ProcessPlayback(process, cleanup=path)
+
+
+class KokoroPlayback(Playback):
+    """One sentence: rendering in the worker thread, then playing.
+
+    The drain loop polls it from the moment begin() returns, so a stop
+    request or a lock refresh never waits for synthesis - a sentence stopped
+    while it renders never makes a sound. A failed synthesis raises from
+    poll(), which skips the rest of the item.
+    """
+
+    def __init__(self, speaker, future, path, voice, upcoming):
+        self._speaker, self._future, self._path = speaker, future, path
+        self._voice, self._upcoming = voice, upcoming
+        self._player = None
+
+    def poll(self) -> bool:
+        if self._player is None:
+            if not self._future.done():
+                return False
+            samples, sample_rate = self._future.result()
+            if self._upcoming:
+                self._speaker.prefetch(self._upcoming, self._voice)
+            self._player = self._speaker.play(self._path, samples, sample_rate)
+            return False
+        return self._player.poll()
+
+    def kill(self) -> None:
+        if self._player is not None:
+            self._player.kill()
+
+
+class KokoroSpeaker:
+    """Plays sentences through a loaded Kokoro model, synthesizing ahead.
+
+    A worker thread renders the next sentence while the current one plays
+    (onnxruntime releases the GIL): within an item through begin()'s
+    `upcoming`, across items through prefetch(). A rendering that does not
+    match the sentence actually begun next is discarded.
+    """
+
+    def __init__(self, kokoro, play_dir):
+        self._kokoro = kokoro
+        self._play_dir = Path(play_dir)
+        self._play_dir.mkdir(parents=True, exist_ok=True)
+        self._worker = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self._ahead = {}
+        self._count = 0
+        cutoff = time.time() - 60  # wavs a killed or Windows-held player left behind
+        for old in self._play_dir.glob("*.wav"):
+            try:
+                if old.stat().st_mtime < cutoff:
+                    old.unlink()
+            except OSError:
+                pass
+
+    def warm_up(self):
+        """Pay the first synthesis' one-time cost now, not on a real sentence."""
+        self._render("Ready.", DEFAULT_VOICE).result()
+
+    def prefetch(self, sentence, voice):
+        """Start rendering a sentence the next item will begin with."""
+        voice = voice or DEFAULT_VOICE
+        if (sentence, voice) not in self._ahead:
+            self._ahead[(sentence, voice)] = self._render(sentence, voice)
+
+    def begin(self, sentence, voice, upcoming=None):
+        voice = voice or DEFAULT_VOICE
+        future = self._ahead.pop((sentence, voice), None) or self._render(sentence, voice)
+        self._ahead.clear()  # anything else rendered ahead belongs to an abandoned item
+        self._count += 1
+        path = self._play_dir / ("%d-%d.wav" % (os.getpid(), self._count))
+        return KokoroPlayback(self, future, path, voice, upcoming)
+
+    def play(self, path, samples, sample_rate):
+        """Write one rendered sentence and start playing it."""
+        import soundfile as sf
+
+        sf.write(str(path), samples, sample_rate)
+        duration = len(samples) / float(sample_rate) if sample_rate else 0.0
+        return play_file(path, duration)
+
+    def _render(self, sentence, voice):
+        settings = get_voice_settings(voice)
+        return self._worker.submit(
+            self._kokoro.create, text=sentence, voice=voice, speed=settings["speed"],
+            lang=settings["lang"], trim=settings["trim"])
 
 
 def speak_text(text, voice, use_streaming=False):
@@ -393,64 +479,30 @@ def print_usage():
 
 def main():
     if "--drain" in sys.argv[1:]:
-        from engine_common import drain, drain_root
+        from engine_common import DryRunSpeaker, drain, drain_root
 
         root = drain_root(sys.argv)
         if root is None:
             log("Usage: kokoro_voice.py --drain <project dir>")
             return 0
-
         if DRY_RUN:
-            def speak_one(item):
-                print("[voiceover] " + item["text"], file=sys.stderr)
-                return True
-            return drain(root, speak_one, {"kokoro"})
+            return drain(root, DryRunSpeaker, {"kokoro"})
 
-        loaded = {}
-
-        def prepare():
-            """Load the model ONCE, and only after the lock is ours.
-
-            Loading first would leave the lock free for the multi-second
-            spin-up, so every hook firing in that window spawns another
-            `uv run` plus a full ONNX load - all but one of which then exit
-            on the lock. Paying that cost once per turn is the whole point
-            of the drain loop.
-            """
+        def open_speaker():
+            """Load the model ONCE, and only after the lock is ours."""
             if not ensure_models():
-                return False
+                return None
             try:
                 from kokoro_onnx import Kokoro
 
-                loaded["kokoro"] = Kokoro(str(MODEL_FILE), str(VOICES_FILE))
+                speaker = KokoroSpeaker(Kokoro(str(MODEL_FILE), str(VOICES_FILE)), root / "play")
+                speaker.warm_up()
+                return speaker
             except Exception as error:
                 log("[ERROR] Model load failed: " + str(error))
-                return False
-            return True
+                return None
 
-        def speak_one(item):
-            kokoro = loaded["kokoro"]
-            text = item["text"]
-            voice = item.get("voice") or DEFAULT_VOICE
-            # Refresh the lock BEFORE synthesis starts, not after it returns:
-            # drain() set the expiry to its own lock_seconds, and a full prose
-            # item (up to 6000 chars) can take longer than that to render. An
-            # expiry inside the synthesis window reads as "free" to the next
-            # hook, which starts a second drainer - two voices on one speaker.
-            # Same length-proportional estimate speak_text() uses.
-            update_lock_expiry(root, 10.0 + 0.4 * len(text.split()))
-            try:
-                # Stream: each chunk plays as it is synthesized, and play_chunk
-                # keeps extending the lock. Without this the whole item renders
-                # before a single word is heard - the dead air this queue
-                # exists to remove.
-                return stream_chunks(kokoro, text, voice, root)
-            except Exception as error:
-                log("[ERROR] Streaming failed: " + str(error))
-                log("[FALLBACK] Falling back to standard synthesis...")
-                return _speak_whole_keeping_lock(kokoro, text, voice, root)
-
-        return drain(root, speak_one, {"kokoro"}, prepare=prepare)
+        return drain(root, open_speaker, {"kokoro"})
 
     parsed = parse_args(sys.argv[1:])
     if parsed is None:

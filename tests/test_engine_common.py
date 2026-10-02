@@ -112,4 +112,14 @@ check("drain_root is None without one",
       engine_common.drain_root(["x.py", "--drain"]) is None
       and engine_common.drain_root(["x.py", "--drain", "--voice"]) is None)
 
+# --- a dead engine's lock is stale even before it expires (Review Focus 5) ------
+import subprocess
+gone = subprocess.Popen([sys.executable, "-c", "pass"])
+gone.wait()
+engine_common.tts_lock_path(ROOT).write_text(
+    json.dumps({"expiry": time.time() + 60, "pid": gone.pid}))
+check("a lock whose engine has exited is not live", engine_common.lock_is_live(ROOT) is False)
+check("and a new engine takes it over", engine_common.try_claim_lock(ROOT, 30.0) is True)
+engine_common.remove_tts_lock(ROOT)
+
 report()

@@ -37,10 +37,24 @@ def run_drain(engine="macos", timeout=None):
     return proc.stderr, proc.returncode
 
 
+class Collect:
+    """A speaker that records each sentence and finishes it at once."""
+
+    def __init__(self, sink):
+        self.sink = sink
+
+    def prefetch(self, sentence, voice):
+        pass
+
+    def begin(self, sentence, voice, upcoming=None):
+        self.sink.append(sentence)
+        return engine_common.Playback()
+
+
 # --- drains the whole spool, in order --------------------------------------
 spool.clear()
 for word in ("first line", "second line", "third line"):
-    spool.enqueue(word, "macos-female", "Samantha")
+    spool.enqueue(word, "macos-female", "Samantha", utterance="U1")
     time.sleep(0.002)
 stderr, code = run_drain("macos")
 spoken = [line.split("[voiceover] ", 1)[1].strip()
@@ -77,9 +91,9 @@ engine_common.remove_tts_lock(ROOT)
 spool.clear()
 spool.enqueue("kokoro only", "kokoro", "bf_emma")
 time.sleep(0.002)
-spool.enqueue("mine to speak", "macos-female", "Samantha")
+spool.enqueue("mine to speak", "macos-female", "Samantha", utterance="U2")
 time.sleep(0.002)
-spool.enqueue("mine as well", "macos-female", "Samantha")
+spool.enqueue("mine as well", "macos-female", "Samantha", utterance="U2")
 stderr, code = run_drain("macos")
 spoken = [line.split("[voiceover] ", 1)[1].strip()
           for line in stderr.splitlines() if "[voiceover] " in line]
@@ -149,8 +163,7 @@ def take_empty_first(*args):
 engine_common.take_oldest = take_empty_first
 spoken_items = []
 try:
-    code = engine_common.drain(ROOT,
-        lambda item: spoken_items.append(item["text"]) or True, {"macos-female"})
+    code = engine_common.drain(ROOT, lambda: Collect(spoken_items), {"macos-female"})
 finally:
     engine_common.take_oldest = real_take
 
@@ -171,7 +184,7 @@ check("no orphaned .taken file is left behind",
 # is ever reached.
 spool.clear()
 spool.enqueue("appended in the gap", "macos-female", "Samantha")
-foreign_payload = json.dumps({"expiry": time.time() + 300, "pid": 999999})
+foreign_payload = json.dumps({"expiry": time.time() + 300, "pid": os.getpid()})
 
 real_take = engine_common.take_oldest
 looks = {"n": 0}
@@ -187,7 +200,7 @@ def take_empty_first(*args):
 
 engine_common.take_oldest = take_empty_first
 try:
-    code = engine_common.drain(ROOT, lambda item: True, {"macos-female"})
+    code = engine_common.drain(ROOT, lambda: Collect([]), {"macos-female"})
 finally:
     engine_common.take_oldest = real_take
 
@@ -238,5 +251,15 @@ if not timed_out:
           json.loads(sorted(spool.queue_dir().glob("*.json"))[0].read_text())["text"]
           == "kokoro only, must survive")
     check("the lock is released afterwards", engine_common.lock_is_live(ROOT) is False)
+
+# --- separate messages queued together: only the newest is heard ---------------
+spool.clear()
+for word in ("stale one", "stale two", "the newest"):
+    spool.enqueue(word, "macos-female", "Samantha")
+    time.sleep(0.002)
+stderr, code = run_drain("macos")
+spoken = [line.split("[voiceover] ", 1)[1].strip()
+          for line in stderr.splitlines() if "[voiceover] " in line]
+check("the jump rule holds end to end", spoken == ["the newest"], spoken)
 
 report()

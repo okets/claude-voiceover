@@ -31,7 +31,7 @@ from .settings import (
 )
 from .templates import truncate_to_words
 from .debuglog import log as _log
-from .projects import project_dir
+from .projects import project_dir, session_slug
 
 _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 _TTS_DIR = _PLUGIN_ROOT / "tts"
@@ -156,6 +156,24 @@ def ensure_drainer(cwd=None) -> bool:
         return spawned
     except Exception:
         return False
+
+
+def request_stop(cwd=None, session=None) -> None:
+    """Ask the project's engine to stop session's sentence now (None: any).
+
+    The engine stops only items queued before this request, so a stale
+    request can never cut the reply that follows. One file per session -
+    <project>/stop/<slug or _all>.json, {"ts"} - written atomically.
+    """
+    try:
+        directory = project_dir(cwd) / "stop"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / ((session_slug(session) or "_all") + ".json")
+        temp = path.with_name("%s.%d.tmp" % (path.name, os.getpid()))
+        temp.write_text(json.dumps({"ts": time.time()}))
+        os.replace(str(temp), str(path))
+    except OSError:
+        pass
 
 
 def _drain_command(engine, root):
