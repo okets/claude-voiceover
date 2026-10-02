@@ -2,9 +2,9 @@
 
 Kills ONLY processes this plugin spawned. The legacy version ran a bare
 ``pkill -f say``, which matched any process whose command line contained
-the substring "say" — that is fixed here: Unix patterns match our engine
-scripts (kokoro_voice.py / macos_say.py) and the exact ``say -v <voice>``
-invocations macos_say.py produces.
+the substring "say" — that is fixed here: Unix patterns match our ONE-SHOT
+engine scripts and their audio children, but never the narrator drainers
+running `--drain <project>` which may be narrating another project.
 """
 
 import json
@@ -14,18 +14,21 @@ import subprocess
 import sys
 from pathlib import Path
 
-# Full-command patterns for processes we spawn (pkill -f / psutil cmdline).
+# Full-command patterns for the ONE-SHOT speaker (pkill -f / psutil cmdline).
+# Narrator drainers run as `--drain <project dir>`, speak through
+# `say --voice=<Name>` and play wavs from their project's play/ directory, so
+# none of these reach them: another project may be narrating, and a
+# concise-level interrupt must not cut it off. Every one-shot caller uses the
+# `kokoro_voice.py --voice ...` form.
 TTS_PROCESS_PATTERNS = [
-    "kokoro_voice.py",
-    "macos_say.py",
+    "kokoro_voice.py --voice",
+    "macos_say.py --voice",
     "tts_controller.py",
-    # The `say` children macos_say.py launches (contract voices only) —
-    # anchored on the voice flag so unrelated processes never match.
+    # The `say` children macos_say.py's one-shot path launches.
     "say -v Samantha",
     "say -v Daniel",
-    # kokoro's temp-wav playback child - anchored on .wav so a user's own
-    # afplay of music etc. never matches (same tradeoff as tts_controller).
-    "afplay .*\\.wav",
+    # kokoro's one-shot temp-wav playback child.
+    "afplay .*voiceover-oneshot-.*\\.wav",
 ]
 
 
@@ -86,8 +89,8 @@ def stop_all_tts(lock_path=None) -> None:
 
 
 def _kill_lock_owner_group(lock_path) -> None:
-    """POSIX only: engines run as session leaders, so PID == PGID. The PID is
-    verified against our engine names before signalling, in case it was
+    """POSIX only: one-shot engines run as session leaders, so PID == PGID. The
+    PID is verified against our engine names before signalling, in case it was
     recycled. Windows relies on the pattern kill below."""
     if sys.platform == "win32":
         return

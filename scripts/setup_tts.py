@@ -145,7 +145,7 @@ def speak_test():
     engine = settings.resolve_engine()
     if engine == "kokoro":
         command = ["uv", "run", "--project", str(PLUGIN_ROOT / "tts"),
-                   str(PLUGIN_ROOT / "tts" / "kokoro_voice.py"), settings.get_voice(), text]
+                   str(PLUGIN_ROOT / "tts" / "kokoro_voice.py"), "--voice", settings.get_voice(), text]
     elif engine in ("macos-female", "macos-male"):
         voice = "Samantha" if engine == "macos-female" else "Daniel"
         command = [sys.executable, str(PLUGIN_ROOT / "tts" / "macos_say.py"), "--voice", voice, text]
