@@ -13,14 +13,15 @@ export type Op =
   | { op: 'dialog'; tool: string; input: unknown; utterance: string | null }
   | { op: 'turn-end'; spoken: boolean }
 
-export type Reply = { narrate: boolean }
+export type Reply = { narrate: boolean | null }
 
-/** The bridge's answer is its last stdout line: {"narrate": bool}. */
+/** The bridge's answer is its last stdout line: {"narrate": bool}. Anything else - no output, a crash, the bridge's own null - is unknown. */
 export function parseReply(stdout: string): Reply {
   const line = stdout.trim().split('\n').pop() ?? ''
   try {
-    return { narrate: (JSON.parse(line) as { narrate?: unknown }).narrate === true }
+    const narrate = (JSON.parse(line) as { narrate?: unknown } | null)?.narrate
+    return { narrate: typeof narrate === 'boolean' ? narrate : null }
   } catch {
-    return { narrate: false }
+    return { narrate: null }
   }
 }

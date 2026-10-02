@@ -62,3 +62,9 @@ test('flushing only whitespace yields nothing', () => {
   segmenter.push('Done. ')
   expect(segmenter.flush()).toEqual([])
 })
+
+test('an indented fence (a list item\'s code) is held until it closes', () => {
+  const segmenter = createSegmenter()
+  expect(segmenter.push('- Run this:\n   ```bash\n   ls -la\n')).toEqual(['- Run this:\n'])
+  expect(segmenter.push('   ```\nDone. ')).toEqual(['   ```bash\n   ls -la\n   ```\n', 'Done. '])
+})

@@ -1,7 +1,7 @@
 /**
  * Cuts streaming markdown into speakable segments: one per sentence or line,
  * as soon as each completes. A fenced code block (``` at the start of a
- * line) is held until it closes and emitted whole, so the bridge's cleaner
+ * line, after any indentation) is held until it closes and emitted whole, so the bridge's cleaner
  * turns it into the spoken code cue; ``` inside a line is text.
  *
  * Scanning resumes where the last push stopped, so a long fence streamed in
@@ -23,13 +23,18 @@ export function createSegmenter(): Segmenter {
   let inFence = false // fence state at `scanned`
   let startsLine = true // whether buffer[0] begins a line
 
-  const atLineStart = (i: number): boolean => (i === 0 ? startsLine : buffer[i - 1] === '\n')
+  /** Whether a fence marker at i opens its line: only spaces or tabs before it (a list item indents its code). */
+  const opensLine = (i: number): boolean => {
+    let j = i - 1
+    while (j >= 0 && (buffer[j] === ' ' || buffer[j] === '\t')) j -= 1
+    return j < 0 ? startsLine : buffer[j] === '\n'
+  }
 
   /** End (exclusive) of the first complete segment, or -1 (and remember how far it got). */
   const boundary = (): number => {
     let i = scanned
     while (i < buffer.length) {
-      if (buffer[i] === '`' && atLineStart(i)) {
+      if (buffer[i] === '`' && opensLine(i)) {
         const marker = buffer.slice(i, i + FENCE.length)
         if (marker === FENCE) {
           inFence = !inFence

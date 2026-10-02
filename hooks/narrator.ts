@@ -20,13 +20,13 @@ import { parseReply, type Op } from './bridge'
 import { isUsersOwnPrompt } from './origin'
 import { createSegmenter, type Segmenter } from './segment'
 
-type Pending = { op: Op; settle: (narrate: boolean) => void }
+type Pending = { op: Op; settle: (narrate: boolean | null) => void }
 
 const SPEAKABLE = /[A-Za-z0-9]/
 
 let queue: Pending[] = []
 let pumping = false
-/** This turn's narrator gate; undefined until a start, a prompt or a recovery asks for it. */
+/** This turn's narrator gate; undefined until a start, a prompt or a recovery asks for it, and again after an unknown answer. */
 let gate: Promise<boolean> | undefined
 /** The utterance of the last text sent this turn: a dialog alert continues it. */
 let lastUtterance: string | null = null
@@ -38,7 +38,7 @@ function debug($: EngineInterface, text: string): void {
 }
 
 /** One bridge call. The session id and root are read per call: /clear and resume change the id. */
-async function runBatch($: EngineInterface, ops: readonly Op[]): Promise<boolean> {
+async function runBatch($: EngineInterface, ops: readonly Op[]): Promise<boolean | null> {
   const [session, cwd] = await Promise.all([$.session.id(), $.session.root()])
   const { stdout } = await $.process.run(
     ['bash', `${$.plugin.root}/hooks/run.sh`, 'mod_bridge'],
@@ -53,7 +53,7 @@ async function pump($: EngineInterface): Promise<void> {
   while (queue.length > 0) {
     const batch = queue
     queue = []
-    let narrate = false
+    let narrate: boolean | null = null // unknown when the call fails
     try {
       narrate = await runBatch($, batch.map(entry => entry.op))
     } catch (error) {
@@ -64,18 +64,34 @@ async function pump($: EngineInterface): Promise<void> {
   pumping = false
 }
 
-/** Sends op to the bridge, after every op sent before it. Resolves with the gate; never rejects. */
-function send($: EngineInterface, op: Op): Promise<boolean> {
-  return new Promise<boolean>(settle => {
+/** Sends op to the bridge, after every op sent before it. Resolves with the gate, null when unknown; never rejects. */
+function send($: EngineInterface, op: Op): Promise<boolean | null> {
+  return new Promise<boolean | null>(settle => {
     queue.push({ op, settle })
     if (!pumping) void pump($)
   })
 }
 
-/** This turn's gate; after a module reload lost it, ask the bridge with a status op. */
+/**
+ * Asks the bridge for this turn's gate with op. An unknown answer is asked
+ * once more with status on the same promise, so the sentences already
+ * waiting keep their order; still unknown, it reads as off and leaves no
+ * gate, so the next op asks again. One failed call never silences a turn.
+ */
+function openGate($: EngineInterface, op: Op): Promise<boolean> {
+  const asked: Promise<boolean> = send($, op)
+    .then(narrate => (narrate === null ? send($, { op: 'status' }) : narrate))
+    .then(narrate => {
+      if (narrate === null && gate === asked) gate = undefined
+      return narrate === true
+    })
+  gate = asked
+  return asked
+}
+
+/** This turn's gate; after a module reload or an unknown answer lost it, ask the bridge with a status op. */
 function currentGate($: EngineInterface): Promise<boolean> {
-  gate ??= send($, { op: 'status' })
-  return gate
+  return gate ?? openGate($, { op: 'status' })
 }
 
 /** Sends op once the gate says this session narrates. */
@@ -84,7 +100,7 @@ function whenNarrating($: EngineInterface, op: Op): void {
 }
 
 /** Sends op after the gate is known, whatever it says (the bridge releases when narration is off). */
-function always($: EngineInterface, op: Op): Promise<boolean> {
+function always($: EngineInterface, op: Op): Promise<boolean | null> {
   return currentGate($).then(() => send($, op))
 }
 
@@ -103,7 +119,7 @@ function questionsOf(e: unknown): unknown {
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
-    gate = send($, { op: 'start' })
+    void openGate($, { op: 'start' })
     return started
   })
 
@@ -117,7 +133,7 @@ export const register: Register = on => {
     // Never awaited: the prompt is not delayed. The gate resolves long before
     // the first text (no turn's first text came sooner than 1.84s after its
     // prompt, across 169 measured turns).
-    gate = send($, { op: 'prompt', cutover: isUsersOwnPrompt(e.origin) })
+    void openGate($, { op: 'prompt', cutover: isUsersOwnPrompt(e.origin) })
     return next(e)
   })
 

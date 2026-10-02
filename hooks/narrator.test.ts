@@ -1,15 +1,19 @@
 import type { On } from 'claude-code'
 import { expect, test } from 'claude-code/testing'
 
-type SentOp = { op: string; session: string; text?: string; utterance?: string | null; spoken?: boolean; input?: unknown; cutover?: boolean }
+type SentOp = { op: string; session: string; text?: string; utterance?: string | null; spoken?: boolean; input?: unknown; cutover?: boolean; tool?: string }
 
 /** Stands beneath the mod for the engine: the bridge process, the session, the event bottoms. */
-function fakeEngine(on: On, narrate: boolean, options: { bridgeFails?: boolean; ids?: string[] } = {}) {
+function fakeEngine(on: On, narrate: boolean, options: { failures?: number; ids?: string[] } = {}) {
   const ops: SentOp[] = []
   const ids = [...(options.ids ?? ['S1'])]
+  let failures = options.failures ?? 0
   const waiters: { check: (sent: SentOp[]) => boolean; done: () => void }[] = []
   on('process.run', async (_$, e) => {
-    if (options.bridgeFails) throw new Error('bridge down')
+    if (failures > 0) {
+      failures -= 1
+      throw new Error('bridge down')
+    }
     const batch = JSON.parse(e.init?.stdin ?? '{}') as { session: string; ops?: Omit<SentOp, 'session'>[] }
     ops.push(...(batch.ops ?? []).map(op => ({ ...op, session: batch.session })))
     for (const waiter of waiters.splice(0)) {
@@ -133,7 +137,7 @@ test('after a lost state the mod recovers the gate with a status op', async ($, 
 })
 
 test('a failing bridge never breaks the stream', async ($, on) => {
-  fakeEngine(on, true, { bridgeFails: true })
+  fakeEngine(on, true, { failures: Infinity })
   const chunks = [text('Still shown. '), stop]
   fakeStep(on, () => chunks)
   await $.prompt.submit(prompt())
@@ -172,4 +176,74 @@ test('the turn end says whether the last step spoke; a subagent turn end is igno
   await $.turn.complete(turnEnd())
   await engine.until(sent => sent.filter(o => o.op === 'turn-end').length === 2)
   expect(engine.ops.filter(o => o.op === 'turn-end').map(o => o.spoken)).toEqual([true, false])
+})
+
+test('one failed bridge call is asked again, and the sentences waiting keep their order', async ($, on) => {
+  const engine = fakeEngine(on, true, { failures: 1 })
+  fakeStep(on, () => [text('One. Two. ')])
+  await $.prompt.submit(prompt())
+  await collect($.turn.step(step()))
+  await engine.until(sent => sent.filter(o => o.op === 'say').length === 2)
+  expect(opsOf(engine.ops)).toEqual(['status', 'hold', 'say', 'say'])
+  expect(engine.ops.filter(o => o.op === 'say').map(o => o.text)).toEqual(['One. ', 'Two. '])
+})
+
+test('a gate still unknown after its retry opens none: the next op asks again', async ($, on) => {
+  const engine = fakeEngine(on, true, { failures: 2 })
+  fakeStep(on, turnId => [text(turnId === 'LOST' ? 'Lost. ' : 'Heard. ')])
+  on('tool.call', { tool: 'ExitPlanMode' }, async () => ({ result: {} as never, text: 'approved' }) as never)
+  await $.prompt.submit(prompt())
+  await collect($.turn.step(step({ turnId: 'LOST' })))
+  await $.tool.call({ tool: 'ExitPlanMode' } as never) // settles only after the failed gate has
+  await collect($.turn.step(step({ turnId: 'NEXT' })))
+  await engine.until(sent => sent.some(o => o.op === 'say'))
+  expect(engine.ops.filter(o => o.op === 'say').map(o => o.text)).toEqual(['Heard. '])
+  expect(opsOf(engine.ops)).toContain('status')
+})
+
+test('a step that ended without a stop reason is not flushed', async ($, on) => {
+  const engine = fakeEngine(on, true)
+  on('turn.step', async function* (_$, e) {
+    yield text(e.turnId === 'OPEN' ? 'An open thought' : 'Closed. ') as never
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: e.turnId === 'OPEN' ? null : 'end_turn', usage: null }
+  })
+  await $.prompt.submit(prompt())
+  await collect($.turn.step(step({ turnId: 'OPEN' })))
+  await collect($.turn.step(step()))
+  await engine.until(sent => sent.some(o => o.op === 'say'))
+  expect(engine.ops.filter(o => o.op === 'say').map(o => o.text)).toEqual(['Closed. '])
+})
+
+test('after session.start the gate comes from the start op', async ($, on) => {
+  const engine = fakeEngine(on, true)
+  fakeStep(on, () => [text('Welcome back. ')])
+  await $.session.start({ cwd: '/work/project' } as never)
+  await collect($.turn.step(step()))
+  await engine.until(sent => sent.some(o => o.op === 'say'))
+  expect(opsOf(engine.ops)).toEqual(['start', 'hold', 'say'])
+})
+
+test('a dialog with no lead-in carries no utterance', async ($, on) => {
+  const engine = fakeEngine(on, true)
+  on('tool.call', { tool: 'ExitPlanMode' }, async () => ({ result: {} as never, text: 'approved' }) as never)
+  await $.prompt.submit(prompt())
+  await $.turn.start({ turnId: 'T' } as never)
+  await $.tool.call({ tool: 'ExitPlanMode' } as never)
+  await engine.until(sent => sent.some(o => o.op === 'dialog'))
+  const dialog = engine.ops.find(o => o.op === 'dialog')
+  expect(dialog?.tool).toBe('ExitPlanMode')
+  expect(dialog?.utterance).toBe(null)
+  expect(dialog?.input).toEqual({})
+})
+
+test('a prompt typed mid-turn keeps the lead-in a later dialog continues', async ($, on) => {
+  const engine = fakeEngine(on, true)
+  fakeStep(on, () => [text('Let me check. ')])
+  on('tool.call', { tool: 'AskUserQuestion' }, async () => ({ result: {} as never, text: 'answered' }) as never)
+  await $.prompt.submit(prompt())
+  await collect($.turn.step(step()))
+  await $.prompt.submit(prompt()) // typed while the turn runs: no turn.start
+  await $.tool.call({ tool: 'AskUserQuestion', questions: [] } as never)
+  await engine.until(sent => sent.some(o => o.op === 'dialog'))
+  expect(engine.ops.find(o => o.op === 'dialog')?.utterance).toBe('T:0')
 })
