@@ -17,6 +17,7 @@ from pathlib import Path
 DEFAULTS = {
     "interaction_level": "concise",     # silent | quiet | concise | verbose | narrator
     "tts_engine": "auto",               # auto | kokoro | macos-female | macos-male | none
+    "tts_device": "cpu",                # cpu | gpu (Kokoro on an NVIDIA GPU; opt-in, falls back to cpu)
     "tts_enabled": True,
     "notification_sounds": True,        # quiet-mode mp3 pings
     "voice": None,                      # explicit kokoro voice id, else per-project hash
@@ -133,6 +134,18 @@ def _load_json(path: Path) -> dict:
     except (OSError, ValueError):
         pass
     return {}
+
+
+# Settings that describe the machine, not a project: global file -> DEFAULTS only.
+# The Kokoro engine reads these too (engine_common.global_setting), and it has no
+# project to resolve against, so launcher and engine must agree on one scope.
+MACHINE_SETTINGS = ("tts_device",)
+
+
+def get_machine_setting(key: str):
+    """Global file -> DEFAULTS. For MACHINE_SETTINGS, which have no project scope."""
+    source = _load_json(_global_settings_path())
+    return source[key] if key in source else DEFAULTS.get(key)
 
 
 def get_setting(key: str, cwd=None):

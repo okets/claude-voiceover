@@ -91,6 +91,18 @@ Narrator level tells you what Claude wrote; the bundled **Narration** output sty
 
 Nothing phones home. All speech is generated on your machine.
 
+### Optional: Kokoro on an NVIDIA GPU (Linux / Windows, x86_64)
+
+Kokoro runs on the CPU by default, everywhere. On a machine with an NVIDIA GPU you can move it there:
+
+```
+python3 scripts/manage_settings.py set tts_device gpu
+```
+
+The next narration builds the separate `tts-gpu` environment (`onnxruntime-gpu` with its CUDA and cuDNN wheels, about 2.5GB, one time) and runs Kokoro on CUDA. It needs a recent NVIDIA driver (CUDA 13: roughly 580 or newer), not a system CUDA install. Kokoro loads on the GPU and proves it with one short synthesis; if anything fails it reloads on the CPU and keeps talking, and `debug_log` records the device actually used. It is a machine-wide setting (no `--project`). macOS and arm machines always use the CPU environment, and the default `tts` environment is never touched. `set tts_device cpu` switches back.
+
+Measured on a GTX 1650 (i7-9750H): a narration's first audio in ~2.1 s instead of ~3.7 s, about 3x faster per sentence in a warm engine, and about 64% less CPU time per narration. It costs ~1.1GB of VRAM while speaking and ~0.9GB more RAM.
+
 ## Install and update
 
 Install with the Quickstart commands above. The reload loads the hooks and the mod. If narration doesn't start, restart Claude Code.

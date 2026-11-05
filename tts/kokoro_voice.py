@@ -27,7 +27,8 @@ import time
 import urllib.request
 from pathlib import Path
 
-from engine_common import Playback, ProcessPlayback, data_dir, remove_tts_lock, try_claim_lock, update_lock_expiry
+from engine_common import (Playback, ProcessPlayback, data_dir, engine_log, global_setting, remove_tts_lock,
+                           try_claim_lock, update_lock_expiry)
 
 DRY_RUN = bool(os.environ.get("VOICEOVER_DRY_RUN"))
 
@@ -70,6 +71,86 @@ def log(message):
     """Diagnostics go to stderr; stdout stays silent for the hook protocol."""
     print(message, file=sys.stderr)
 
+
+# --- model loading: CPU by default, NVIDIA GPU when tts_device is "gpu" -------
+
+_CPU = "CPUExecutionProvider"
+_CUDA = "CUDAExecutionProvider"
+
+
+def _gpu_provider():
+    """CUDA when the gpu extra is installed and usable, else None.
+
+    The gpu extra ships CUDA and cuDNN as pip wheels; onnxruntime only finds
+    them after preload_dlls(). Without that step it silently falls back to CPU.
+    """
+    try:
+        import onnxruntime
+        if hasattr(onnxruntime, "preload_dlls"):
+            onnxruntime.preload_dlls()
+        if _CUDA in onnxruntime.get_available_providers():
+            return _CUDA
+    except Exception as error:
+        log("[voiceover] GPU unavailable, using CPU: " + str(error))
+    return None
+
+
+def choose_onnx_provider():
+    """The ONNX provider for the tts_device setting.
+
+    An ONNX_PROVIDER already in the environment wins. Otherwise CPU, unless the
+    machine opted into "gpu" and CUDA is usable. CPU is always named explicitly
+    (by _load_on), so no installed package can change CPU behaviour.
+    """
+    if os.environ.get("ONNX_PROVIDER"):
+        return os.environ["ONNX_PROVIDER"]
+    wants_gpu = global_setting("tts_device", "cpu") == "gpu"
+    return (_gpu_provider() if wants_gpu else None) or _CPU
+
+
+def _active_provider(kokoro):
+    """The provider the loaded session really runs on, for diagnostics only."""
+    try:
+        return kokoro.sess.get_providers()[0]
+    except Exception:
+        return "unknown"
+
+
+_PROBE_VOICE = "af_sky"
+
+
+def _load_on(provider):
+    """A Kokoro model whose ONNX session runs on provider."""
+    os.environ["ONNX_PROVIDER"] = provider
+    from kokoro_onnx import Kokoro
+
+    return Kokoro(str(MODEL_FILE), str(VOICES_FILE))
+
+
+def _load_accelerated(provider):
+    """The model on an accelerated provider, proven by one short synthesis.
+
+    CUDA can load and still fail on first use (driver too old for the CUDA
+    build, no kernel image for the card, out of VRAM). Returns None on failure.
+    """
+    try:
+        kokoro = _load_on(provider)
+        kokoro.create("Ready.", voice=_PROBE_VOICE, speed=1.0)
+        return kokoro
+    except Exception as error:
+        log("[voiceover] %s failed, falling back to CPU: %s" % (provider, error))
+        engine_log("device", "fallback provider=%s error=%s" % (provider, error))
+        return None
+
+
+def load_kokoro():
+    """Load the Kokoro model on the configured device, falling back to CPU."""
+    requested = choose_onnx_provider()
+    kokoro = _load_accelerated(requested) if requested != _CPU else None
+    if kokoro is None:
+        kokoro = _load_on(_CPU)
+    engine_log("device", "requested=%s active=%s" % (requested, _active_provider(kokoro)))
+    return kokoro
 
 # --- audio playback (inline port of the cross-platform player) --------------
 
@@ -425,9 +506,7 @@ def speak_text(text, voice, use_streaming=False):
         if not try_claim_lock(data_dir(), 10.0 + 0.4 * len(text.split())):
             return True  # another narration is playing - skip quietly
         try:
-            from kokoro_onnx import Kokoro
-
-            kokoro = Kokoro(str(MODEL_FILE), str(VOICES_FILE))
+            kokoro = load_kokoro()
             if use_streaming:
                 return speak_streaming(kokoro, text, voice)
             return speak_standard(kokoro, text, voice)
@@ -502,9 +581,7 @@ def main():
             if not ensure_models():
                 return None
             try:
-                from kokoro_onnx import Kokoro
-
-                speaker = KokoroSpeaker(Kokoro(str(MODEL_FILE), str(VOICES_FILE)), root / "play")
+                speaker = KokoroSpeaker(load_kokoro(), root / "play")
                 speaker.warm_up()
                 return speaker
             except Exception as error:

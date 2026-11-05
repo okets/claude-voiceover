@@ -44,7 +44,7 @@ _UNSAFE = re.compile(r"[^A-Za-z0-9_-]")
 POLL_SECONDS = 0.05
 _SENTENCE_BREAK = re.compile(r"(?<=[.!?])\s+|\n+")
 _LOG_MAX_BYTES = 200_000
-_debug = None
+_global_settings = None
 
 
 # --- data dir / tts.lock ----------------------------------------------------
@@ -306,16 +306,24 @@ def put_back(taken_path) -> None:
 
 # --- logging ----------------------------------------------------------------
 
-def _debug_enabled():
-    """The global debug_log setting, read once per engine process."""
-    global _debug
-    if _debug is None:
+def global_setting(key, default=None):
+    """A value from the global settings file (data_dir()/settings.json), read
+    once per engine process. Machine-wide settings only: the engine has no cwd
+    to resolve project overrides against. Never raises."""
+    global _global_settings
+    if _global_settings is None:
         try:
             with open(data_dir() / "settings.json", encoding="utf-8") as handle:
-                _debug = bool(json.load(handle).get("debug_log"))
+                loaded = json.load(handle)
+            _global_settings = loaded if isinstance(loaded, dict) else {}
         except Exception:
-            _debug = False
-    return _debug
+            _global_settings = {}
+    return _global_settings.get(key, default)
+
+
+def _debug_enabled():
+    """The global debug_log setting."""
+    return bool(global_setting("debug_log", False))
 
 
 def engine_log(tag, message):

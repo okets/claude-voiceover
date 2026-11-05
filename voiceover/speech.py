@@ -14,6 +14,7 @@ With env VOICEOVER_DRY_RUN set, speak()/play_sound() print
 
 import json
 import os
+import platform
 import subprocess
 import sys
 import time
@@ -23,6 +24,7 @@ from . import lease, process_utils, spool
 from .audio_player import play_audio_file
 from .settings import (
     data_dir,
+    get_machine_setting,
     get_setting,
     get_voice,
     is_tts_enabled,
@@ -35,6 +37,7 @@ from .projects import project_dir, session_slug
 
 _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 _TTS_DIR = _PLUGIN_ROOT / "tts"
+_TTS_GPU_DIR = _PLUGIN_ROOT / "tts-gpu"
 _SOUNDS_DIR = Path(__file__).resolve().parent / "sounds"
 
 _LOCK_FILE_NAME = "tts.lock"
@@ -211,11 +214,34 @@ def request_stop(cwd=None, session=None) -> None:
         pass
 
 
+def gpu_capable(system=None, machine=None) -> bool:
+    """True where the onnxruntime-gpu wheels exist: x86_64 Linux/Windows, never macOS."""
+    system = sys.platform if system is None else system
+    machine = (platform.machine() if machine is None else machine).lower()
+    return system != "darwin" and machine in ("x86_64", "amd64")
+
+
+def kokoro_project(device=None) -> Path:
+    """The uv project to run Kokoro from: tts-gpu for an opted-in, capable machine."""
+    device = get_machine_setting("tts_device") if device is None else device
+    return _TTS_GPU_DIR if device == "gpu" and gpu_capable() else _TTS_DIR
+
+
+def kokoro_command(*args):
+    """The uv argv that runs the Kokoro engine with args, on the configured device.
+
+    tts_device "gpu" switches to the separate tts-gpu project (onnxruntime-gpu with
+    its CUDA/cuDNN wheels), never on macOS. The engine reads the same machine-wide
+    setting to pick its provider and falls back to CPU when the GPU is unusable.
+    """
+    return ["uv", "run", "--project", str(kokoro_project()),
+            str(_TTS_DIR / "kokoro_voice.py")] + list(args)
+
+
 def _drain_command(engine, root):
     """The argv that drains root's spool with engine, or None for no engine."""
     if engine == "kokoro":
-        return ["uv", "run", "--project", str(_TTS_DIR),
-                str(_TTS_DIR / "kokoro_voice.py"), "--drain", str(root)]
+        return kokoro_command("--drain", str(root))
     if engine in _MACOS_VOICES:
         return ["python3", str(_TTS_DIR / "macos_say.py"), "--drain", str(root)]
     return None
@@ -266,11 +292,7 @@ def truncate_for_speech(text, limit: int = 220) -> str:
 
 def _dispatch(message, engine, cwd) -> None:
     if engine == "kokoro":
-        command = [
-            "uv", "run", "--project", str(_TTS_DIR),
-            str(_TTS_DIR / "kokoro_voice.py"),
-            "--voice", get_voice(cwd), "--stream", message,
-        ]
+        command = kokoro_command("--voice", get_voice(cwd), "--stream", message)
     elif engine in _MACOS_VOICES:
         command = [
             "python3", str(_TTS_DIR / "macos_say.py"),

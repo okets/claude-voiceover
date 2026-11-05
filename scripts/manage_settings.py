@@ -31,6 +31,7 @@ LEVEL_DESCRIPTIONS = {
 NUMERIC_ALIASES = {"0": "silent", "1": "quiet", "2": "concise", "3": "verbose", "4": "narrator"}
 
 VALID_ENGINES = ["auto", "kokoro", "macos-female", "macos-male", "none"]
+VALID_DEVICES = ["cpu", "gpu"]
 
 
 def project_settings_path(cwd=None):
@@ -114,6 +115,10 @@ def normalize(key, value):
         if value not in VALID_ENGINES:
             raise ValueError(f"tts_engine must be one of {VALID_ENGINES}")
         return value
+    if key == "tts_device":
+        if value not in VALID_DEVICES:
+            raise ValueError(f"tts_device must be one of {VALID_DEVICES}")
+        return value
     if key == "voice":
         if value is not None and value not in settings.KOKORO_VOICES:
             raise ValueError(f"voice must be null or one of {settings.KOKORO_VOICES}")
@@ -134,6 +139,9 @@ def cmd_set(args):
         value = normalize(args.key, parse_value(args.value))
     except ValueError as error:
         print(f"Invalid value: {error}")
+        return 1
+    if args.project and args.key in settings.MACHINE_SETTINGS:
+        print(f"{args.key} is a machine-wide setting; set it without --project.")
         return 1
     scope = "project" if args.project else "global"
     settings.set_setting(args.key, value, scope=scope)

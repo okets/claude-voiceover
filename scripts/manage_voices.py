@@ -23,6 +23,7 @@ PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PLUGIN_ROOT))
 
 from voiceover import settings  # noqa: E402
+from voiceover.speech import kokoro_command  # noqa: E402
 
 SAMPLE_TEXT = "Hello! This is your Claude Voiceover narrator."
 
@@ -139,10 +140,7 @@ def speak_sample(engine, voice, text):
         print(f"[voiceover] {text}", file=sys.stderr)
         return 0
     if engine == "kokoro":
-        command = [
-            "uv", "run", "--project", str(PLUGIN_ROOT / "tts"),
-            str(PLUGIN_ROOT / "tts" / "kokoro_voice.py"), "--voice", voice, text,
-        ]
+        command = kokoro_command("--voice", voice, text)
     elif engine in MACOS_SAY_VOICES:
         command = [
             sys.executable, str(PLUGIN_ROOT / "tts" / "macos_say.py"),

@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- Optional NVIDIA GPU for the Kokoro engine: machine-wide setting `tts_device`
+  (`cpu` default, `gpu`). `gpu` runs the engine from a separate `tts-gpu` uv project
+  (`onnxruntime-gpu` with CUDA/cuDNN wheels, preloaded before the session; the CPU
+  `onnxruntime` wheel is overridden away so the two never share a package directory).
+  The model proves the GPU with one short synthesis and reloads on CPU on any failure.
+  Linux and Windows x86_64 only; macOS and arm keep the CPU environment, and the
+  default `tts` project is unchanged. `setup_tts.py` reports the device.
+
+### Changed
+- One `kokoro_command()` builds every Kokoro launch (one-shot, drainer, setup test,
+  voice preview), and one `load_kokoro()` loads the model at both engine load sites.
+- The engine reads machine-wide settings through `engine_common.global_setting()`
+  (debug_log uses it too); `settings.get_machine_setting()` is the plugin-side twin.
+
 ## 1.4.0 - 2026-10-02
 
 **Restart every running Claude Code session (or run `/reload-plugins` in it)

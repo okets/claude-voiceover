@@ -49,7 +49,7 @@ for name, cmdline in ONE_SHOTS.items():
 for script in ("scripts/manage_voices.py", "scripts/setup_tts.py"):
     source = (REPO_ROOT / script).read_text()
     check(script + " calls kokoro_voice.py with --voice",
-          re.search(r'kokoro_voice\.py"\),\s*"--voice"', source) is not None)
+          re.search(r'kokoro_voice\.py"\),\s*"--voice"|kokoro_command\(\s*"--voice"', source) is not None)
 
 # --- the kill switch reaches every project and clears its state --------------------
 sys.path.insert(0, str(REPO_ROOT / "tts"))

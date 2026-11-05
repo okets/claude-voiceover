@@ -23,6 +23,7 @@ PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PLUGIN_ROOT))
 
 from voiceover import settings  # noqa: E402
+from voiceover.speech import kokoro_command  # noqa: E402
 
 KOKORO_DIR = Path.home() / ".kokoro-tts" / "models"
 MODEL_FILES = {
@@ -95,6 +96,8 @@ def print_status():
     print()
     print(f"Resolved engine: {settings.resolve_engine()}")
     print(f"Resolved voice:  {settings.get_voice()}")
+    print(f"TTS device:      {settings.get_machine_setting('tts_device')}"
+          " (gpu = NVIDIA CUDA via the tts-gpu environment; manage_settings.py set tts_device gpu)")
     return models_ok and uv_ok
 
 
@@ -144,8 +147,7 @@ def speak_test():
         return True
     engine = settings.resolve_engine()
     if engine == "kokoro":
-        command = ["uv", "run", "--project", str(PLUGIN_ROOT / "tts"),
-                   str(PLUGIN_ROOT / "tts" / "kokoro_voice.py"), "--voice", settings.get_voice(), text]
+        command = kokoro_command("--voice", settings.get_voice(), text)
     elif engine in ("macos-female", "macos-male"):
         voice = "Samantha" if engine == "macos-female" else "Daniel"
         command = [sys.executable, str(PLUGIN_ROOT / "tts" / "macos_say.py"), "--voice", voice, text]

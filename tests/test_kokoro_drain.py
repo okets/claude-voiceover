@@ -174,7 +174,7 @@ check("and its process was killed", hung.poll() is not None)
 
 # --- the first sound is logged when it starts, not when it is begun --------------
 (engine_common.data_dir() / "settings.json").write_text('{"debug_log": true}')
-engine_common._debug = None
+engine_common._global_settings = None
 log_path = engine_common.data_dir() / "voiceover.log"
 if log_path.exists():
     log_path.unlink()
@@ -213,6 +213,6 @@ check("and not before the playback started",
       sound and started_at and float(sound[0].split()[0]) >= started_at[0] - 0.01,
       (sound, started_at))
 check("the line names the item's utterance", sound and "utterance=U9" in sound[0], sound)
-engine_common._debug = None
+engine_common._global_settings = None
 
 report()

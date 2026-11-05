@@ -1,0 +1,37 @@
+# Opt-in NVIDIA GPU environment for the Kokoro engine (setting tts_device = "gpu").
+#
+# A separate uv project, so the default CPU environment in ../tts is never touched.
+# kokoro-onnx always requires the CPU "onnxruntime" wheel, and it would share the
+# onnxruntime/ package directory with "onnxruntime-gpu" (unsupported, and uv links
+# wheels in parallel, so either could win). The override below drops the CPU wheel
+# wherever the GPU wheel installs, and keeps it everywhere else (macOS, arm), so a
+# misconfigured machine still gets a working CPU engine.
+#
+# Keep "dependencies" in sync with ../tts/pyproject.toml (tests/test_tts_device.py checks).
+
+[project]
+name = "claude-voiceover-tts-gpu"
+version = "1.0.0"
+description = "Optional NVIDIA GPU environment for the Claude Voiceover Kokoro engine"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "kokoro-onnx>=0.4.9",
+    "soundfile>=0.13.1",
+    "numpy>=1.24.0",
+    "onnxruntime-gpu[cuda,cudnn]>=1.21; (platform_machine == 'x86_64' or platform_machine == 'AMD64') and sys_platform != 'darwin'",
+]
+
+[tool.uv]
+override-dependencies = [
+    "onnxruntime>=1.20.1; sys_platform == 'darwin' or (platform_machine != 'x86_64' and platform_machine != 'AMD64')",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = []
+
+[tool.setuptools.packages.find]
+exclude = ["*"]
