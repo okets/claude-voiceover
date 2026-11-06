@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.5.0 - 2026-11-06
 
 ### Added
 - Optional NVIDIA GPU for the Kokoro engine: machine-wide setting `tts_device`

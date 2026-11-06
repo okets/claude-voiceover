@@ -523,7 +523,7 @@ All commands invoke scripts with `"${CLAUDE_PLUGIN_ROOT}/scripts/<script>.py"` p
 
 ## .claude-plugin/
 
-- `plugin.json` — name "voiceover", displayName "Claude Voiceover", version 1.4.0,
+- `plugin.json` — name "voiceover", displayName "Claude Voiceover", version 1.5.0,
   description packed with search terms (voice, text-to-speech, TTS, narration, notification
   sounds, Kokoro, offline, local), author Hanan (okets), homepage/repository
   https://github.com/okets/claude-voiceover, license MIT.
