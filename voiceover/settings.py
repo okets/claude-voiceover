@@ -18,6 +18,9 @@ DEFAULTS = {
     "interaction_level": "concise",     # silent | quiet | concise | verbose | narrator
     "tts_engine": "auto",               # auto | kokoro | macos-female | macos-male | none
     "tts_device": "cpu",                # cpu | gpu (Kokoro on an NVIDIA GPU; opt-in, falls back to cpu)
+    "engine_port": None,                # TCP port of the shared Kokoro engine (127.0.0.1); null = socket only
+    "engine_idle_s": None,              # seconds the engine keeps the model loaded; null = 330 with a port, else 60
+    "engine_plugin_root": None,         # plugin directory the engine launcher runs from; null = this install
     "tts_enabled": True,
     "notification_sounds": True,        # quiet-mode mp3 pings
     "voice": None,                      # explicit kokoro voice id, else per-project hash
@@ -139,7 +142,7 @@ def _load_json(path: Path) -> dict:
 # Settings that describe the machine, not a project: global file -> DEFAULTS only.
 # The Kokoro engine reads these too (engine_common.global_setting), and it has no
 # project to resolve against, so launcher and engine must agree on one scope.
-MACHINE_SETTINGS = ("tts_device",)
+MACHINE_SETTINGS = ("tts_device", "engine_port", "engine_idle_s", "engine_plugin_root")
 
 
 def get_machine_setting(key: str):
