@@ -6,6 +6,7 @@ import json
 import os
 import socket
 import stat
+import subprocess
 import sys
 import time
 import warnings
@@ -16,7 +17,8 @@ from _harness import check, isolate, report, REPO_ROOT, temp_dir
 
 isolate()
 sys.path.insert(0, str(REPO_ROOT / "tts"))
-from engine_server import adopt_systemd_listeners, bind_listeners, hold_single_instance
+import engine_paths
+from engine_listeners import adopt_systemd_listeners, bind_listeners, hold_single_instance, open_listeners
 from engine_stub import SineSynth
 from _engine_test_util import Raw, serve, start_line, stop_server
 
@@ -120,6 +122,17 @@ u.send({"op": "status"})
 check("Unix socket: an auth line is accepted and ignored", u.read_event().ev == "status")
 stop_server(srv)
 
+# --- C1: an adopted Unix socket's file outlives the engine (systemd owns it) ----------------------
+adopted_path = WORK / "adopted.sock"
+adopted_sock = socket.socket(socket.AF_UNIX)
+adopted_sock.bind(str(adopted_path))
+adopted_sock.listen(8)
+srv = serve(SineSynth(), [adopted_sock], adopted=True)
+check("C1: the adopted socket serves", Raw(str(adopted_path)).hello().ev == "hello")
+stop_server(srv, "idle")
+check("C1: after the engine exits, systemd's socket file is still there",
+      adopted_path.exists() and stat.S_ISSOCK(adopted_path.stat().st_mode))
+
 # --- bind_listeners (T22, stale socket) -----------------------------------------------------------
 sock_path = WORK / "engine.sock"
 sock_path.write_text("leftover")
@@ -144,29 +157,58 @@ check("with a port: Unix socket plus 127.0.0.1:port",
 for s in with_port:
     s.close()
 
-# --- bind failure leaves no open listener ------------------------------------------------------------------
+# --- I5: a taken TCP port is logged and the engine serves Unix only ------------------------------
 taken = socket.socket()
 taken.bind(("127.0.0.1", 0))
 taken.listen(1)
-raised = False
 with warnings.catch_warnings(record=True) as caught:
     warnings.simplefilter("always")
     try:
-        bind_listeners(sock_path, taken.getsockname()[1])
-    except OSError:
-        raised = True
+        unix_only = bind_listeners(sock_path, taken.getsockname()[1])
+    except OSError as error:
+        unix_only = error
     gc.collect()
 leak_warnings = [w for w in caught if issubclass(w.category, ResourceWarning)]
-probe_unix = socket.socket(socket.AF_UNIX)
-try:
-    probe_unix.connect(str(sock_path))
-    still_listening = True
-except OSError:
-    still_listening = False
-probe_unix.close()
+taken_port = taken.getsockname()[1]
 taken.close()
-check("a taken TCP port raises, and the Unix socket is not left listening",
-      raised and not still_listening and not leak_warnings, (raised, still_listening, leak_warnings))
+check("I5: a taken TCP port does not stop the engine: it serves the Unix socket only",
+      isinstance(unix_only, list) and [s.family for s in unix_only] == [socket.AF_UNIX] and not leak_warnings,
+      (unix_only, leak_warnings))
+log_text = engine_paths.log_path().read_text() if engine_paths.log_path().exists() else ""
+check("I5: the failed TCP bind is logged", "127.0.0.1:%d" % taken_port in log_text
+      and "Unix socket only" in log_text, log_text)
+if isinstance(unix_only, list):
+    for s in unix_only:
+        s.close()
+
+# --- I5: a socket that answers belongs to a live engine (or systemd): never unlinked --------------
+live_path = WORK / "live.sock"
+live = socket.socket(socket.AF_UNIX)
+live.bind(str(live_path))
+live.listen(8)
+live_inode = live_path.stat().st_ino
+check("I5: bind_listeners on an answering socket returns None (another engine serves)",
+      bind_listeners(live_path, None) is None)
+check("I5: and leaves that socket file alone", live_path.stat().st_ino == live_inode)
+
+self_start_data = temp_dir("vo-i5-")
+(self_start_data / "engine").mkdir(mode=0o700)
+answering_path = self_start_data / "engine" / "engine.sock"
+answering = socket.socket(socket.AF_UNIX)
+answering.bind(str(answering_path))
+answering.listen(8)
+answering_inode = answering_path.stat().st_ino
+try:
+    proc = subprocess.run([sys.executable, str(REPO_ROOT / "tts" / "kokoro_engine.py"), "--stub"],
+                          env=dict(os.environ, VOICEOVER_DATA_DIR=str(self_start_data)),
+                          capture_output=True, text=True, timeout=8)
+    exit_code = proc.returncode
+except subprocess.TimeoutExpired:
+    exit_code = "still serving"
+check("I5: a self-start that finds an answering engine.sock exits 0", exit_code == 0, exit_code)
+check("I5: without unlinking it", answering_path.exists() and answering_path.stat().st_ino == answering_inode)
+answering.close()
+live.close()
 
 # --- single instance --------------------------------------------------------------------------------
 lock = WORK / "engine.lock"
@@ -230,5 +272,28 @@ check("systemd: LISTEN_FDS=1 with our pid adopts fd 3 as one Unix socket, and un
 check("systemd: an inherited TCP socket is recognised as AF_INET", adopt_tcp_in_child())
 check("systemd: LISTEN_PID of another process -> None, variables still unset", adopt_in_child(pid_offset=1))
 check("systemd: no variables -> None", adopt_systemd_listeners({}) is None)
+
+
+def open_adopted_in_child(lock_held_elsewhere):
+    """open_listeners under socket activation, with engine.lock free or already held."""
+    def body():
+        lock = WORK / ("adopt%d.lock" % os.getpid())
+        listener = socket.socket(socket.AF_UNIX)
+        listener.bind(str(WORK / ("ad%d.sock" % os.getpid())))
+        listener.listen(4)
+        os.dup2(listener.fileno(), 3)
+        held = hold_single_instance(lock) if lock_held_elsewhere else None   # after dup2: fd 3 is taken
+        os.environ.update(LISTEN_FDS="1", LISTEN_PID=str(os.getpid()))
+        opened = open_listeners(WORK / "unused.sock", None, lock)
+        if opened is None or not opened.adopted or len(opened.sockets) != 1:
+            return False
+        if lock_held_elsewhere:
+            return held is not None and opened.lock_fd is None
+        return isinstance(opened.lock_fd, int) and hold_single_instance(lock) is None
+    return in_child(body)
+
+
+check("I5: an adopted engine holds engine.lock too", open_adopted_in_child(False))
+check("I5: an adopted engine still serves when engine.lock is held elsewhere", open_adopted_in_child(True))
 
 report()

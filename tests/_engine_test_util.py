@@ -79,13 +79,14 @@ class Raw:
         self.sock.close()
 
 
-def serve(synth, listeners, **kwargs):
-    """Run an EngineServer on `listeners` in a thread; returns the server."""
+def serve(synth, listeners, adopted=False, **kwargs):
+    """Run an EngineServer on `listeners` (systemd's when `adopted`) in a thread; returns the server."""
     settings = dict(idle_unload_s=60.0, token=None, plugin_version="9.9.9", plugin_root="/x")
     settings.update(kwargs)
     server = EngineServer(synth, **settings)
     result = []
-    thread = threading.Thread(target=lambda: result.append(server.serve_forever(listeners)), daemon=True)
+    thread = threading.Thread(target=lambda: result.append(server.serve_forever(listeners, adopted=adopted)),
+                              daemon=True)
     thread.start()
     server.result, server.thread = result, thread
     return server

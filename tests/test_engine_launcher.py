@@ -179,6 +179,38 @@ try:
     waiter.join(10)
     check("late waiter returns True when an engine is up", late == [True], late)
     check("late waiter did not block far past its deadline", time.monotonic() - started < 2.5)
+
+    # C2: a pointer whose python is gone -> ensure still starts an engine, through serve's repair.
+    # The plugin root is a copy whose kokoro_engine.py runs the stub, so no model is needed.
+    run_cli("stop")
+    check("engine stopped before the repair test", wait_gone())
+    fake_root = temp_dir("vo-fakeroot-")
+    (fake_root / ".claude-plugin").mkdir()
+    (fake_root / ".claude-plugin" / "plugin.json").write_text('{"version": "1.6.0"}')
+    (fake_root / "tts").mkdir()
+    for source in (REPO_ROOT / "tts").glob("*.py"):
+        if source.name != "kokoro_engine.py":
+            (fake_root / "tts" / source.name).symlink_to(source)
+    (fake_root / "tts" / "kokoro_engine.py").write_text(
+        "import runpy, sys\nsys.argv.append('--stub')\nrunpy.run_path(%r, run_name='__main__')\n"
+        % str(REPO_ROOT / "tts" / "kokoro_engine.py"))
+    uv_dir = temp_dir("vo-fakeuv-")
+    (uv_dir / "uv").write_text("#!/bin/sh\n[ \"$1\" = run ] && echo %s\nexit 0\n" % sys.executable)
+    (uv_dir / "uv").chmod(0o755)
+    engine_paths.write_pointer({"plugin_root": str(fake_root), "plugin_version": "1.6.0", "uv": "/gone/uv",
+                                "python": "/no/such/python", "project": str(fake_root / "tts")})
+    saved_env = dict(os.environ)
+    os.environ.pop("VOICEOVER_ENGINE_STUB", None)
+    os.environ["PATH"] = "%s:%s" % (uv_dir, os.environ.get("PATH", ""))
+    try:
+        started = engine_client.ensure(fake_root, timeout=8.0)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_env)
+    check("C2: ensure starts an engine though the pointer's python is missing", started)
+    repaired = engine_paths.read_pointer() or {}
+    check("C2: serve repaired the pointer before exec",
+          repaired.get("python") == sys.executable and repaired.get("plugin_root") == str(fake_root), repaired)
 finally:
     code, _ = run_cli("stop")
     check("stop exits 0", code == 0)

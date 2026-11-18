@@ -27,7 +27,6 @@ PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PLUGIN_ROOT))
 sys.path.append(str(PLUGIN_ROOT / "tts"))
 
-import engine_launcher  # noqa: E402
 import engine_paths  # noqa: E402
 from voiceover import engine_pointer, settings  # noqa: E402
 from voiceover.speech import kokoro_command  # noqa: E402
@@ -215,8 +214,14 @@ def _port_arg(text):
     return text if text == AUTO_PORT else int(text)
 
 
+def _engine_launcher():
+    """The launcher module, imported only when sharing: it needs fcntl, which Windows lacks."""
+    import engine_launcher
+    return engine_launcher
+
+
 def _launcher(*argv):
-    return engine_launcher.main(list(argv))
+    return _engine_launcher().main(list(argv))
 
 
 def _choose_port(requested):
@@ -235,7 +240,7 @@ def _choose_port(requested):
 def _install_everything(port):
     """prepare, shim, units; an error message, or None."""
     settings.set_setting("engine_port", port)
-    project = engine_launcher.default_project(PLUGIN_ROOT, engine_paths.read_global_settings())
+    project = _engine_launcher().default_project(PLUGIN_ROOT, engine_paths.read_global_settings())
     if _launcher("prepare", str(PLUGIN_ROOT), "--project", str(project)) != 0:
         return "Could not prepare the engine environment (is uv installed?)."
     engine_pointer.install_shim()

@@ -264,10 +264,54 @@ try:
 
     reset_state()
     engine_launcher._run_uv = fake_uv
-    engine_paths.write_pointer({"plugin_root": str(root), "plugin_version": "1.6.1", "python": "/ptr/python"})
+    ptr_python = temp_dir("vo-ptrpy-") / "python"
+    ptr_python.write_text("#!/bin/sh\n")
+    ptr_python.chmod(0o755)
+    engine_paths.write_pointer(good(root, "1.6.1", python=str(ptr_python)))
     uv_calls.clear()
     engine_launcher.main(["serve", "--plugin-root", str(root)])
-    check("serve with a pointer python skips prepare", execs[-1][0] == "/ptr/python" and not uv_calls, (execs, uv_calls))
+    check("serve with a usable, current pointer skips prepare", execs[-1][0] == str(ptr_python) and not uv_calls,
+          (execs, uv_calls))
+
+    # C2: serve repairs an unusable pointer, and runs the POINTER's script with the pointer's python
+    reset_state()
+    engine_paths.write_pointer(good(root, "1.6.1", python="/no/such/python"))
+    uv_calls.clear(); execs.clear()
+    engine_launcher.main(["serve", "--plugin-root", str(root)])
+    check("C2: serve with an unusable pointer (python missing) prepares first",
+          uv_calls == [("/fake/uv", str(root / "tts"))], uv_calls)
+    check("C2: then execs the repaired pointer's python and script",
+          execs and execs[-1][0] == sys.executable and execs[-1][1][1] == str(root / "tts" / "kokoro_engine.py"), execs)
+
+    newer = make_root("9.9.9")
+    reset_state()
+    engine_paths.write_pointer(good(newer, "9.9.9", python=str(ptr_python)))
+    uv_calls.clear(); execs.clear()
+    engine_launcher.main(["serve", "--plugin-root", str(root)])
+    check("C2: a newer pointer's root differs from --plugin-root: no prepare, the pointer root's script runs",
+          not uv_calls and execs and execs[-1][0] == str(ptr_python)
+          and execs[-1][1][1] == str(newer / "tts" / "kokoro_engine.py"), (uv_calls, execs))
+
+    older = make_root("1.0.0")
+    reset_state()
+    engine_paths.write_pointer(good(older, "1.0.0", python=str(ptr_python)))
+    uv_calls.clear(); execs.clear()
+    engine_launcher.main(["serve", "--plugin-root", str(root)])
+    check("C2: an older pointer is superseded: serve prepares this copy and runs its script",
+          uv_calls == [("/fake/uv", str(root / "tts"))] and execs
+          and execs[-1][1][1] == str(root / "tts" / "kokoro_engine.py"), (uv_calls, execs))
+
+    reset_state()
+    engine_paths.write_pointer(good(root, "1.6.1", python="/no/such/python"))
+    engine_launcher._run_uv = lambda uv, project: None
+    execs.clear()
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        code = engine_launcher.main(["serve", "--plugin-root", str(root)])
+    check("C2: a pointer still unusable after prepare: one stderr line, exit 1, no exec",
+          code == 1 and not execs and len(err.getvalue().strip().splitlines()) == 1, (code, execs, err.getvalue()))
+    engine_launcher._run_uv = fake_uv
+    engine_paths.write_pointer(good(root, "1.6.1", python=str(ptr_python)))
     os.execv = lambda python, argv: (_ for _ in ()).throw(FileNotFoundError(2, "No such file", python))
     err = io.StringIO()
     with contextlib.redirect_stderr(err):
@@ -298,16 +342,24 @@ proc = subprocess.run([sys.executable, "-c", driver], capture_output=True, text=
 check("hook calls refresh on a user prompt", marker.exists(), proc.stderr)
 check("hook exits 0 and prints nothing when refresh raises", proc.returncode == 0 and proc.stdout == "", (proc.returncode, proc.stdout, proc.stderr))
 
-# --- the hook refreshes only for Kokoro narrators ----------------------------------------------
-def hook_installs_shim(**settings):
-    """Run the hook (spawn allowed in-process by NO_SPAWN, so only the shim shows) under settings."""
-    for key, value in settings.items():
-        set_setting(key, value)
+# --- the hook refreshes for Kokoro users at any level, and for share-only users (R23) ------------
+from voiceover import narrator
+
+
+def hook_installs_shim(level="narrator", pointer=None, mod=False, **settings):
+    """Run the hook (NO_SPAWN: only the shim shows) under settings; True when it installed the shim."""
     SHIM_TARGET.unlink(missing_ok=True)
     reset_state()
-    set_setting("interaction_level", "narrator")
+    set_setting("tts_enabled", True)
+    set_setting("interaction_level", level)
     for key, value in settings.items():
         set_setting(key, value)
+    if pointer is not None:
+        engine_paths.write_pointer(pointer)
+    if mod:
+        narrator.mark_mod_session("S1")
+    else:
+        narrator.unmark_mod_session("S1")
     subprocess.run([sys.executable, str(REPO_ROOT / "hooks" / "user_prompt_submit.py")], capture_output=True,
                    text=True, env=os.environ.copy(),
                    input=json.dumps({"cwd": str(REPO_ROOT), "session_id": "S1", "prompt": "go"}))
@@ -315,10 +367,18 @@ def hook_installs_shim(**settings):
 
 
 check("hook installs the shim for a kokoro narrator", hook_installs_shim(tts_engine="kokoro") is True)
+check("C2: hook installs the shim for kokoro at the concise level", hook_installs_shim("concise", tts_engine="kokoro") is True)
+check("C2: hook installs the shim for kokoro at the silent level", hook_installs_shim("silent", tts_engine="kokoro") is True)
+check("C2: hook installs the shim when the mod owns the prompt",
+      hook_installs_shim(mod=True, tts_engine="kokoro") is True)
+check("C2: hook installs the shim for a share-only user (a pointer exists, engine is not kokoro)",
+      hook_installs_shim("concise", pointer=good(REPO_ROOT, "1.6.0"), tts_engine="macos-female") is True)
 check("hook installs no shim for a macOS-voice narrator", hook_installs_shim(tts_engine="macos-female") is False)
 check("hook installs no shim when the engine is none", hook_installs_shim(tts_engine="none") is False)
-check("hook installs no shim when TTS is disabled",
-      hook_installs_shim(tts_engine="kokoro", tts_enabled=False) is False)
+check("C2: hook installs the shim for kokoro even with TTS disabled (any level, R23)",
+      hook_installs_shim(tts_engine="kokoro", tts_enabled=False) is True)
 set_setting("tts_enabled", True)
+set_setting("interaction_level", "narrator")
+narrator.unmark_mod_session("S1")
 
 report()

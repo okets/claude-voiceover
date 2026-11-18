@@ -161,35 +161,72 @@ def _prepare(args):
         return _prepare_pointer(Path(args.root), Path(args.project))
 
 
-def _pointer_python():
-    return (engine_paths.read_pointer() or {}).get("python")
+def _serve_candidate(root):
+    """(root, project, override) serve would publish: the engine_plugin_root override, else this copy."""
+    settings = engine_paths.read_global_settings()
+    override = settings.get("engine_plugin_root")
+    candidate = Path(override) if override else Path(root)
+    return candidate, default_project(candidate, settings), override
 
 
-def _serve(args):
-    sock = engine_paths.socket_path()
-    if engine_paths.socket_path_too_long(sock):
-        print("voiceover-engine: socket path %s is longer than the %d-byte AF_UNIX limit; "
-              "use a shorter VOICEOVER_DATA_DIR" % (sock, engine_paths.UNIX_PATH_LIMIT), file=sys.stderr)
-        return EXIT_UNREACHABLE
-    root = Path(args.plugin_root)
-    script = str(root / "tts" / "kokoro_engine.py")
-    if args.stub:
-        python = sys.executable
-    else:
-        python = _pointer_python()
-        if not python:
-            project = default_project(root, engine_paths.read_global_settings())
-            if _prepare_pointer(root, project, take_lock=False) != EXIT_OK or not _pointer_python():
-                print("voiceover-engine: no engine environment could be prepared", file=sys.stderr)
-                return EXIT_UNREACHABLE
-            python = _pointer_python()
-    stub_args = ["--stub"] + (["--stub-delay-ms", str(args.stub_delay_ms)] if args.stub_delay_ms else [])
-    argv = [python, script] + (stub_args if args.stub else [])
+def _repair_pointer(root):
+    """Prepare (take_lock=False) when the pointer is unusable or this copy supersedes it.
+    False only when a prepare was needed and failed (it has said why on stderr)."""
+    candidate, project, override = _serve_candidate(root)
+    if not engine_paths.should_replace(engine_paths.read_pointer(), candidate,
+                                       engine_paths.plugin_version(candidate), override, project):
+        return True
+    return _prepare_pointer(candidate, project, take_lock=False) == EXIT_OK
+
+
+def _serving_pointer(root):
+    """The pointer serve runs from, repaired first when needed; None (one stderr line) when unusable."""
+    repaired = _repair_pointer(root)
+    pointer = engine_paths.read_pointer()
+    if engine_paths.pointer_usable(pointer):
+        return pointer
+    if repaired:
+        print("voiceover-engine: no usable engine environment in %s" % engine_paths.pointer_path(), file=sys.stderr)
+    return None
+
+
+def _engine_script(root) -> str:
+    return str(Path(root) / "tts" / "kokoro_engine.py")
+
+
+def _stub_args(args):
+    return ["--stub"] + (["--stub-delay-ms", str(args.stub_delay_ms)] if args.stub_delay_ms else [])
+
+
+def _exec_engine(python, script, extra_args):
+    """Replace this process with the engine; exec keeps the pid, so LISTEN_PID stays valid."""
     try:
-        os.execv(python, argv)   # exec keeps the pid, so LISTEN_PID stays valid
+        os.execv(python, [python, script] + extra_args)
     except OSError as error:
         print("voiceover-engine: cannot start %s: %s" % (python, error), file=sys.stderr)
         return EXIT_UNREACHABLE
+
+
+def _socket_path_ok() -> bool:
+    sock = engine_paths.socket_path()
+    if not engine_paths.socket_path_too_long(sock):
+        return True
+    print("voiceover-engine: socket path %s is longer than the %d-byte AF_UNIX limit; "
+          "use a shorter VOICEOVER_DATA_DIR" % (sock, engine_paths.UNIX_PATH_LIMIT), file=sys.stderr)
+    return False
+
+
+def _serve(args):
+    """Run the engine: --stub from this copy; otherwise the pointer's plugin root with the
+    pointer's python (design 5.3), so code and environment always come from one version."""
+    if not _socket_path_ok():
+        return EXIT_UNREACHABLE
+    if args.stub:
+        return _exec_engine(sys.executable, _engine_script(args.plugin_root), _stub_args(args))
+    pointer = _serving_pointer(args.plugin_root)
+    if pointer is None:
+        return EXIT_UNREACHABLE
+    return _exec_engine(pointer["python"], _engine_script(pointer["plugin_root"]), [])
 
 
 def _ensure(args):

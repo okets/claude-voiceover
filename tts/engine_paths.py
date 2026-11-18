@@ -74,6 +74,15 @@ def log_path() -> Path:
     return _file("engine.log")
 
 
+def append_log(message: str) -> None:
+    """One timestamped line in engine.log. Never raises."""
+    try:
+        with open(log_path(), "a", encoding="utf-8") as handle:
+            handle.write("%.2f engine %s\n" % (time.time(), message))
+    except OSError:
+        pass
+
+
 # --- token ------------------------------------------------------------------
 
 def _new_token() -> str:
@@ -224,7 +233,7 @@ def version_tuple(version) -> tuple:
     return tuple(parts)
 
 
-def _pointer_usable(pointer) -> bool:
+def pointer_usable(pointer) -> bool:
     """A pointer whose root exists and whose python is an executable file."""
     python = (pointer or {}).get("python")
     root = (pointer or {}).get("plugin_root")
@@ -242,7 +251,7 @@ def should_replace(current, candidate_root, candidate_version, override, wanted_
     higher; an equal version keeps the current pointer (a dev checkout never flips it)."""
     if override and str(candidate_root) != str(override):
         return False
-    if not _pointer_usable(current):
+    if not pointer_usable(current):
         return True
     if wanted_project is not None and Path(str(current.get("project"))).name != Path(wanted_project).name:
         return True

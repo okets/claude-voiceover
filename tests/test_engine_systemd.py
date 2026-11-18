@@ -214,4 +214,13 @@ setup_tts.port_is_free = real_free
 engine_launcher._run_uv, engine_launcher._find_uv = real_uv, real_find
 engine_launcher.run_systemctl = real_systemctl
 
+# --- C3: setup works where fcntl does not exist (Windows) -----------------------------------------
+import subprocess
+no_fcntl = subprocess.run(
+    [sys.executable, "-c",
+     "import sys; sys.modules['fcntl'] = None; sys.path.insert(0, %r); import setup_tts; "
+     "sys.exit(0 if setup_tts.audio_player_found is not None else 1)" % str(REPO_ROOT / "scripts")],
+    capture_output=True, text=True, env=dict(os.environ))
+check("C3: setup_tts imports without fcntl (Windows)", no_fcntl.returncode == 0, no_fcntl.stderr[-400:])
+
 report()

@@ -17,14 +17,12 @@ The Synth interface (duck-typed; `engine_stub.SineSynth` is the reference):
 """
 
 import asyncio
-import fcntl
 import os
 import socket
 import sys
 import threading
 import time
 import traceback
-from pathlib import Path
 
 import engine_paths
 from engine_common import engine_log
@@ -43,80 +41,12 @@ _EXIT_ENDINGS = {"stop": (None, "cancelled")}
 _DEFAULT_EXIT_ENDING = ("restarting", "error")
 
 
-SYSTEMD_FIRST_FD = 3
-SOCKET_MODE = 0o600
-TCP_HOST = "127.0.0.1"
-LISTEN_BACKLOG = 32
-
-
-def adopt_systemd_listeners(environ=os.environ):
-    """Sockets passed by systemd socket activation, or None when there are none for this process."""
-    pid, count = environ.pop("LISTEN_PID", None), environ.pop("LISTEN_FDS", None)
-    environ.pop("LISTEN_FDNAMES", None)
-    if pid != str(os.getpid()) or not (count or "").isdigit() or int(count) < 1:
-        return None
-    return [_adopt_fd(fd) for fd in range(SYSTEMD_FIRST_FD, SYSTEMD_FIRST_FD + int(count))]
-
-
-def _adopt_fd(fd):
-    """Wrap an inherited listening fd; socket() reads the family from the fd's own address."""
-    return socket.socket(fileno=fd)
-
-
-def bind_listeners(sock_path: Path, port):
-    """Bind the Unix socket (and 127.0.0.1:port). The caller already holds engine.lock,
-    so any socket file at the path is a leftover and may be removed."""
-    sock_path = Path(sock_path)
-    listeners = [_bind_unix(sock_path)]
-    if port is not None:
-        try:
-            listeners.append(_bind_tcp(port))
-        except BaseException:
-            listeners[0].close()
-            raise
-    return listeners
-
-
-def _bind_unix(sock_path):
-    sock_path.unlink(missing_ok=True)
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    old_umask = os.umask(0o177)  # the socket is created 0600, never briefly wider
-    try:
-        sock.bind(str(sock_path))
-        os.chmod(sock_path, SOCKET_MODE)
-        sock.listen(LISTEN_BACKLOG)
-    except BaseException:
-        sock.close()
-        raise
-    finally:
-        os.umask(old_umask)
-    return sock
-
-
-def _bind_tcp(port):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((TCP_HOST, port))
-        sock.listen(LISTEN_BACKLOG)
-    except BaseException:
-        sock.close()
-        raise
-    return sock
-
-
-def hold_single_instance(lock: Path):
-    """Take engine.lock without blocking. The fd (keep it open), or None if another engine holds it."""
-    fd = os.open(str(lock), os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        os.close(fd)
-        return None
-    except BaseException:
-        os.close(fd)
-        raise
-    return fd
+def _unix_cleanup(adopted):
+    """Python 3.13+ unlinks a Unix server's socket file on close (cleanup_socket=True). An adopted
+    socket's file belongs to systemd, which keeps listening on it after we exit: keep it."""
+    if adopted and sys.version_info >= (3, 13):
+        return {"cleanup_socket": False}
+    return {}
 
 
 class NoModel(Exception):
@@ -205,22 +135,23 @@ class EngineServer:
 
     # --- running -----------------------------------------------------------------
 
-    def serve_forever(self, listeners):
-        """Block, serving `listeners`, until request_exit; return the reason."""
+    def serve_forever(self, listeners, adopted=False):
+        """Block, serving `listeners`, until request_exit; return the reason.
+        `adopted`: the sockets are systemd's, so their files must outlive this process."""
         loop = asyncio.new_event_loop()
         worker = threading.Thread(target=self._work, name="engine-worker", daemon=True)
         try:
-            loop.run_until_complete(self._main(loop, listeners, worker))
+            loop.run_until_complete(self._main(loop, listeners, adopted, worker))
         finally:
             loop.close()
         return self._exit_reason
 
-    async def _main(self, loop, listeners, worker):
+    async def _main(self, loop, listeners, adopted, worker):
         self._exit_future = loop.create_future()
         with self._exit_lock:
             self._loop = loop
             already = self._exit_reason is not None
-        servers = [await self._listen(sock) for sock in listeners]
+        servers = [await self._listen(sock, adopted) for sock in listeners]
         self._start_device = engine_paths.read_global_settings().get("tts_device")
         worker.start()
         if already:
@@ -300,9 +231,9 @@ class EngineServer:
         conn.send({"ev": "released", "vram_mib": 0})
         self.request_exit("release")
 
-    async def _listen(self, sock):
+    async def _listen(self, sock, adopted):
         if sock.family == socket.AF_UNIX:
-            return await asyncio.start_unix_server(self._accept, sock=sock)
+            return await asyncio.start_unix_server(self._accept, sock=sock, **_unix_cleanup(adopted))
         return await asyncio.start_server(self._accept, sock=sock)
 
     def request_exit(self, reason):

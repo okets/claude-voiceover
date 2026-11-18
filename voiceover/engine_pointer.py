@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 from . import speech
-from .settings import data_dir, get_machine_setting
+from .settings import get_machine_setting, resolve_engine
 
 sys.path.append(str(speech._TTS_DIR))   # appended: a tts module must never shadow the stdlib
 import engine_paths  # noqa: E402  (the engine's stdlib-only path and pointer rules)
@@ -27,6 +27,13 @@ _SHIM_MODE = 0o755
 
 def should_replace(current, candidate_root, candidate_version, override, wanted_project=None) -> bool:
     return engine_paths.should_replace(current, candidate_root, candidate_version, override, wanted_project)
+
+
+def wanted(cwd=None) -> bool:
+    """True when this project's engine resolves to Kokoro (at any level, even silent or with TTS
+    off: the setting may change at any prompt), or a pointer already exists (the engine is
+    shared, perhaps with no Kokoro narration at all)."""
+    return engine_paths.pointer_path().exists() or resolve_engine(cwd) == "kokoro"
 
 
 def _windows() -> bool:
