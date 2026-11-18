@@ -38,8 +38,11 @@ check("feed applies the long-sentence split", len(big.feed(" ".join(["w"] * 90) 
 
 lv = UtteranceText(live=True)
 check("live first clause early (first boundary after >= 4 words)",
-      lv.feed("Well, sure thing, I can check the build now. Next. ") ==
-      ["Well, sure thing,", "I can check the build now.", "Next."])
+      lv.feed("Well, sure thing, okay, I can check the build now. Next. ") ==
+      ["Well, sure thing, okay,", "I can check the build now.", "Next."])
+check("live: a boundary with fewer than 4 words before it is not used",
+      UtteranceText(live=True).feed("Well, sure thing, I can check the build now. ") ==
+      ["Well, sure thing, I can check the build now."])
 lv2 = UtteranceText(live=True); lv2.feed("First. ")
 check("live split is for the first sentence only", lv2.feed("Well, sure thing, I can check. ") ==
       ["Well, sure thing, I can check."])

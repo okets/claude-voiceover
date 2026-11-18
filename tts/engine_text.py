@@ -56,10 +56,10 @@ def split_long(sentence, max_words=CLAUSE_SPLIT_WORDS):
 
 
 def _first_clause(sentence):
-    """(head, tail) at the first boundary that has read LIVE_FIRST_CLAUSE_MIN_WORDS
-    words by the time it is passed (the word after the boundary counts), else None."""
+    """(head, tail) at the first boundary with at least LIVE_FIRST_CLAUSE_MIN_WORDS
+    words before it, else None."""
     for head, tail in _boundaries(sentence):
-        if _word_count(head) + 1 >= LIVE_FIRST_CLAUSE_MIN_WORDS:
+        if _word_count(head) >= LIVE_FIRST_CLAUSE_MIN_WORDS:
             return head, tail
     return None
 
