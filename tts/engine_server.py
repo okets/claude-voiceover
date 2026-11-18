@@ -17,11 +17,13 @@ The Synth interface (duck-typed; `engine_stub.SineSynth` is the reference):
 """
 
 import asyncio
+import fcntl
 import os
 import socket
 import sys
 import threading
 import traceback
+from pathlib import Path
 
 from engine_connection import Connection
 from engine_protocol import LIMITS, PROTOCOL, split_frames
@@ -35,6 +37,72 @@ SHUTDOWN_WAIT_S = 2.0
 # Exit reason -> how a request still open at that moment ends: (error code or None, end reason).
 _EXIT_ENDINGS = {"stop": (None, "cancelled")}
 _DEFAULT_EXIT_ENDING = ("restarting", "error")
+
+
+SYSTEMD_FIRST_FD = 3
+SOCKET_MODE = 0o600
+TCP_HOST = "127.0.0.1"
+LISTEN_BACKLOG = 32
+
+
+def adopt_systemd_listeners(environ=os.environ):
+    """Sockets passed by systemd socket activation, or None when there are none for this process."""
+    pid, count = environ.pop("LISTEN_PID", None), environ.pop("LISTEN_FDS", None)
+    environ.pop("LISTEN_FDNAMES", None)
+    if pid != str(os.getpid()) or not (count or "").isdigit() or int(count) < 1:
+        return None
+    return [_adopt_fd(fd) for fd in range(SYSTEMD_FIRST_FD, SYSTEMD_FIRST_FD + int(count))]
+
+
+def _adopt_fd(fd):
+    """Wrap an inherited listening fd; socket() reads the family from the fd's own address."""
+    return socket.socket(fileno=fd)
+
+
+def bind_listeners(sock_path: Path, port):
+    """Bind the Unix socket (and 127.0.0.1:port). The caller already holds engine.lock,
+    so any socket file at the path is a leftover and may be removed."""
+    sock_path = Path(sock_path)
+    listeners = [_bind_unix(sock_path)]
+    if port is not None:
+        try:
+            listeners.append(_bind_tcp(port))
+        except OSError:
+            listeners[0].close()
+            raise
+    return listeners
+
+
+def _bind_unix(sock_path):
+    sock_path.unlink(missing_ok=True)
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    old_umask = os.umask(0o177)  # the socket is created 0600, never briefly wider
+    try:
+        sock.bind(str(sock_path))
+    finally:
+        os.umask(old_umask)
+    os.chmod(sock_path, SOCKET_MODE)
+    sock.listen(LISTEN_BACKLOG)
+    return sock
+
+
+def _bind_tcp(port):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((TCP_HOST, port))
+    sock.listen(LISTEN_BACKLOG)
+    return sock
+
+
+def hold_single_instance(lock: Path):
+    """Take engine.lock without blocking. The fd (keep it open), or None if another engine holds it."""
+    fd = os.open(str(lock), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
 
 
 class NoModel(Exception):
@@ -91,7 +159,8 @@ class EngineServer:
                  slow_reader_s=30.0):
         self._synth = synth
         self._idle_unload_s = idle_unload_s   # used by the lifecycle work (Task 7)
-        self._token = token                   # used by the TCP listener work (Task 6)
+        self._token = token                   # required on TCP connections only
+        self.last_tcp_nodelay = None          # test hook: TCP_NODELAY of the last accepted TCP socket
         self._plugin_version = plugin_version
         self._plugin_root = plugin_root
         self._max_connections = max_connections
@@ -185,7 +254,8 @@ class EngineServer:
             writer.write(Connection.busy_line())
             writer.close()
             return
-        conn = Connection(self, reader, writer, self._out_buffer_bytes, self._slow_reader_s)
+        conn = Connection(self, reader, writer, self._out_buffer_bytes, self._slow_reader_s,
+                          token=self._token, needs_auth=self._prepare_tcp(writer))
         self._conns.add(conn)
         task = asyncio.current_task()
         self._handlers.add(task)
@@ -194,6 +264,20 @@ class EngineServer:
             await conn.wait_closed()
         finally:
             self._handlers.discard(task)
+
+    @staticmethod
+    def _is_tcp(writer):
+        sock = writer.get_extra_info("socket")
+        return sock is not None and sock.family == socket.AF_INET
+
+    def _prepare_tcp(self, writer):
+        """TCP callers get TCP_NODELAY (set explicitly, then read back for tests)."""
+        if not self._is_tcp(writer):
+            return False
+        sock = writer.get_extra_info("socket")
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.last_tcp_nodelay = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY)
+        return True
 
     def drop_connection(self, conn):
         """The caller is gone: drop its queued work and discard what is in flight."""
@@ -426,8 +510,9 @@ class EngineServer:
         """The one place a request ends: forget it, then say so exactly once."""
         if req.ended:
             return
-        self._forget(req)
-        req.conn.send_end(req.id, reason, req.samples)
+        self._forget(req, promote=False)
+        req.conn.send_end(req.id, reason, req.samples)  # before the next request can finish
+        self._promote(req.conn)
 
     def _forget(self, req, promote=True):
         req.ended = True

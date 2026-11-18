@@ -6,6 +6,7 @@ the slow-reader watchdog and op dispatch; request state lives in EngineServer.
 """
 
 import asyncio
+import hmac
 import sys
 import time
 import traceback
@@ -24,7 +25,8 @@ def _is_protocol(value):
 
 
 class Connection:
-    def __init__(self, server, reader, writer, out_buffer_bytes, slow_reader_s):
+    def __init__(self, server, reader, writer, out_buffer_bytes, slow_reader_s,
+                 token=None, needs_auth=False):
         self.id = next(_connection_ids)
         self.requests = {}      # request id -> Request, in start order
         self._server = server
@@ -35,6 +37,8 @@ class Connection:
         self._slow_reader_s = slow_reader_s
         self._slow_timer = None
         self._over_since = None  # when the output buffer last went over its limit
+        self._token = token
+        self._needs_auth = needs_auth   # TCP callers must send a valid auth line first
         self._said_hello = False
         self._closing = False
         self._ops = {
@@ -140,6 +144,8 @@ class Connection:
     # --- dispatch --------------------------------------------------------------
 
     def _handle(self, item):
+        if self._needs_auth and not self._authenticate(item):
+            return
         if isinstance(item, BadLine):
             self.send_error(item.code, item.message)
             return
@@ -151,6 +157,20 @@ class Connection:
             self.send_error("bad_request", "hello comes first")
         else:
             handler(item)
+
+    def _authenticate(self, item):
+        """The first line on a TCP connection must carry the token; else refuse and close."""
+        if isinstance(item, BadLine) or item.get("op") != "auth" or not self._token_matches(item.get("token")):
+            self.send_error("unauthorized", "a valid auth token is required")
+            self.close()
+            return False
+        self._needs_auth = False
+        return True  # the auth line itself is then handled (and ignored) like any other
+
+    def _token_matches(self, given):
+        if not isinstance(self._token, str) or not isinstance(given, str):
+            return False
+        return hmac.compare_digest(given.encode(), self._token.encode())
 
     def _op_ignored(self, msg):
         pass
