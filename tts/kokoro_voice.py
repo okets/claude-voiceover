@@ -85,44 +85,47 @@ def _play_linux(file_path, timeout):
 
 # --- synthesis ---------------------------------------------------------------
 
-def play_chunk(samples, sample_rate, root):
-    """Play one streamed chunk; extends the lock, never removes it."""
-    import soundfile as sf
-
-    duration = len(samples) / float(sample_rate) if sample_rate else 0.0
-    update_lock_expiry(root, duration + 20.0)  # this chunk plus headroom for the next
+def _play_temp_wav(write, duration):
+    """Write one clip to a temp wav with write(path), play it to the end, then delete it.
+    delete=False + manual cleanup avoids Windows file-locking issues."""
     tmp_file = tempfile.NamedTemporaryFile(prefix="voiceover-oneshot-", suffix=".wav", delete=False)
     tmp_path = tmp_file.name
     tmp_file.close()
     try:
-        sf.write(tmp_path, samples, sample_rate)
+        write(tmp_path)
         return play_audio_file(tmp_path, timeout=max(30, int(duration) + 10))
     finally:
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
+
+
+def _samples_duration(samples, sample_rate):
+    return len(samples) / float(sample_rate) if sample_rate else 0.0
+
+
+def _write_samples(samples, sample_rate):
+    """A write(path) for _play_temp_wav that stores numpy samples with soundfile."""
+    import soundfile as sf
+    return lambda path: sf.write(path, samples, sample_rate)
+
+
+def play_chunk(samples, sample_rate, root):
+    """Play one streamed chunk; extends the lock, never removes it."""
+    duration = _samples_duration(samples, sample_rate)
+    update_lock_expiry(root, duration + 20.0)  # this chunk plus headroom for the next
+    return _play_temp_wav(_write_samples(samples, sample_rate), duration)
 
 
 def play_samples(samples, sample_rate):
-    """Write samples to a temp wav and play it under the tts lock."""
-    import soundfile as sf
-
-    duration = len(samples) / float(sample_rate) if sample_rate else 0.0
+    """Play samples under the tts lock, then release it."""
+    duration = _samples_duration(samples, sample_rate)
     update_lock_expiry(data_dir(), duration)
-    # delete=False + manual cleanup avoids Windows file-locking issues.
-    tmp_file = tempfile.NamedTemporaryFile(prefix="voiceover-oneshot-", suffix=".wav", delete=False)
-    tmp_path = tmp_file.name
-    tmp_file.close()
     try:
-        sf.write(tmp_path, samples, sample_rate)
-        return play_audio_file(tmp_path, timeout=max(30, int(duration) + 10))
+        return _play_temp_wav(_write_samples(samples, sample_rate), duration)
     finally:
         remove_tts_lock(data_dir())
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
 
 
 def speak_standard(kokoro, text, voice):
@@ -375,20 +378,11 @@ def _speak_text_in_process(text, voice, use_streaming):
 
 def play_pcm(pcm, root):
     """Play one block of engine audio as a wav; extends the lock, never removes it."""
-    from engine_speaker import write_wav
+    from engine_speaker import pcm_seconds, write_wav
 
-    tmp_file = tempfile.NamedTemporaryFile(prefix="voiceover-oneshot-", suffix=".wav", delete=False)
-    tmp_path = tmp_file.name
-    tmp_file.close()
-    try:
-        duration = write_wav(tmp_path, pcm)
-        update_lock_expiry(root, duration + 20.0)
-        return play_audio_file(tmp_path, timeout=max(30, int(duration) + 10))
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+    duration = pcm_seconds(pcm)
+    update_lock_expiry(root, duration + 20.0)
+    return _play_temp_wav(lambda path: write_wav(path, pcm), duration)
 
 
 def _speak_text_via_engine(text, voice, use_streaming):

@@ -25,10 +25,6 @@ _SHIM_NAME = "voiceover_engine_shim.py"
 _SHIM_MODE = 0o755
 
 
-def should_replace(current, candidate_root, candidate_version, override, wanted_project=None) -> bool:
-    return engine_paths.should_replace(current, candidate_root, candidate_version, override, wanted_project)
-
-
 def wanted(cwd=None) -> bool:
     """True when this project's engine resolves to Kokoro (at any level, even silent or with TTS
     off: the setting may change at any prompt), or a pointer already exists (the engine is
@@ -100,8 +96,8 @@ def _prepare_if_needed(plugin_root: Path) -> bool:
     override = get_machine_setting("engine_plugin_root")
     root = _candidate_root(plugin_root, override)
     project = _project_for(root)
-    if not should_replace(engine_paths.read_pointer(), root, engine_paths.plugin_version(root), override,
-                          project):
+    if not engine_paths.should_replace(engine_paths.read_pointer(), root, engine_paths.plugin_version(root),
+                                       override, project):
         return False
     if os.environ.get("VOICEOVER_NO_SPAWN"):
         return False

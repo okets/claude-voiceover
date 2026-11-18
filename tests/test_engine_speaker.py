@@ -283,7 +283,7 @@ try:
     old_pid = engine_status()["pid"]
     os.kill(old_pid, signal.SIGKILL)
     deadline = time.monotonic() + 5
-    while engine_client._reachable() and time.monotonic() < deadline:
+    while engine_client.reachable() and time.monotonic() < deadline:
         time.sleep(0.02)
     spool.enqueue("Second sentence.", "kokoro", VOICE, utterance="K", session="SK")
     deadline = time.monotonic() + 15

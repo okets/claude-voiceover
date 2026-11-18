@@ -32,7 +32,7 @@ for i in range(3):
 for i in range(2):
     s.add(job("B", text="b%d" % i))
 check("A, B alternate", [j.text for j in drain(s)] == ["a0", "b0", "a1", "b1", "a2"])
-check("empty scheduler has no work", not s.has_work() and s.next() is None)
+check("an emptied scheduler has nothing next", s.next() is None)
 
 # --- a connection is FIFO ---------------------------------------------------
 s = Scheduler()
@@ -76,18 +76,17 @@ check("cancel by request returns the count", s.cancel("A", "r1") == 2)
 check("only that request's jobs go", [j.text for j in drain(s)] == ["y", "w"])
 s = Scheduler()
 s.add(job("A", "r1")); s.add(job("A", "r2")); s.add(job("B", "r1"))
-check("cancel a whole connection", s.cancel("A") == 2 and s.pending("A") == 0 and s.pending("B") == 1)
+check("cancel a whole connection", s.cancel("A") == 2 and [j.conn for j in drain(s)] == ["B"])
+s = Scheduler()
 check("cancelling nothing returns 0", s.cancel("zzz") == 0)
 s = Scheduler(); s.add(job("A")); s.add(job("B")); s.next()
 s.cancel("B")
-check("a cancelled connection is skipped mid-round", s.next() is None and not s.has_work())
-
-check("pending counts queued jobs", (lambda q: (q.add(job("A")), q.add(job("A")), q.pending("A"))[2])(Scheduler()) == 2)
+check("a cancelled connection is skipped mid-round", s.next() is None)
 
 # --- exclude: skipped for this pick, place kept ----------------------------------------------
 s = Scheduler(); s.add(job("A", text="a1")); s.add(job("B", text="b1")); s.add(job("A", text="a2"))
 check("an excluded connection is skipped", s.next(exclude={"A"}).text == "b1")
-check("with only excluded work, next is None and the work stays", s.next(exclude={"A"}) is None and s.pending("A") == 2)
+check("with only excluded work, next is None", s.next(exclude={"A"}) is None)
 check("an excluded connection keeps its place once allowed again", [j.text for j in drain(s)] == ["a1", "a2"])
 s = Scheduler(); s.add(job("A", text="a1")); s.add(job("B", text="b1"))
 s.next(exclude={"A"})

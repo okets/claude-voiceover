@@ -13,6 +13,8 @@ from typing import NamedTuple
 PROTOCOL = 1
 AUDIO = {"format": "pcm_s16le", "rate": 24000, "channels": 1}
 LIMITS = {"line": 65536, "text": 6000, "frame": 32768}
+# The protocol's error codes, as documented in INTERFACES.md ("Errors"): the only codes the
+# engine sends, kept here as the reference list for client authors and tests.
 ERROR_CODES = frozenset({
     "bad_request", "unsupported_protocol", "unknown_voice", "bad_speed",
     "text_too_long", "busy", "no_model", "synthesis_failed", "released",

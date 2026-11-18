@@ -287,6 +287,20 @@ check("I4: a CUDA load adds no second warm-up (its own probe ran inside load_kok
 kokoro_model._load_on, kokoro_model.load_kokoro, kokoro_model.choose_onnx_provider = (
     fake_load_on, real_load_kokoro, real_choose)
 
+# M1: the heavy imports happen in preload(), which the engine runs before binding (never for --stub)
+import kokoro_engine
+sys.modules.setdefault("kokoro_onnx", types.ModuleType("kokoro_onnx"))
+order = []
+real_preload, real_open = kokoro_model.KokoroSynth.preload, kokoro_engine._open_listeners
+kokoro_model.KokoroSynth.preload = lambda self: (order.append("preload"), real_preload(self))[1]
+kokoro_engine._open_listeners = lambda: order.append("listen")      # None: "another engine serves"
+kokoro_engine.main([])
+check("M1: the real engine preloads numpy/onnxruntime/kokoro_onnx before binding", order == ["preload", "listen"], order)
+order.clear()
+kokoro_engine.main(["--stub"])
+check("M1: the stub engine skips preload", order == ["listen"], order)
+kokoro_model.KokoroSynth.preload, kokoro_engine._open_listeners = real_preload, real_open
+
 # old names
 check("kokoro_voice.VOICE_SETTINGS is kokoro_model.VOICE_SETTINGS",
       kokoro_voice.VOICE_SETTINGS is kokoro_model.VOICE_SETTINGS)

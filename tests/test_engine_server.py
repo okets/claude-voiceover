@@ -254,22 +254,39 @@ c.send({"op": "cancel", "id": "gone"})
 check("cancel before activation ends the request once", c.read_until_end("gone")[-1]["reason"] == "cancelled")
 stop_server(srv)
 
-# --- limits ---------------------------------------------------------------------------------------------------
+# --- limits: requests per connection (M3); Unix connections uncapped (M4) ------------------------------------
 srv, path = start_server(SineSynth(synth_delay=0.1), max_connections=2, max_requests=2)
 a, b = Raw(path), Raw(path)
 a.hello(); b.hello()
 third = Raw(path)
-check("too many connections -> busy, then close", third.read_error()["code"] == "busy" and third.closed_by_peer())
+check("M4: Unix connections are not capped: a third over a cap of 2 still gets hello", third.hello().ev == "hello")
 a.send(start_line(id="q1", text="Word. " * 10))
 a.send(start_line(id="q2", text="Word. " * 10))
-b.send(start_line(id="q3", text="Hi.", end=True))
-busy = b.read_error()
-check("too many requests -> busy for that request, which then ends in error",
-      busy["code"] == "busy" and busy["id"] == "q3" and b.read_until_end("q3")[-1]["reason"] == "error")
+a.send(start_line(id="q3", text="Hi.", end=True))
+busy = a.read_error()
+check("M3: a connection's request over its limit -> busy for that request, which then ends in error",
+      busy["code"] == "busy" and busy["id"] == "q3" and a.read_until_end("q3")[-1]["reason"] == "error", busy)
+b.send(start_line(id="q4", text="Hi.", end=True))
+check("M3: the limit is per connection: another connection still opens requests",
+      b.read_until_end("q4")[-1]["reason"] == "complete")
 a.send({"op": "cancel"})
 a.read_until_end("q1"); a.read_until_end("q2")
-b.send(start_line(id="q4", text="Hi.", end=True))
-check("capacity returns after cancels", b.read_until_end("q4")[-1]["reason"] == "complete")
+a.send(start_line(id="q5", text="Hi.", end=True))
+check("capacity returns after cancels", a.read_until_end("q5")[-1]["reason"] == "complete")
+stop_server(srv)
+
+# --- M5: cancel with a non-string id is bad_request (ref), and the connection stays ---------------------------
+srv, path = start_server(SineSynth())
+c = Raw(path)
+c.hello()
+for bad_id in (["x"], {"k": 1}, 7):
+    c.send({"op": "cancel", "id": bad_id})
+    error = c.read_event()
+    check("M5: cancel with id %r -> bad_request carrying ref" % (bad_id,),
+          error.ev == "error" and error["code"] == "bad_request" and error.get("ref") == bad_id and "id" not in error,
+          error)
+c.send({"op": "status"})
+check("M5: the connection is still served after a bad cancel", c.read_event().ev == "status")
 stop_server(srv)
 
 # --- slow reader (T15) ------------------------------------------------------------------------------------------

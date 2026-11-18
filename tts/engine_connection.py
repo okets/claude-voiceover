@@ -39,6 +39,7 @@ class Connection:
         self._over_since = None  # when the output buffer last went over its limit
         self._token = token
         self._auth_deadline = time.monotonic() + auth_timeout_s
+        self.remote = needs_auth          # a TCP caller (counts against the connection cap)
         self._needs_auth = needs_auth   # TCP callers must send a valid auth line first
         self._said_hello = False
         self._closing = False

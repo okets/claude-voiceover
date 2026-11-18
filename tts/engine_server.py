@@ -17,6 +17,7 @@ The Synth interface (duck-typed; `engine_stub.SineSynth` is the reference):
 """
 
 import asyncio
+import math
 import os
 import socket
 import sys
@@ -35,6 +36,7 @@ from engine_text import UtteranceText
 SPEED_RANGE = (0.5, 2.0)
 DEFAULT_LANG = "en-us"
 SHUTDOWN_WAIT_S = 2.0
+MAX_KEEP_OFF_S = 86400          # a release keeps the engine off the GPU for at most a day
 
 # Exit reason -> how a request still open at that moment ends: (error code or None, end reason).
 _EXIT_ENDINGS = {"stop": (None, "cancelled")}
@@ -78,6 +80,12 @@ class Request:
 def _valid_speed(value):
     return (isinstance(value, (int, float)) and not isinstance(value, bool)
             and SPEED_RANGE[0] <= value <= SPEED_RANGE[1])
+
+
+def _valid_keep_off(value):
+    """A finite number of seconds from 0 to MAX_KEEP_OFF_S (JSON admits NaN and Infinity)."""
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and 0 <= value <= MAX_KEEP_OFF_S)
 
 
 def _start_problem(msg):
@@ -223,8 +231,8 @@ class EngineServer:
     def release(self, conn, msg):
         """`release`: leave for a while (keep-off), ending open requests with restarting."""
         keep_off_s = msg.get("keep_off_s", 0)
-        if not isinstance(keep_off_s, (int, float)) or isinstance(keep_off_s, bool):
-            conn.send_error("bad_request", "keep_off_s must be a number")
+        if not _valid_keep_off(keep_off_s):
+            conn.send_error("bad_request", "keep_off_s must be a number from 0 to %d" % MAX_KEEP_OFF_S)
             return
         if keep_off_s > 0:
             engine_paths.write_keep_off(keep_off_s, "release")
@@ -272,13 +280,13 @@ class EngineServer:
     # --- accepting -----------------------------------------------------------------
 
     async def _accept(self, reader, writer):
-        if len(self._conns) >= self._max_connections:
+        remote = self._prepare_remote(writer)
+        if remote and self._remote_count() >= self._max_connections:
             writer.write(Connection.busy_line())
             writer.close()
             return
         conn = Connection(self, reader, writer, self._out_buffer_bytes, self._slow_reader_s,
-                          token=self._token, needs_auth=self._prepare_remote(writer),
-                          auth_timeout_s=self._auth_timeout_s)
+                          token=self._token, needs_auth=remote, auth_timeout_s=self._auth_timeout_s)
         self._conns.add(conn)
         task = asyncio.current_task()
         self._handlers.add(task)
@@ -287,6 +295,12 @@ class EngineServer:
             await conn.wait_closed()
         finally:
             self._handlers.discard(task)
+
+    def _remote_count(self):
+        """Open TCP connections: only they count against max_connections. The Unix socket is
+        the owner's own (file permissions guard it), so a crowd of unauthenticated TCP peers
+        can never lock narration out."""
+        return sum(1 for conn in self._conns if conn.remote)
 
     @staticmethod
     def _is_remote(writer):
@@ -347,16 +361,16 @@ class EngineServer:
         elif req_id in conn.requests:
             conn.send_error("bad_request", "request id %s is still active" % req_id, ref=req_id)
         else:
-            problem = _start_problem(msg) or self._capacity_problem()
+            problem = _start_problem(msg) or self._capacity_problem(conn)
             if problem:
                 conn.send_error(problem[0], problem[1], req_id)
                 conn.send_end(req_id, "error", 0)
             else:
                 self._begin(self._register(conn, req_id, msg), msg)
 
-    def _capacity_problem(self):
-        if len(self._registry) >= self._max_requests:
-            return "busy", "too many requests in flight"
+    def _capacity_problem(self, conn):
+        if len(conn.requests) >= self._max_requests:
+            return "busy", "too many requests in flight on this connection"
         return None
 
     def _register(self, conn, req_id, msg):
@@ -414,6 +428,9 @@ class EngineServer:
 
     def cancel_requests(self, conn, req_id):
         """`cancel`: one request by id, or everything on the connection."""
+        if req_id is not None and not isinstance(req_id, str):
+            conn.send_error("bad_request", "cancel id must be a string", ref=req_id)
+            return
         if req_id is None:
             targets = list(conn.requests.values())
         else:

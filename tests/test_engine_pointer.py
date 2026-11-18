@@ -48,35 +48,35 @@ def good(root, version, project=None, python=None):
 here = make_root("1.6.0")
 other = make_root("1.6.0")
 current = good(here, "1.6.0")
-check("should_replace: no pointer", engine_pointer.should_replace(None, here, "1.6.0", None) is True)
-check("should_replace: higher version wins", engine_pointer.should_replace(current, other, "1.6.1", None) is True)
+check("should_replace: no pointer", engine_paths.should_replace(None, here, "1.6.0", None) is True)
+check("should_replace: higher version wins", engine_paths.should_replace(current, other, "1.6.1", None) is True)
 check("should_replace: numeric, not textual (1.10.0 > 1.9.0)",
-      engine_pointer.should_replace(good(here, "1.9.0"), other, "1.10.0", None) is True)
+      engine_paths.should_replace(good(here, "1.9.0"), other, "1.10.0", None) is True)
 check("should_replace: equal version from another root keeps the pointer",
-      engine_pointer.should_replace(current, other, "1.6.0", None) is False)
+      engine_paths.should_replace(current, other, "1.6.0", None) is False)
 check("should_replace: lower version keeps the pointer",
-      engine_pointer.should_replace(current, other, "1.5.0", None) is False)
+      engine_paths.should_replace(current, other, "1.5.0", None) is False)
 check("should_replace: vanished current root is replaced",
-      engine_pointer.should_replace(good("/no/such/root", "9.9.9"), other, "1.0.0", None) is True)
+      engine_paths.should_replace(good("/no/such/root", "9.9.9"), other, "1.0.0", None) is True)
 check("should_replace: an override that differs wins even over a higher current",
-      engine_pointer.should_replace(good(here, "9.0.0"), other, "1.0.0", str(other)) is True)
+      engine_paths.should_replace(good(here, "9.0.0"), other, "1.0.0", str(other)) is True)
 check("should_replace: override L, candidate R is False (only the override is admitted)",
-      engine_pointer.should_replace(good(here, "1.0.0"), other, "9.0.0", str(here)) is False
-      and engine_pointer.should_replace(None, other, "9.0.0", str(here)) is False)
+      engine_paths.should_replace(good(here, "1.0.0"), other, "9.0.0", str(here)) is False
+      and engine_paths.should_replace(None, other, "9.0.0", str(here)) is False)
 check("should_replace: a pointer with no python is unusable",
-      engine_pointer.should_replace({"plugin_root": str(here), "plugin_version": "9.9.9", "project": str(here / "tts")},
+      engine_paths.should_replace({"plugin_root": str(here), "plugin_version": "9.9.9", "project": str(here / "tts")},
                                     other, "1.0.0", None) is True)
 check("should_replace: a pointer whose python is not an executable file is unusable",
-      engine_pointer.should_replace(good(here, "9.9.9", python="/no/such/python"), other, "1.0.0", None) is True
-      and engine_pointer.should_replace(good(here, "9.9.9", python=str(here)), other, "1.0.0", None) is True)
+      engine_paths.should_replace(good(here, "9.9.9", python="/no/such/python"), other, "1.0.0", None) is True
+      and engine_paths.should_replace(good(here, "9.9.9", python=str(here)), other, "1.0.0", None) is True)
 check("should_replace: same root, project flipped (cpu -> gpu) replaces",
-      engine_pointer.should_replace(good(here, "1.6.0"), here, "1.6.0", None, here / "tts-gpu") is True)
+      engine_paths.should_replace(good(here, "1.6.0"), here, "1.6.0", None, here / "tts-gpu") is True)
 check("should_replace: same root, same project keeps",
-      engine_pointer.should_replace(good(here, "1.6.0"), here, "1.6.0", None, here / "tts") is False)
+      engine_paths.should_replace(good(here, "1.6.0"), here, "1.6.0", None, here / "tts") is False)
 check("should_replace: override == current root, but the project flipped, replaces",
-      engine_pointer.should_replace(good(here, "1.6.0"), here, "1.6.0", str(here), here / "tts-gpu") is True)
+      engine_paths.should_replace(good(here, "1.6.0"), here, "1.6.0", str(here), here / "tts-gpu") is True)
 check("should_replace: an override equal to the current root replaces nothing",
-      engine_pointer.should_replace(current, other, "9.9.9", str(here)) is False)
+      engine_paths.should_replace(current, other, "9.9.9", str(here)) is False)
 
 # --- refresh: shim install, rate limit, spawn ---------------------------------------
 spawned = []

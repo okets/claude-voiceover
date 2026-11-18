@@ -6,7 +6,6 @@ Exit codes: 0 ok, 1 engine unreachable (prepare: failed), 2 usage.
 """
 
 import argparse
-import fcntl
 import json
 import os
 import platform
@@ -79,19 +78,6 @@ def _run_uv(uv, project):
     return lines[-1].strip() if lines else None
 
 
-def _hold_start_lock(lock):
-    """flock start.lock, waiting at most _POINTER_LOCK_WAIT_S; True when held."""
-    deadline = time.monotonic() + _POINTER_LOCK_WAIT_S
-    while True:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return True
-        except BlockingIOError:
-            if time.monotonic() >= deadline:
-                return False
-            time.sleep(engine_client.CONNECT_POLL_S)
-
-
 def _write_unless_kept(root, info):
     """Write `info` unless the pointer rule, re-checked now, says to keep the current one."""
     override = engine_paths.read_global_settings().get("engine_plugin_root")
@@ -111,7 +97,7 @@ def _publish_pointer(root, info, take_lock):
     except OSError:
         return False
     with lock:
-        if not _hold_start_lock(lock):
+        if not engine_client.hold_lock(lock, time.monotonic() + _POINTER_LOCK_WAIT_S):
             return False
         _write_unless_kept(root, info)
         return True
@@ -154,9 +140,7 @@ def _prepare(args):
     except OSError:
         return EXIT_UNREACHABLE
     with lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+        if not engine_client.hold_lock(lock, deadline=time.monotonic()):   # one try, no wait
             return EXIT_OK
         return _prepare_pointer(Path(args.root), Path(args.project))
 
@@ -235,17 +219,7 @@ def _ensure(args):
 
 def _with_engine(action):
     """Run action(connection) against a running engine; EXIT_UNREACHABLE if none answers."""
-    try:
-        conn = engine_client.EngineConnection.connect()
-    except (OSError, engine_client.EngineError):
-        return EXIT_UNREACHABLE
-    try:
-        action(conn)
-    except engine_client.EngineError:
-        return EXIT_UNREACHABLE
-    finally:
-        conn.close()
-    return EXIT_OK
+    return EXIT_OK if engine_client.run_on_engine(action) else EXIT_UNREACHABLE
 
 
 def _print_json(value):
@@ -393,19 +367,11 @@ def _uninstall_service(args):
     return EXIT_OK
 
 
-def _engine_answers() -> bool:
-    try:
-        engine_client.EngineConnection.connect().close()
-        return True
-    except (OSError, engine_client.EngineError):
-        return False
-
-
 def _enable_socket(args, restart_if_active=False):
     """Hand the socket to systemd. A self-started engine holds engine.sock, so stop it first
     (unless the socket is already active). `restart_if_active` applies a changed ListenStream."""
     active = run_systemctl("is-active", _SOCKET_UNIT) == 0
-    if not active and _engine_answers():
+    if not active and engine_client.reachable():
         _stop(args)
     if run_systemctl("enable", "--now", _SOCKET_UNIT) != 0:
         return EXIT_UNREACHABLE

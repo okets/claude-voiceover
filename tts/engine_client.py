@@ -268,20 +268,32 @@ class EngineConnection:
 
 # --- starting the engine on demand ------------------------------------------------
 
-def _try_connect():
+def _try_connect(timeout: float = 2.0):
     """A live connection, or None when no engine answers."""
     try:
-        return EngineConnection.connect()
+        return EngineConnection.connect(timeout=timeout)
     except (OSError, EngineError):
         return None
 
 
-def _reachable():
-    conn = _try_connect()
+def run_on_engine(action, timeout: float = 2.0) -> bool:
+    """Run action(connection) on a fresh connection to the running engine, then close it.
+    False when no engine answers or the action fails with EngineError."""
+    conn = _try_connect(timeout)
     if conn is None:
         return False
-    conn.close()
-    return True
+    try:
+        action(conn)
+        return True
+    except EngineError:
+        return False
+    finally:
+        conn.close()
+
+
+def reachable() -> bool:
+    """True when an engine answers hello."""
+    return run_on_engine(lambda conn: None)
 
 
 def _serve_command(plugin_root: Path):
@@ -302,8 +314,8 @@ def _spawn(plugin_root: Path):
         return None
 
 
-def _acquire_start_lock(lock, deadline):
-    """flock start.lock without blocking past the deadline; True when held."""
+def hold_lock(lock, deadline):
+    """flock `lock` (an open file) exclusively, never waiting past the monotonic deadline; True when held."""
     while True:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -316,16 +328,16 @@ def _acquire_start_lock(lock, deadline):
 
 def _start_and_wait(plugin_root, deadline):
     """Under start.lock: spawn unless an engine appeared, then poll until it answers."""
-    if _reachable():
+    if reachable():
         return True
     child = _spawn(plugin_root)
     if child is None:
         return False
     while time.monotonic() < deadline:
-        if _reachable():
+        if reachable():
             return True
         if child.poll() not in (None, 0):   # it failed (exit 0: another engine won the lock, keep polling)
-            return _reachable()
+            return reachable()
         time.sleep(CONNECT_POLL_S)
     return False
 
@@ -334,16 +346,16 @@ def ensure(plugin_root: Path, timeout: float = 10.0) -> bool:
     """True once an engine answers; starts one (single-flight under start.lock) if needed.
     Never blocks past `timeout`, and a last probe settles a deadline that passed mid-wait."""
     deadline = time.monotonic() + timeout
-    if _reachable():
+    if reachable():
         return True
     try:
         lock = open(engine_paths.start_lock_path(), "a+")
     except OSError:
         return False
     with lock:
-        if _acquire_start_lock(lock, deadline) and _start_and_wait(plugin_root, deadline):
+        if hold_lock(lock, deadline) and _start_and_wait(plugin_root, deadline):
             return True
-    return _reachable()
+    return reachable()
 
 
 def connect_or_start(plugin_root: Path, timeout: float = 10.0) -> EngineConnection:

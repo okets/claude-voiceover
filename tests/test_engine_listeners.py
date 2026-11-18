@@ -104,6 +104,10 @@ srv = serve(SineSynth(), [listener, cap_unix], token=TOKEN, max_connections=2, a
 idle = [Raw(listener.getsockname(), tcp=True, timeout=3.0) for _ in range(2)]
 time.sleep(0.1)
 check("idle TCP peers fill the connection cap", srv.snapshot()["callers"] == 2)
+over = Raw(listener.getsockname(), tcp=True, timeout=3.0)
+check("M4: a TCP peer over the cap gets busy, then EOF", over.read_event().get("code") == "busy" and over.closed_by_peer())
+check("M4: a Unix client is served at once while the TCP cap is full (Unix is not capped)",
+      Raw(unix_path).hello().ev == "hello")
 check("an idle TCP peer is closed without a reply after the deadline",
       all(p.sock.recv(100) == b"" for p in idle))
 check("a Unix client can connect once they are gone", Raw(unix_path).hello().ev == "hello")

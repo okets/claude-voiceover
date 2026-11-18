@@ -23,6 +23,11 @@ WARM_EVERY_S = 30
 _RETRYABLE = ("restarting", "disconnected")
 
 
+def pcm_seconds(pcm: bytes) -> float:
+    """The length of mono 16-bit 24 kHz PCM, in seconds."""
+    return len(pcm) / float(SAMPLE_WIDTH * SAMPLE_RATE)
+
+
 def write_wav(path, pcm: bytes) -> float:
     """Write mono 16-bit 24 kHz PCM as a WAV; the clip's length in seconds."""
     with wave.open(str(path), "wb") as out:
@@ -30,7 +35,7 @@ def write_wav(path, pcm: bytes) -> float:
         out.setsampwidth(SAMPLE_WIDTH)
         out.setframerate(SAMPLE_RATE)
         out.writeframes(pcm)
-    return len(pcm) / float(SAMPLE_WIDTH * SAMPLE_RATE)
+    return pcm_seconds(pcm)
 
 
 class EnginePlayback(Playback):

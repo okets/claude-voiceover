@@ -55,7 +55,6 @@ def log(message):
     print(message, file=sys.stderr)
 
 
-
 # --- model loading: CPU by default, NVIDIA GPU when tts_device is "gpu" -------
 
 _CPU = "CPUExecutionProvider"
@@ -146,7 +145,8 @@ def load_kokoro():
     engine_log("device", "requested=%s active=%s" % (requested, _active_provider(kokoro)))
     return kokoro
 
-# --- audio playback (inline port of the cross-platform player) --------------
+
+# --- model files ---------------------------------------------------------------
 
 def models_present():
     return MODEL_FILE.exists() and VOICES_FILE.exists()
@@ -175,8 +175,6 @@ def ensure_models():
     except Exception as error:
         log("[ERROR] Model download failed: " + str(error))
         return False
-
-
 
 
 def get_voice_settings(voice):
@@ -209,7 +207,8 @@ INPUT_ERRORS = (ValueError, TypeError, KeyError)   # the caller's fault: CPU wou
 
 
 class KokoroSynth:
-    """The real Synth: Kokoro on CUDA when it works, else CPU. Construction is cheap; load() does the work.
+    """The real Synth: Kokoro on CUDA when it works, else CPU. Construction is cheap; preload() does
+    the imports and load() the model.
 
     status() and synthesize() only read cached state: the VRAM figure is refreshed by a daemon timer
     thread (started by load(), every VRAM_CACHE_SECONDS while on cuda), so nvidia-smi never sits on
@@ -224,12 +223,17 @@ class KokoroSynth:
         self._placement = ("cpu", None)   # (device, fallback), replaced as one value
         self._vram = None
 
+    def preload(self):
+        """Import numpy, onnxruntime and kokoro_onnx now. kokoro_engine calls this before it
+        binds (never for --stub), so a request pays only the model load, not seconds of imports."""
+        import numpy  # noqa: F401
+        import onnxruntime  # noqa: F401
+        import kokoro_onnx  # noqa: F401
+
     def load(self):
         from engine_server import NoModel
         if not models_present():
             raise NoModel("Kokoro model files are missing")
-        import numpy  # noqa: F401  eager (S7): everything is imported before serving
-        import onnxruntime  # noqa: F401
         self._requested = "cuda" if choose_onnx_provider() == _CUDA else "cpu"
         keep_off = self._keep_off()
         if self._force_cpu or keep_off:

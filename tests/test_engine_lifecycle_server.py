@@ -210,6 +210,14 @@ c.hello()
 c.send({"op": "release", "keep_off_s": "long"})
 check("release: a non-numeric keep_off_s is bad_request and the engine stays",
       c.read_error()["code"] == "bad_request" and not srv.result)
+for bad in (float("inf"), float("nan"), -5, 86400.5):
+    c.sock.sendall(json.dumps({"op": "release", "keep_off_s": bad}).encode() + b"\n")   # NaN/Infinity as JSON
+    error = c.read_event()
+    check("M6: release keep_off_s=%r -> bad_request, no exit, no keep-off written" % bad,
+          error.ev == "error" and error["code"] == "bad_request" and not srv.result
+          and engine_paths.read_keep_off() is None, (error, srv.result))
+c.send({"op": "status"})
+check("M6: the engine still answers after the refused releases", c.read_event().ev == "status")
 srv.request_exit("stop")
 wait_exit(srv, 3)
 

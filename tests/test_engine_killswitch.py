@@ -40,7 +40,7 @@ def start_engine():
                              stderr=subprocess.DEVNULL, start_new_session=True)
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
-        if engine_client._reachable():
+        if engine_client.reachable():
             return child
         time.sleep(0.05)
     raise RuntimeError("engine did not start")
@@ -85,7 +85,7 @@ try:
     check("no kill pattern (regex) matches the real engine command line", not matching, (matching, cmdline))
     check("the request still completes", pending.done.wait(10) and pending.reason == "complete",
           (pending.reason, pending.error))
-    check("the engine is still alive", child.poll() is None and engine_client._reachable())
+    check("the engine is still alive", child.poll() is None and engine_client.reachable())
 
     # plain `stop` does not touch the engine either
     pending = conn.submit(LONG, "bf_emma")

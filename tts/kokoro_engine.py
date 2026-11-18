@@ -1,7 +1,9 @@
 # tts/kokoro_engine.py
 """The shared Kokoro engine process. Run through engine_launcher.py serve.
 
-Only --stub works until the real synth lands; numpy and kokoro are imported lazily.
+The real synth (kokoro_model.KokoroSynth) imports numpy, onnxruntime and kokoro_onnx in
+preload(), before the sockets are bound, and loads the model on the first request or warm.
+--stub serves a sine-tone synth instead and imports none of them.
 """
 
 import sys
@@ -32,13 +34,15 @@ def _stub_delay_ms(argv) -> int:
 def _choose_synth(stub: bool, stub_delay_ms: int = 0):
     if stub:
         return SineSynth(synth_delay=stub_delay_ms / 1000)
-    from kokoro_model import KokoroSynth   # lazy: pulls in numpy and onnxruntime
-    return KokoroSynth()
+    from kokoro_model import KokoroSynth
+    synth = KokoroSynth()
+    synth.preload()   # the heavy imports, before binding: the first request pays only the model load
+    return synth
 
 
 def main(argv) -> int:
     stub = "--stub" in argv
-    synth = _choose_synth(stub, _stub_delay_ms(argv))   # construction stays cheap: the model loads later, on demand
+    synth = _choose_synth(stub, _stub_delay_ms(argv))   # the model itself loads later, on demand
     try:
         listening = _open_listeners()   # holds engine.lock (listening.lock_fd) for the process lifetime
     except OSError as error:

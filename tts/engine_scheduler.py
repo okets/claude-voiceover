@@ -58,12 +58,6 @@ class Scheduler:
         self._replace(conn, kept)
         return dropped
 
-    def has_work(self) -> bool:
-        return bool(self._queues)
-
-    def pending(self, conn: int) -> int:
-        return len(self._queues.get(conn, ()))
-
     # --- internals ---------------------------------------------------------
 
     def _next_conn(self, exclude):

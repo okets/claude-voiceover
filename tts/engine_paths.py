@@ -143,12 +143,7 @@ def rotate_token() -> str:
 
 def read_global_settings() -> dict:
     """The global settings file, read fresh each call; {} on any error."""
-    try:
-        with open(engine_common.data_dir() / "settings.json", encoding="utf-8") as handle:
-            loaded = json.load(handle)
-        return loaded if isinstance(loaded, dict) else {}
-    except Exception:
-        return {}
+    return engine_common.read_json(engine_common.data_dir() / "settings.json") or {}
 
 
 def engine_port():
@@ -169,15 +164,6 @@ def idle_unload_seconds() -> float:
 
 # --- JSON state files -------------------------------------------------------
 
-def _read_json(path: Path):
-    try:
-        with open(path, encoding="utf-8") as handle:
-            loaded = json.load(handle)
-    except (OSError, ValueError):
-        return None
-    return loaded if isinstance(loaded, dict) else None
-
-
 def _write_json_atomic(path: Path, data: dict) -> None:
     temp = path.with_name("%s.%d.tmp" % (path.name, os.getpid()))
     temp.write_text(json.dumps(data))
@@ -186,7 +172,7 @@ def _write_json_atomic(path: Path, data: dict) -> None:
 
 def read_pointer():
     """current.json: what the running engine published about itself, or None."""
-    return _read_json(pointer_path())
+    return engine_common.read_json(pointer_path())
 
 
 def write_pointer(info: dict) -> None:
@@ -195,7 +181,7 @@ def write_pointer(info: dict) -> None:
 
 def read_keep_off():
     """The keep-off record while it is still in force, else None."""
-    record = _read_json(keep_off_path())
+    record = engine_common.read_json(keep_off_path())
     try:
         if record is not None and float(record["until"]) > time.time():
             return record

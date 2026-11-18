@@ -167,12 +167,8 @@ def stop_shared_engine():
     """Ask the shared Kokoro engine to exit; every error (none running, stale socket,
     no engine client on this platform) is ignored."""
     try:
-        import engine_client
-        conn = engine_client.EngineConnection.connect(timeout=0.5)
-        try:
-            conn.stop()
-        finally:
-            conn.close()
+        import engine_client   # POSIX only: needs fcntl
+        engine_client.run_on_engine(lambda conn: conn.stop(), timeout=0.5)
     except Exception:
         pass
 

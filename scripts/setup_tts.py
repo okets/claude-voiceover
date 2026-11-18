@@ -40,7 +40,8 @@ MODEL_FILES = {
 FIRST_SHARE_PORT = 47320
 LAST_PORT = 65535
 AUTO_PORT = "auto"
-TOKEN_NOTE = "Put this token in your assistant's secrets; `voiceover-engine token` shows it again."
+TOKEN_NOTE = ("TCP callers need the engine's token. To keep it out of this transcript, run this in your own "
+              "terminal and put the token in your assistant's secrets:\n  %s token")
 
 LINUX_PLAYERS = ["ffplay", "aplay", "paplay", "mpv"]
 
@@ -250,7 +251,8 @@ def _install_everything(port):
 
 
 def share_engine(requested_port=AUTO_PORT):
-    """Opt in to sharing the engine: port, prepared environment, systemd units, token. Returns an exit code."""
+    """Opt in to sharing the engine: port, prepared environment, systemd units, token (created, never
+    printed). Returns an exit code."""
     if not sys.platform.startswith("linux"):
         print("--share-engine is Linux only (it uses systemd user units).")
         return 1
@@ -265,8 +267,8 @@ def share_engine(requested_port=AUTO_PORT):
         return 1
     print("Engine shared on 127.0.0.1:%d and %s" % (port, engine_paths.socket_path()))
     warn_if_no_linger()
-    print("Token: %s" % engine_paths.read_or_create_token())
-    print(TOKEN_NOTE)
+    engine_paths.read_or_create_token()   # created now, shown only by `voiceover-engine token`
+    print(TOKEN_NOTE % engine_paths.shim_path())
     return 0
 
 

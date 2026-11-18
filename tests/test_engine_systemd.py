@@ -84,9 +84,9 @@ shim.write_text("#!/bin/sh\n")
 engine_launcher._python_candidates = lambda: [str(inside_plugin)]
 check("install-service refuses when only a plugin python exists", engine_launcher.main(["install-service"]) == 1 and not calls)
 engine_launcher._python_candidates = lambda: [str(stable)]
-real_answers0, real_stop0 = engine_launcher._engine_answers, engine_launcher._stop
+real_answers0, real_stop0 = engine_launcher.engine_client.reachable, engine_launcher._stop
 order = []
-engine_launcher._engine_answers = lambda: True
+engine_launcher.engine_client.reachable = lambda: True
 engine_launcher._stop = lambda args: order.append("stop") or 0
 _fake = fake_systemctl
 engine_launcher.run_systemctl = lambda *a: order.append(a[0] if a[0] != "enable" else "enable") or _fake(*a)
@@ -94,7 +94,7 @@ check("install-service succeeds", engine_launcher.main(["install-service"]) == 0
 check("a reachable self-started engine is stopped before enable --now",
       order.index("stop") < order.index("enable"), order)
 engine_launcher.run_systemctl = _fake
-engine_launcher._engine_answers, engine_launcher._stop = real_answers0, real_stop0
+engine_launcher.engine_client.reachable, engine_launcher._stop = real_answers0, real_stop0
 check("the unit's ExecStart uses the chosen python", "ExecStart=%s " % stable in (UNITS / "voiceover-engine.service").read_text())
 check("both unit files written", (UNITS / "voiceover-engine.socket").is_file() and (UNITS / "voiceover-engine.service").is_file())
 check("units carry the temp data dir and shim",
@@ -115,22 +115,22 @@ check("uninstall disables --now first", calls[0] == ("disable", "--now", "voiceo
 check("uninstall removes the files", not list(UNITS.glob("voiceover-engine.*")))
 
 stops = []
-real_answers, real_stop = engine_launcher._engine_answers, engine_launcher._stop
+real_answers, real_stop = engine_launcher.engine_client.reachable, engine_launcher._stop
 engine_launcher._stop = lambda args: stops.append(1) or 0
 calls.clear()
-engine_launcher._engine_answers = lambda: True
+engine_launcher.engine_client.reachable = lambda: True
 check("enable stops a self-started engine, then enables",
       engine_launcher.main(["enable"]) == 0 and stops == [1] and calls[-1] == ("enable", "--now", "voiceover-engine.socket"), calls)
 stops.clear(); active["socket"] = True
 engine_launcher.main(["enable"])
 check("enable leaves an engine the socket already owns", stops == [])
-stops.clear(); active["socket"] = False; engine_launcher._engine_answers = lambda: False
+stops.clear(); active["socket"] = False; engine_launcher.engine_client.reachable = lambda: False
 engine_launcher.main(["enable"])
 check("enable with no engine running stops nothing", stops == [])
 calls.clear(); stops.clear()
 check("disable runs disable --now then stop",
       engine_launcher.main(["disable"]) == 0 and calls == [("disable", "--now", "voiceover-engine.socket")] and stops == [1])
-engine_launcher._engine_answers, engine_launcher._stop = real_answers, real_stop
+engine_launcher.engine_client.reachable, engine_launcher._stop = real_answers, real_stop
 
 # --- setup_tts --share-engine ---------------------------------------------------------
 def run_setup(*argv):
@@ -197,8 +197,10 @@ os.environ["USER"] = "tester"
 setup_tts.run_loginctl = lambda *a: "Linger=no\n"
 check("linger off prints the warning and the command, without running it",
       "loginctl enable-linger tester" in shared_out and not any(c[0] == "enable-linger" for c in calls))
-check("it prints the token and the note", engine_paths.read_or_create_token() in shared_out
-      and "Put this token in your assistant's secrets; `voiceover-engine token` shows it again." in shared_out)
+check("M10: it never prints the token (it would land in the transcript)",
+      engine_paths.read_or_create_token() not in shared_out, shared_out)
+check("M10: it tells the user to run `voiceover-engine token` in their own terminal",
+      "%s token" % engine_paths.shim_path() in shared_out and "your own terminal" in shared_out, shared_out)
 setup_tts.run_loginctl = lambda *a: "Linger=yes\n"
 check("linger on prints no warning", "enable-linger" not in run_setup("--share-engine")[1])
 
