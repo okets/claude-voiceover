@@ -26,3 +26,15 @@ Observations:
 - The engine's status `vram_mib` lags `nvidia-smi` by up to one 5 s timer tick.
 
 Not run here: T5 cancel inside the box on the card, and the boxed latency figures — handed to the my_agent session's probe (results appended below when received). T6 (busy, two long narrations) is partly covered by T1's 0.59 s.
+
+## Boxed rerun by the my_agent session (real engine, through its sandbox proxy)
+
+ms, min / median / max, bf_emma:
+- Warm "Okay then.": start → first frame 170 / 171 / 210; from the box's spawn call: hello 285, first audio 456 (medians).
+- Warm 15-word sentence: start → first frame 443 / 444 / 635 (complete within 0.7 s).
+- 10-sentence paragraph (40.1 s of audio): first frame 589; about 7× real time; largest frame 32768.
+- Cancel 100 ms after first frame: end/cancelled 0.8 / 0.9 / 1.2; zero frames after; a following 2-word request waits out the sentence in the model (621 median).
+- SIGTERM → new boxed client's first audio: 409 / 409 / 445.
+- Two callers (A paragraph, B "Okay then." 600 ms later): B start → first frame 878 median without `live`, 880 with — one in-flight sentence plus B's own; the round-order fix confirmed.
+- Idle 345 s: engine off the card, service inactive, memory back to the other programs' 1146 MiB; cold boxed client: spawn → first audio 1989.
+- Changeover note: sessions started before the switch still run 1.5.0 hooks and load their own model (seen: one 1122 MiB and one 604 MiB 1.5.0 drainer beside the shared engine). M1 holds once those sessions are restarted onto 1.6.0.
