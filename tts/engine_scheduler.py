@@ -4,7 +4,7 @@
 Jobs within a connection are strictly first-in, first-out. Scheduling works in
 rounds: each round serves, once, every connection that had a ready job when the
 round began. Within a round, connections whose head job is live go first;
-otherwise the order is the order in which they started waiting. A connection
+otherwise the least recently served goes first (never served before any). A connection
 served this round waits for the next one, so a narration sentence never waits
 behind more than one sentence of any other caller.
 """
@@ -24,14 +24,13 @@ class Job(NamedTuple):
 class Scheduler:
     def __init__(self):
         self._queues = {}        # conn -> deque of Job (non-empty only)
-        self._waiting_since = {}  # conn -> ticket: when it started waiting
+        self._last_served = {}   # conn -> ticket of its latest served job (absent: never served)
         self._tickets = count()
         self._round = []         # conns still to be served this round
 
     def add(self, job: Job) -> None:
         if job.conn not in self._queues:
             self._queues[job.conn] = deque()
-            self._waiting_since[job.conn] = next(self._tickets)
         self._queues[job.conn].append(job)
 
     def next(self, exclude=()):
@@ -75,15 +74,14 @@ class Scheduler:
         return None
 
     def _ordered_conns(self):
-        """Live heads first, then by when each connection started waiting."""
+        """Live heads first, then least recently served (never served first)."""
         return sorted(self._queues, key=lambda c: (not self._queues[c][0].live,
-                                                   self._waiting_since[c]))
+                                                   self._last_served.get(c, -1)))
 
     def _served(self, conn):
-        """After serving: drop an emptied connection, else it waits anew."""
-        if self._queues[conn]:
-            self._waiting_since[conn] = next(self._tickets)
-        else:
+        """After serving: note when, and drop an emptied connection."""
+        self._last_served[conn] = next(self._tickets)
+        if not self._queues[conn]:
             self._forget(conn)
 
     def _replace(self, conn, queue):
@@ -94,4 +92,4 @@ class Scheduler:
 
     def _forget(self, conn):
         self._queues.pop(conn, None)
-        self._waiting_since.pop(conn, None)
+        self._last_served.pop(conn, None)

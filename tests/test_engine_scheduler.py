@@ -86,4 +86,17 @@ check("newcomers are served while another connection stays excluded", s.next(exc
 s = Scheduler(); s.add(job("A", text="a1")); s.add(job("B", text="b1"))
 check("exclude does not reorder the others", [s.next(exclude={"A"}).text, s.next().text] == ["b1", "a1"])
 
+# --- a newcomer is not queued behind a busy caller's next sentence (M17, ruling R16) -------------
+s = Scheduler()
+for i in range(10):
+    s.add(job("A", text="a%d" % i))
+in_flight = s.next()
+s.add(job("B", text="b0"))
+check("probe: the in-flight pick is A's first", in_flight.text == "a0")
+check("probe: the newcomer goes next, then A", [s.next().text, s.next().text] == ["b0", "a1"])
+s = Scheduler()
+s.add(job("A", text="a0")); s.add(job("A", text="a1")); s.next()
+s.add(job("B", text="b0", live=False)); s.add(job("C", text="c0", live=True))
+check("live heads still go first, among the least recently served", s.next().text == "c0")
+
 report()
