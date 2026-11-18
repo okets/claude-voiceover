@@ -79,6 +79,7 @@ kokoro_model.models_present = lambda: True
 
 # voices, speeds, construction
 synth = kokoro_model.KokoroSynth()
+check("voices() before load() is empty", kokoro_model.KokoroSynth().voices() == set())
 check("construction is cheap: not loaded", synth.loaded is False and loads == [])
 synth.load()
 check("loaded after load()", synth.loaded)
@@ -87,6 +88,37 @@ check("default speed bm_daniel 1.3", synth.default_speed("bm_daniel") == 1.3)
 check("default speed af_heart 1.0", synth.default_speed("af_heart") == 1.0)
 check("status on cuda", synth.status() == {"device": "cuda", "requested": "cuda", "fallback": None, "vram_mib": 512},
       synth.status())
+
+# status() never spawns a process
+import subprocess
+real_run = subprocess.run
+def no_spawn(*a, **k):
+    raise AssertionError("subprocess.run called")
+subprocess.run = no_spawn
+try:
+    status_ok = synth.status()["vram_mib"] == 512
+except AssertionError:
+    status_ok = False
+subprocess.run = real_run
+check("status() spawns nothing and serves the cached vram", status_ok)
+
+# input errors do not fall back
+class BadInput(FakeKokoro):
+    def create(self, *args, **kwargs):
+        raise KeyError("no such voice")
+loads.clear()
+picky = kokoro_model.KokoroSynth()
+picky.load()
+picky._kokoro = BadInput("CUDAExecutionProvider")
+loads.clear()
+raised = False
+try:
+    picky.synthesize("x", "nope", 1.0, "en-us")
+except KeyError:
+    raised = True
+check("a KeyError on cuda is re-raised", raised)
+check("and neither reloads nor falls back", loads == [] and picky.status()["device"] == "cuda"
+      and picky.status()["fallback"] is None, picky.status())
 
 # mid-run CUDA failure
 first = synth.synthesize("hello", "voice_1", 1.0, "en-us")
@@ -106,7 +138,7 @@ class Broken(FakeKokoro):
         raise RuntimeError("boom")
 cpu_synth = kokoro_model.KokoroSynth()
 cpu_synth.load()
-cpu_synth._kokoro, cpu_synth._device = Broken("CPUExecutionProvider"), "cpu"
+cpu_synth._kokoro, cpu_synth._placement = Broken("CPUExecutionProvider"), ("cpu", None)
 raised = False
 try:
     cpu_synth.synthesize("x", "voice_1", 1.0, "en-us")
@@ -136,6 +168,7 @@ guarded = kokoro_model.KokoroSynth()
 guarded.load()
 status = guarded.status()
 check("keep-off loads on CPU", loads == ["CPUExecutionProvider"], loads)
+check("keep-off reports the configured provider as requested", status["requested"] == "cuda", status)
 check("keep-off fallback reason", status["fallback"]["reason"] == "keep_off" and status["device"] == "cpu", status)
 keep_off[0] = None
 
@@ -149,6 +182,30 @@ failed.load()
 check("load failure falls back to CPU with load_failed",
       failed.status()["device"] == "cpu" and failed.status()["fallback"]["reason"].startswith("load_failed"),
       failed.status())
+
+# realistic load failure: _load_accelerated swallows the error, its reason survives
+loads.clear()
+def accel_fails_then_cpu():
+    kokoro = kokoro_model._load_accelerated("CUDAExecutionProvider")
+    return kokoro if kokoro is not None else fake_load_on("CPUExecutionProvider")
+def broken_cuda_load(provider):
+    if provider == "CUDAExecutionProvider":
+        raise OSError("libcudnn missing")
+    return fake_load_on(provider)
+kokoro_model._load_on = broken_cuda_load
+kokoro_model.load_kokoro = accel_fails_then_cpu
+accel = kokoro_model.KokoroSynth()
+accel.load()
+check("a swallowed accelerated-load error is the fallback reason",
+      accel.status()["fallback"]["reason"] == "load_failed: OSError: libcudnn missing", accel.status())
+kokoro_model._load_on = fake_load_on
+
+# cpu: no vram query
+kokoro_model._query_vram_mib = lambda pid: (_ for _ in ()).throw(AssertionError("queried"))
+cpu_only = kokoro_model.KokoroSynth(force_cpu=True)
+cpu_only.load()
+cpu_only.synthesize("x", "voice_1", 1.0, "en-us")
+check("on cpu vram_mib is None with no query", cpu_only.status()["vram_mib"] is None)
 
 # force_cpu
 loads.clear()

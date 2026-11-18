@@ -24,24 +24,18 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.request
 from pathlib import Path
 
 from kokoro_model import (  # noqa: F401  moved; re-exported for existing callers and tests
     DEFAULT_SAMPLE_RATE, DEFAULT_VOICE, DEFAULT_VOICE_SETTINGS, MODEL_FILE, MODEL_URL, MODELS_DIR, VOICE_SETTINGS,
     VOICES_FILE, VOICES_URL, _CPU, _CUDA, _PROBE_VOICE, _active_provider, _gpu_provider, _load_accelerated,
-    _load_on, choose_onnx_provider, download_models, ensure_models, get_voice_settings, load_kokoro, models_present)
+    _load_on, choose_onnx_provider, download_models, ensure_models, get_voice_settings, load_kokoro, log, models_present)
 from engine_common import (Playback, ProcessPlayback, data_dir, engine_log, global_setting, remove_tts_lock,
                            try_claim_lock, update_lock_expiry)
 
 DRY_RUN = bool(os.environ.get("VOICEOVER_DRY_RUN"))
 
 PLAYBACK_GRACE_SECONDS = 10  # a clip's player may run this much past its length
-
-
-def log(message):
-    """Diagnostics go to stderr; stdout stays silent for the hook protocol."""
-    print(message, file=sys.stderr)
 
 
 # --- audio playback (inline port of the cross-platform player) --------------
@@ -85,10 +79,7 @@ def _play_linux(file_path, timeout):
     return False
 
 
-# --- model management --------------------------------------------------------
-
 # --- synthesis ---------------------------------------------------------------
-
 
 def play_chunk(samples, sample_rate, root):
     """Play one streamed chunk; extends the lock, never removes it."""

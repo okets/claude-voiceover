@@ -9,7 +9,6 @@ inside functions, so this module imports in the stdlib-only test suite.
 import os
 import subprocess
 import sys
-import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -111,17 +110,23 @@ def _load_on(provider):
     return Kokoro(str(MODEL_FILE), str(VOICES_FILE))
 
 
+_last_accelerated_error = None   # why the latest _load_accelerated failed (None after a success)
+
+
 def _load_accelerated(provider):
     """The model on an accelerated provider, proven by one short synthesis.
 
     CUDA can load and still fail on first use (driver too old for the CUDA
     build, no kernel image for the card, out of VRAM). Returns None on failure.
     """
+    global _last_accelerated_error
+    _last_accelerated_error = None
     try:
         kokoro = _load_on(provider)
         kokoro.create("Ready.", voice=_PROBE_VOICE, speed=1.0)
         return kokoro
     except Exception as error:
+        _last_accelerated_error = error
         log("[voiceover] %s failed, falling back to CPU: %s" % (provider, error))
         engine_log("device", "fallback provider=%s error=%s" % (provider, error))
         return None
@@ -195,18 +200,23 @@ def _query_vram_mib(pid):
     return None
 
 
+INPUT_ERRORS = (ValueError, TypeError, KeyError)   # the caller's fault: CPU would fail the same way
+
+
 class KokoroSynth:
-    """The real Synth: Kokoro on CUDA when it works, else CPU. Construction is cheap; load() does the work."""
+    """The real Synth: Kokoro on CUDA when it works, else CPU. Construction is cheap; load() does the work.
+
+    status() only reads cached state, since the engine answers it on its event loop. The VRAM figure
+    is refreshed on the worker thread, after load() and after synthesize()."""
 
     def __init__(self, force_cpu=False):
         self.loaded = False
         self._force_cpu = force_cpu
         self._kokoro = None
         self._requested = "cpu"
-        self._device = "cpu"
-        self._fallback = None
-        self._vram = (0.0, None)   # (time read, value)
-        self._reload_lock = threading.Lock()
+        self._placement = ("cpu", None)   # (device, fallback), replaced as one value
+        self._vram_read_at = 0.0
+        self._vram = None
 
     def load(self):
         from engine_server import NoModel
@@ -214,15 +224,16 @@ class KokoroSynth:
             raise NoModel("Kokoro model files are missing")
         import numpy  # noqa: F401  eager (S7): everything is imported before serving
         import onnxruntime  # noqa: F401
+        self._requested = "cuda" if choose_onnx_provider() == _CUDA else "cpu"
         keep_off = self._keep_off()
         if self._force_cpu or keep_off:
-            self._requested = "cpu"
             self._kokoro = _load_on(_CPU)
-            self._fallback = self._fallback_record("keep_off") if keep_off else None
+            fallback = self._fallback_record("keep_off") if keep_off else None
+            self._placement = ("cpu", fallback)
         else:
             self._load_requested()
-        self._device = self._device_of(self._kokoro)
         self.loaded = True
+        self._refresh_vram()
 
     @staticmethod
     def _keep_off():
@@ -233,23 +244,30 @@ class KokoroSynth:
     def _fallback_record(reason):
         return {"reason": reason, "at": time.time()}
 
+    @staticmethod
+    def _failure_reason(error):
+        return "%s: %s" % (type(error).__name__, error)
+
     def _load_requested(self):
-        self._requested = "cuda" if choose_onnx_provider() == _CUDA else "cpu"
+        fallback = None
         try:
             self._kokoro = load_kokoro()
-            self._fallback = None
         except Exception as error:
             self._kokoro = _load_on(_CPU)
-            self._fallback = self._fallback_record("load_failed: %s: %s" % (type(error).__name__, error))
-        if self._requested == "cuda" and self._device_of(self._kokoro) == "cpu" and self._fallback is None:
-            self._fallback = self._fallback_record("load_failed: CUDA unavailable")
+            fallback = self._fallback_record("load_failed: " + self._failure_reason(error))
+        device = self._device_of(self._kokoro)
+        if fallback is None and self._requested == "cuda" and device == "cpu":
+            cause = _last_accelerated_error
+            reason = self._failure_reason(cause) if cause is not None else "CUDA unavailable"
+            fallback = self._fallback_record("load_failed: " + reason)
+        self._placement = (device, fallback)
 
     @staticmethod
     def _device_of(kokoro):
         return "cuda" if _active_provider(kokoro) == _CUDA else "cpu"
 
     def voices(self):
-        return set(self._kokoro.get_voices())
+        return set(self._kokoro.get_voices()) if self._kokoro is not None else set()
 
     def default_speed(self, voice):
         return get_voice_settings(voice)["speed"]
@@ -258,28 +276,30 @@ class KokoroSynth:
         from engine_protocol import pcm16le
         try:
             samples, _rate = self._kokoro.create(text, voice, speed, lang, trim=True)
+        except INPUT_ERRORS:
+            raise
         except Exception as error:
-            if self._device != "cuda":
+            if self._placement[0] != "cuda":
                 raise
             self._fall_back_to_cpu(error)
             samples, _rate = self._kokoro.create(text, voice, speed, lang, trim=True)
+        self._refresh_vram()
         return pcm16le(samples)
 
     def _fall_back_to_cpu(self, error):
-        with self._reload_lock:
-            self._kokoro = _load_on(_CPU)
-            self._device = "cpu"
-            self._fallback = self._fallback_record("synthesis_failed: %s: %s" % (type(error).__name__, error))
-            self._vram = (0.0, None)
+        self._kokoro = _load_on(_CPU)
+        self._placement = ("cpu", self._fallback_record("synthesis_failed: " + self._failure_reason(error)))
+        self._vram = None
         engine_log("device", "synthesis fallback to cpu: %s" % error)
 
     def status(self):
-        return {"device": self._device, "requested": self._requested,
-                "fallback": self._fallback, "vram_mib": self._vram_mib()}
+        device, fallback = self._placement
+        return {"device": device, "requested": self._requested,
+                "fallback": fallback, "vram_mib": self._vram if device == "cuda" else None}
 
-    def _vram_mib(self):
-        read_at, value = self._vram
-        if time.time() - read_at >= VRAM_CACHE_SECONDS:
-            value = _query_vram_mib(os.getpid())
-            self._vram = (time.time(), value)
-        return value
+    def _refresh_vram(self):
+        """Worker-thread only: query nvidia-smi, at most every VRAM_CACHE_SECONDS, and only on cuda."""
+        if self._placement[0] != "cuda" or time.time() - self._vram_read_at < VRAM_CACHE_SECONDS:
+            return
+        self._vram = _query_vram_mib(os.getpid())
+        self._vram_read_at = time.time()
