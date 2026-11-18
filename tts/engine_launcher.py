@@ -95,7 +95,8 @@ def _hold_start_lock(lock):
 def _write_unless_kept(root, info):
     """Write `info` unless the pointer rule, re-checked now, says to keep the current one."""
     override = engine_paths.read_global_settings().get("engine_plugin_root")
-    if engine_paths.should_replace(engine_paths.read_pointer(), root, info["plugin_version"], override):
+    if engine_paths.should_replace(engine_paths.read_pointer(), root, info["plugin_version"], override,
+                                   info["project"]):
         engine_paths.write_pointer(info)
 
 
@@ -122,7 +123,9 @@ def _prepare_pointer(root, project, take_lock=True):
     start.lock is held only for the re-check and the write, never across the build: ensure()
     holds it while it waits for the engine we are being run by, and a minutes-long uv sync
     would stall every other starter. serve passes take_lock=False for that same reason: its
-    starter already holds start.lock, and waiting for it here would deadlock."""
+    starter already holds start.lock, and waiting for it here would deadlock. The cost: a serve
+    started by systemd or by hand may race a hook's prepare; the worst case is one lower pointer,
+    corrected by the next prompt's refresh."""
     uv = _find_uv()
     python = _run_uv(uv, project) if uv else None
     if not python:
@@ -140,12 +143,22 @@ def _default_project(root, settings, system=None, machine=None):
     import voiceover/: the onnxruntime-gpu wheels exist on x86_64 Linux and Windows only."""
     system = sys.platform if system is None else system
     machine = (platform.machine() if machine is None else machine).lower()
-    capable = system != "darwin" and machine in ("x86_64", "amd64")
+    capable = system.startswith(("linux", "win")) and machine in ("x86_64", "amd64")
     return root / ("tts-gpu" if settings.get("tts_device") == "gpu" and capable else "tts")
 
 
 def _prepare(args):
-    return _prepare_pointer(Path(args.root), Path(args.project))
+    """One prepare at a time: a second one, while a sync runs, has nothing to add and exits 0."""
+    try:
+        lock = open(engine_paths.prepare_lock_path(), "a+")
+    except OSError:
+        return EXIT_UNREACHABLE
+    with lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return EXIT_OK
+        return _prepare_pointer(Path(args.root), Path(args.project))
 
 
 def _pointer_python():
@@ -167,7 +180,11 @@ def _serve(args):
             python = _pointer_python()
     stub_args = ["--stub"] + (["--stub-delay-ms", str(args.stub_delay_ms)] if args.stub_delay_ms else [])
     argv = [python, script] + (stub_args if args.stub else [])
-    os.execv(python, argv)   # exec keeps the pid, so LISTEN_PID stays valid
+    try:
+        os.execv(python, argv)   # exec keeps the pid, so LISTEN_PID stays valid
+    except OSError as error:
+        print("voiceover-engine: cannot start %s: %s" % (python, error), file=sys.stderr)
+        return EXIT_UNREACHABLE
 
 
 def _ensure(args):

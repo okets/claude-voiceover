@@ -17,7 +17,7 @@ from pathlib import Path
 from . import speech
 from .settings import data_dir, get_machine_setting
 
-sys.path.insert(0, str(speech._TTS_DIR))
+sys.path.append(str(speech._TTS_DIR))   # appended: a tts module must never shadow the stdlib
 import engine_paths  # noqa: E402  (the engine's stdlib-only path and pointer rules)
 
 CHECK_INTERVAL_S = 60.0
@@ -25,8 +25,8 @@ _SHIM_NAME = "voiceover_engine_shim.py"
 _SHIM_MODE = 0o755
 
 
-def should_replace(current, candidate_root, candidate_version, override) -> bool:
-    return engine_paths.should_replace(current, candidate_root, candidate_version, override)
+def should_replace(current, candidate_root, candidate_version, override, wanted_project=None) -> bool:
+    return engine_paths.should_replace(current, candidate_root, candidate_version, override, wanted_project)
 
 
 def _windows() -> bool:
@@ -45,8 +45,19 @@ def _due() -> bool:
     return True
 
 
+def _newer_than_own(pointer) -> bool:
+    """True when the pointer is of a higher plugin version than this copy."""
+    if not pointer:
+        return False
+    own = engine_paths.plugin_version(speech._PLUGIN_ROOT)
+    return engine_paths.version_tuple(own) < engine_paths.version_tuple(pointer.get("plugin_version", ""))
+
+
 def _install_shim() -> None:
-    """Put the launcher shim at <state>/bin/voiceover-engine (0755) when its bytes differ."""
+    """Put the launcher shim at <state>/bin/voiceover-engine (0755) when its bytes differ,
+    unless a newer plugin version owns the pointer (an older copy must not overwrite its shim)."""
+    if _newer_than_own(engine_paths.read_pointer()):
+        return
     wanted = (speech._TTS_DIR / _SHIM_NAME).read_bytes()
     target = data_dir() / "bin" / "voiceover-engine"
     try:
@@ -81,11 +92,13 @@ def _spawn_prepare(root: Path, project: Path) -> None:
 def _prepare_if_needed(plugin_root: Path) -> bool:
     override = get_machine_setting("engine_plugin_root")
     root = _candidate_root(plugin_root, override)
-    if not should_replace(engine_paths.read_pointer(), root, engine_paths.plugin_version(root), override):
+    project = _project_for(root)
+    if not should_replace(engine_paths.read_pointer(), root, engine_paths.plugin_version(root), override,
+                          project):
         return False
     if os.environ.get("VOICEOVER_NO_SPAWN"):
         return False
-    _spawn_prepare(root, _project_for(root))
+    _spawn_prepare(root, project)
     return True
 
 

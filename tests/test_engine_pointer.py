@@ -1,6 +1,9 @@
 """The version pointer: should_replace, refresh (shim install, rate limit, spawn),
 engine_launcher prepare, serve's own prepare, and the hook's isolation from failures."""
 
+import contextlib
+import fcntl
+import io
 import json
 import os
 import stat
@@ -35,22 +38,43 @@ def reset_state():
     (DATA / "settings.json").unlink(missing_ok=True)
 
 
+def good(root, version, project=None, python=None):
+    """A usable pointer for root: its python is a real executable."""
+    return {"plugin_root": str(root), "plugin_version": version, "python": python or sys.executable,
+            "project": str(project or Path(root) / "tts")}
+
+
 # --- should_replace ---------------------------------------------------------------
 here = make_root("1.6.0")
 other = make_root("1.6.0")
-current = {"plugin_root": str(here), "plugin_version": "1.6.0"}
+current = good(here, "1.6.0")
 check("should_replace: no pointer", engine_pointer.should_replace(None, here, "1.6.0", None) is True)
 check("should_replace: higher version wins", engine_pointer.should_replace(current, other, "1.6.1", None) is True)
 check("should_replace: numeric, not textual (1.10.0 > 1.9.0)",
-      engine_pointer.should_replace({"plugin_root": str(here), "plugin_version": "1.9.0"}, other, "1.10.0", None) is True)
+      engine_pointer.should_replace(good(here, "1.9.0"), other, "1.10.0", None) is True)
 check("should_replace: equal version from another root keeps the pointer",
       engine_pointer.should_replace(current, other, "1.6.0", None) is False)
 check("should_replace: lower version keeps the pointer",
       engine_pointer.should_replace(current, other, "1.5.0", None) is False)
 check("should_replace: vanished current root is replaced",
-      engine_pointer.should_replace({"plugin_root": "/no/such/root", "plugin_version": "9.9.9"}, other, "1.0.0", None) is True)
+      engine_pointer.should_replace(good("/no/such/root", "9.9.9"), other, "1.0.0", None) is True)
 check("should_replace: an override that differs wins even over a higher current",
-      engine_pointer.should_replace({"plugin_root": str(here), "plugin_version": "9.0.0"}, other, "1.0.0", str(other)) is True)
+      engine_pointer.should_replace(good(here, "9.0.0"), other, "1.0.0", str(other)) is True)
+check("should_replace: override L, candidate R is False (only the override is admitted)",
+      engine_pointer.should_replace(good(here, "1.0.0"), other, "9.0.0", str(here)) is False
+      and engine_pointer.should_replace(None, other, "9.0.0", str(here)) is False)
+check("should_replace: a pointer with no python is unusable",
+      engine_pointer.should_replace({"plugin_root": str(here), "plugin_version": "9.9.9", "project": str(here / "tts")},
+                                    other, "1.0.0", None) is True)
+check("should_replace: a pointer whose python is not an executable file is unusable",
+      engine_pointer.should_replace(good(here, "9.9.9", python="/no/such/python"), other, "1.0.0", None) is True
+      and engine_pointer.should_replace(good(here, "9.9.9", python=str(here)), other, "1.0.0", None) is True)
+check("should_replace: same root, project flipped (cpu -> gpu) replaces",
+      engine_pointer.should_replace(good(here, "1.6.0"), here, "1.6.0", None, here / "tts-gpu") is True)
+check("should_replace: same root, same project keeps",
+      engine_pointer.should_replace(good(here, "1.6.0"), here, "1.6.0", None, here / "tts") is False)
+check("should_replace: override == current root, but the project flipped, replaces",
+      engine_pointer.should_replace(good(here, "1.6.0"), here, "1.6.0", str(here), here / "tts-gpu") is True)
 check("should_replace: an override equal to the current root replaces nothing",
       engine_pointer.should_replace(current, other, "9.9.9", str(here)) is False)
 
@@ -71,13 +95,24 @@ check("a second refresh within 60 s does nothing", SHIM_TARGET.read_bytes() == b
 engine_pointer.refresh(here)
 check("a refresh after the window repairs a differing shim", SHIM_TARGET.read_bytes() == SHIM_SOURCE.read_bytes())
 
+# an older copy never overwrites the shim of a newer pointer
+SHIM_TARGET.write_bytes(b"newer shim")
+engine_paths.write_pointer(good(here, "99.0.0"))
+(engine_paths.engine_dir() / "pointer_checked").unlink()
+engine_pointer.refresh(here)
+check("an older plugin copy leaves a newer version's shim alone", SHIM_TARGET.read_bytes() == b"newer shim")
+engine_paths.write_pointer(good(here, "0.0.1"))
+(engine_paths.engine_dir() / "pointer_checked").unlink()
+engine_pointer.refresh(here)
+check("a copy at or above the pointer's version installs the shim", SHIM_TARGET.read_bytes() == SHIM_SOURCE.read_bytes())
+
 reset_state()
 del os.environ["VOICEOVER_NO_SPAWN"]
 try:
     check("refresh spawns prepare when the pointer should change", engine_pointer.refresh(here) is True
           and len(spawned) == 1 and spawned[0][0] == here, spawned)
     (engine_paths.engine_dir() / "pointer_checked").unlink()
-    engine_paths.write_pointer({"plugin_root": str(here), "plugin_version": "1.6.0"})
+    engine_paths.write_pointer(good(here, "1.6.0", here / "tts"))
     check("refresh spawns nothing when the pointer is current", engine_pointer.refresh(other) is False
           and len(spawned) == 1)
     (engine_paths.engine_dir() / "pointer_checked").unlink()
@@ -109,7 +144,7 @@ uv_calls = []
 
 def fake_uv(uv, project):
     uv_calls.append((uv, str(project)))
-    return "/fake/venv/bin/python"
+    return sys.executable
 
 
 real_run_uv, real_find_uv = engine_launcher._run_uv, engine_launcher._find_uv
@@ -121,7 +156,7 @@ try:
     pointer = engine_paths.read_pointer()
     check("prepare exits 0 and writes the pointer", code == 0 and pointer == {
         "plugin_root": str(root), "plugin_version": "1.6.1", "uv": "/fake/uv",
-        "python": "/fake/venv/bin/python", "project": str(root / "tts")}, pointer)
+        "python": sys.executable, "project": str(root / "tts")}, pointer)
     check("prepare ran uv for that project", uv_calls == [("/fake/uv", str(root / "tts"))], uv_calls)
 
     lower = make_root("1.6.0")
@@ -135,7 +170,7 @@ try:
           code == 0 and engine_paths.read_pointer()["plugin_root"] == str(lower))
 
     reset_state()
-    engine_paths.write_pointer({"plugin_root": "/old", "plugin_version": "0.1.0", "python": "/old/python"})
+    engine_paths.write_pointer(good(here, "0.1.0"))
     before = engine_paths.pointer_path().read_text()
     engine_launcher._run_uv = lambda uv, project: None
     code = engine_launcher.main(["prepare", str(root), "--project", str(root / "tts")])
@@ -147,6 +182,19 @@ try:
           code == 1 and engine_paths.pointer_path().read_text() == before)
 finally:
     engine_launcher._run_uv, engine_launcher._find_uv = real_run_uv, real_find_uv
+
+# a second prepare while one holds prepare.lock exits 0 without running uv
+engine_launcher._run_uv = fake_uv
+engine_launcher._find_uv = lambda: "/fake/uv"
+uv_calls.clear()
+held_lock = open(engine_paths.prepare_lock_path(), "a+")
+fcntl.flock(held_lock, fcntl.LOCK_EX)
+try:
+    code = engine_launcher.main(["prepare", str(root), "--project", str(root / "tts")])
+    check("prepare while another holds prepare.lock exits 0 without running uv", code == 0 and not uv_calls, uv_calls)
+finally:
+    held_lock.close()
+engine_launcher._run_uv, engine_launcher._find_uv = real_run_uv, real_find_uv
 
 # uv lookup order: PATH, then ~/.local/bin, then ~/.cargo/bin
 home = temp_dir("vo-home-")
@@ -192,7 +240,7 @@ try:
     root = make_root("1.6.1")
     engine_launcher.main(["serve", "--plugin-root", str(root)])
     check("serve with no pointer prepares, then execs the prepared python",
-          execs and execs[0][0] == "/fake/venv/bin/python" and execs[0][1][1] == str(root / "tts" / "kokoro_engine.py"),
+          execs and execs[0][0] == sys.executable and execs[0][1][1] == str(root / "tts" / "kokoro_engine.py"),
           execs)
     check("serve's prepare used the cpu project by default", uv_calls[-1][1] == str(root / "tts"), uv_calls)
 
@@ -202,6 +250,9 @@ try:
           engine_launcher._default_project(root, {"tts_device": "gpu"}, "darwin", "arm64") == root / "tts")
     check("default project: gpu on arm64 Linux is tts",
           engine_launcher._default_project(root, {"tts_device": "gpu"}, "linux", "aarch64") == root / "tts")
+    check("default project: gpu on a non-Linux/Windows platform is tts",
+          engine_launcher._default_project(root, {"tts_device": "gpu"}, "freebsd14", "amd64") == root / "tts"
+          and engine_launcher._default_project(root, {"tts_device": "gpu"}, "win32", "AMD64") == root / "tts-gpu")
     check("default project: no gpu setting is tts",
           engine_launcher._default_project(root, {}, "linux", "x86_64") == root / "tts")
 
@@ -217,6 +268,12 @@ try:
     uv_calls.clear()
     engine_launcher.main(["serve", "--plugin-root", str(root)])
     check("serve with a pointer python skips prepare", execs[-1][0] == "/ptr/python" and not uv_calls, (execs, uv_calls))
+    os.execv = lambda python, argv: (_ for _ in ()).throw(FileNotFoundError(2, "No such file", python))
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        code = engine_launcher.main(["serve", "--plugin-root", str(root)])
+    check("serve whose exec fails prints one stderr line and exits 1, no traceback",
+          code == 1 and len(err.getvalue().strip().splitlines()) == 1 and "Traceback" not in err.getvalue(), err.getvalue())
 finally:
     os.execv = real_execv
     engine_launcher._run_uv, engine_launcher._find_uv = real_run_uv, real_find_uv
@@ -240,5 +297,28 @@ proc = subprocess.run([sys.executable, "-c", driver], capture_output=True, text=
                       input=json.dumps({"cwd": str(REPO_ROOT), "session_id": "S1", "prompt": "go"}))
 check("hook calls refresh on a user prompt", marker.exists(), proc.stderr)
 check("hook exits 0 and prints nothing when refresh raises", proc.returncode == 0 and proc.stdout == "", (proc.returncode, proc.stdout, proc.stderr))
+
+# --- the hook refreshes only for Kokoro narrators ----------------------------------------------
+def hook_installs_shim(**settings):
+    """Run the hook (spawn allowed in-process by NO_SPAWN, so only the shim shows) under settings."""
+    for key, value in settings.items():
+        set_setting(key, value)
+    SHIM_TARGET.unlink(missing_ok=True)
+    reset_state()
+    set_setting("interaction_level", "narrator")
+    for key, value in settings.items():
+        set_setting(key, value)
+    subprocess.run([sys.executable, str(REPO_ROOT / "hooks" / "user_prompt_submit.py")], capture_output=True,
+                   text=True, env=os.environ.copy(),
+                   input=json.dumps({"cwd": str(REPO_ROOT), "session_id": "S1", "prompt": "go"}))
+    return SHIM_TARGET.exists()
+
+
+check("hook installs the shim for a kokoro narrator", hook_installs_shim(tts_engine="kokoro") is True)
+check("hook installs no shim for a macOS-voice narrator", hook_installs_shim(tts_engine="macos-female") is False)
+check("hook installs no shim when the engine is none", hook_installs_shim(tts_engine="none") is False)
+check("hook installs no shim when TTS is disabled",
+      hook_installs_shim(tts_engine="kokoro", tts_enabled=False) is False)
+set_setting("tts_enabled", True)
 
 report()

@@ -40,6 +40,10 @@ def start_lock_path() -> Path:
     return _file("start.lock")
 
 
+def prepare_lock_path() -> Path:
+    return _file("prepare.lock")
+
+
 def token_path() -> Path:
     return _file("token")
 
@@ -206,15 +210,28 @@ def version_tuple(version) -> tuple:
     return tuple(parts)
 
 
-def should_replace(current, candidate_root, candidate_version, override) -> bool:
+def _pointer_usable(pointer) -> bool:
+    """A pointer whose root exists and whose python is an executable file."""
+    python = (pointer or {}).get("python")
+    root = (pointer or {}).get("plugin_root")
+    return bool(root and python and Path(root).exists() and Path(python).is_file()
+                and os.access(python, os.X_OK))
+
+
+def should_replace(current, candidate_root, candidate_version, override, wanted_project=None) -> bool:
     """Whether the candidate should become the pointer.
 
-    An override (the engine_plugin_root setting) wins: replace exactly when it differs from the
-    current root. Otherwise replace when there is no pointer, its root is gone, or the candidate's
-    version is higher; an equal version keeps the current pointer (a dev checkout never flips it)."""
-    current_root = (current or {}).get("plugin_root")
-    if override:
-        return str(override) != str(current_root)
-    if current_root is None or not Path(current_root).exists():
+    An override (the engine_plugin_root setting) only ever admits the candidate that is the override;
+    then it replaces exactly when the current root differs, or the current pointer is unusable
+    or points at another kind of project (tts / tts-gpu, by name) than `wanted_project`. Without an override, replace when there is no
+    usable pointer, the project differs (same root, tts_device flipped), or the candidate's version is
+    higher; an equal version keeps the current pointer (a dev checkout never flips it)."""
+    if override and str(candidate_root) != str(override):
+        return False
+    if not _pointer_usable(current):
         return True
-    return version_tuple(candidate_version) > version_tuple((current or {}).get("plugin_version", ""))
+    if wanted_project is not None and Path(str(current.get("project"))).name != Path(wanted_project).name:
+        return True
+    if override:
+        return str(override) != str(current.get("plugin_root"))
+    return version_tuple(candidate_version) > version_tuple(current.get("plugin_version", ""))

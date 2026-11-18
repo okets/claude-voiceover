@@ -19,11 +19,14 @@ PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PLUGIN_ROOT))
 
 
-def refresh_engine_pointer():
-    """Keep the shared engine's pointer and launcher shim fresh. Own try: never costs the hook."""
+def refresh_engine_pointer(cwd):
+    """Keep the shared engine's pointer and launcher shim fresh, for Kokoro narrators only.
+    Own try: never costs the hook."""
     try:
-        from voiceover import engine_pointer
-        engine_pointer.refresh()
+        from voiceover import engine_pointer, narrator
+        from voiceover.settings import resolve_engine
+        if narrator.narrates(cwd) and resolve_engine(cwd) == "kokoro":
+            engine_pointer.refresh()
     except Exception:
         pass
 
@@ -49,7 +52,7 @@ def main():
     if level == "narrator":
         if narrator.headless():
             return
-        refresh_engine_pointer()
+        refresh_engine_pointer(cwd)
         if narrator.is_users_prompt(payload.get("prompt")):
             if previous:
                 narrator.abandon(previous, session)  # the old turn, in its own project
