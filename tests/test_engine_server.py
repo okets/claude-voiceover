@@ -122,9 +122,14 @@ check("cancel without id cancels everything on the connection", ends == {"a", "b
 
 c.send({"op": "start", "id": "dup", "voice": "bf_emma"})
 c.send({"op": "start", "id": "dup", "voice": "bf_emma"})
-check("active id reuse -> bad_request", c.read_error()["code"] == "bad_request")
-c.send({"op": "cancel", "id": "dup"})
-check("the original dup is still cancellable", c.read_until_end("dup")[-1]["reason"] == "cancelled")
+dup_err = c.read_error()
+check("active id reuse -> bad_request with ref, no id",
+      dup_err["code"] == "bad_request" and dup_err.get("ref") == "dup" and "id" not in dup_err, dup_err)
+c.send({"op": "text", "id": "dup", "text": "Still mine."})
+c.send({"op": "end", "id": "dup"})
+dup_events = c.read_until_end("dup")
+check("the original request still completes with its own end",
+      dup_events[-1]["reason"] == "complete" and not any(e.ev == "error" for e in dup_events), dup_events[-1])
 
 # --- requests on one connection are served in start order -------------------------------------------
 c.send({"op": "start", "id": "A", "voice": "bf_emma"})
@@ -166,7 +171,11 @@ c.read_until_end("fl")
 c.send({"op": "frobnicate"})
 check("unknown op -> bad_request", c.read_error()["code"] == "bad_request")
 c.send({"op": "text", "id": "nobody", "text": "x"})
-check("text for an unknown id -> bad_request", c.read_error()["code"] == "bad_request")
+nobody = c.read_error()
+check("text for an unknown id -> bad_request with ref", nobody["code"] == "bad_request"
+      and nobody.get("ref") == "nobody" and "id" not in nobody, nobody)
+c.send({"op": "status"})
+check("nothing follows a ref error (no end)", c.read_event().ev == "status")
 c.send({"op": "start", "voice": "bf_emma"})
 check("start without id -> bad_request", c.read_error()["code"] == "bad_request")
 c.sock.sendall(b"{not json\n")

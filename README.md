@@ -105,7 +105,7 @@ Measured on a GTX 1650 (i7-9750H): a narration's first audio in ~2.1 s instead o
 
 ## Sharing the engine with another program
 
-On Linux and macOS, Voiceover runs one Kokoro engine per user and every narration is a client of it. The model loads once, the engine leaves memory after 60 seconds of quiet, and it never holds the GPU for longer than that. Another program of yours (a voice assistant, a script) can use the same engine instead of loading a second copy of the model.
+On Linux and macOS, Voiceover runs one Kokoro engine per user and every narration is a client of it. The model loads once, the engine leaves memory after 60 seconds of quiet (330 seconds while sharing is on; a warm hold or an open request keeps it loaded). Another program of yours (a voice assistant, a script) can use the same engine instead of loading a second copy of the model.
 
 - **Same machine, no setup:** connect to the Unix socket `~/.claude-voiceover/engine/engine.sock` and speak the line protocol described in `INTERFACES.md` ("Shared engine (protocol 1)"). Audio comes back as 24 kHz mono 16-bit little-endian PCM. A Unix-socket caller needs no token.
 - **Over TCP, or from another account or container:** on Linux run `python3 scripts/setup_tts.py --share-engine [PORT]`. It sets up a systemd user socket on the Unix socket and `127.0.0.1:PORT` (loopback only; the default is the first free port from 47320), starts the engine on demand, and prints a token. TCP callers must send that token first; `voiceover-engine token` shows it again and `voiceover-engine rotate-token` replaces it. `python3 scripts/setup_tts.py --unshare-engine` undoes it. The engine then stays loaded for 330 seconds after the last use (set `engine_idle_s` to change it).

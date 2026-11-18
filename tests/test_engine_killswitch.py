@@ -20,7 +20,6 @@ import engine_client
 import tts_controller
 from voiceover import process_utils, speech
 
-ENGINE_CMDLINE = "python3 /p/tts/kokoro_engine.py"
 LONG = " ".join("Sentence number %d goes here." % i for i in range(12))   # 12 sentences, 0.25 s each
 
 pkills = []
@@ -47,6 +46,18 @@ def start_engine():
     raise RuntimeError("engine did not start")
 
 
+def real_cmdline(pid):
+    """The running process's command line, as pkill -f sees it."""
+    return Path("/proc/%d/cmdline" % pid).read_bytes().replace(b"\0", b" ").decode().strip()
+
+
+def wait_exec(child, timeout=5.0):
+    """The launcher execs into the engine under the same pid; wait for that."""
+    deadline = time.monotonic() + timeout
+    while "kokoro_engine.py" not in real_cmdline(child.pid) and time.monotonic() < deadline:
+        time.sleep(0.02)
+
+
 def wait_exit(child, timeout=5.0):
     try:
         child.wait(timeout)
@@ -65,10 +76,13 @@ try:
     tts_controller.stop_tts()
     speech.stop_speech()
     check("both kill switches ran their pkills", len(pkills) > 0, pkills)
-    check("no kill pattern matches the engine's command line",
-          not any(re.search(p, ENGINE_CMDLINE) for p in
-                  list(tts_controller.UNIX_PATTERNS) + list(tts_controller.WINDOWS_PATTERNS)
-                  + list(process_utils.TTS_PROCESS_PATTERNS)))
+    wait_exec(child)
+    cmdline = real_cmdline(child.pid)
+    check("the running engine's own command line is the engine script", "kokoro_engine.py" in cmdline, cmdline)
+    patterns = (list(tts_controller.UNIX_PATTERNS) + list(tts_controller.WINDOWS_PATTERNS)
+                + list(process_utils.TTS_PROCESS_PATTERNS))
+    matching = [p for p in patterns if re.search(p, cmdline)]
+    check("no kill pattern (regex) matches the real engine command line", not matching, (matching, cmdline))
     check("the request still completes", pending.done.wait(10) and pending.reason == "complete",
           (pending.reason, pending.error))
     check("the engine is still alive", child.poll() is None and engine_client._reachable())

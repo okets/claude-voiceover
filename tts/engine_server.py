@@ -274,7 +274,7 @@ class EngineServer:
         hold_s = msg.get("hold_s", 0)
         warm_id = msg.get("id") if isinstance(msg.get("id"), str) else None   # echoed back, optional
         if not isinstance(hold_s, (int, float)) or isinstance(hold_s, bool):
-            conn.send_error("bad_request", "hold_s must be a number", warm_id)
+            conn.send_error("bad_request", "hold_s must be a number", ref=warm_id)
             return
         token = self._policy.hold(hold_s)
         if self._synth.loaded:
@@ -414,7 +414,7 @@ class EngineServer:
         if not isinstance(req_id, str) or not req_id:
             conn.send_error("bad_request", "start needs a string id")
         elif req_id in conn.requests:
-            conn.send_error("bad_request", "request id %s is still active" % req_id, req_id)
+            conn.send_error("bad_request", "request id %s is still active" % req_id, ref=req_id)
         else:
             problem = _start_problem(msg) or self._capacity_problem()
             if problem:
@@ -453,9 +453,9 @@ class EngineServer:
         """The active request a text/flush/end line is about, else complain and None."""
         req = conn.requests.get(msg.get("id")) if isinstance(msg.get("id"), str) else None
         if req is None:
-            conn.send_error("bad_request", "no active request with that id", msg.get("id"))
+            conn.send_error("bad_request", "no active request with that id", ref=msg.get("id"))
         elif req.input_ended:
-            conn.send_error("bad_request", "request input already ended", req.id)
+            conn.send_error("bad_request", "request input already ended", ref=req.id)
             req = None
         return req
 
@@ -463,14 +463,14 @@ class EngineServer:
         req = self._find(conn, msg)
         problem = _text_problem(msg) if req else None
         if problem:
-            conn.send_error(problem[0], problem[1], req.id)
+            conn.send_error(problem[0], problem[1], ref=req.id)
         elif req and msg.get("text"):
             self._feed(req, msg["text"])
 
     def flush_request(self, conn, msg):
         req = self._find(conn, msg)
         if req and (not isinstance(msg.get("n"), int) or isinstance(msg.get("n"), bool)):
-            conn.send_error("bad_request", "flush needs an integer n", req.id)
+            conn.send_error("bad_request", "flush needs an integer n", ref=req.id)
         elif req:
             self._add_sentences(req, req.text.drain())
             req.markers.append((req.queued, msg.get("n")))
@@ -554,7 +554,7 @@ class EngineServer:
         for conn, token, warm_id in waiters:
             if error:
                 self._policy.drop_hold(token)  # a failed load must not keep the engine alive
-                conn.send_error(error[0], error[1], warm_id)
+                conn.send_error(error[0], error[1], ref=warm_id)
             else:
                 self._send_warm(conn, warm_id)
 

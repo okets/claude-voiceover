@@ -21,6 +21,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+_TTS_DIR = str(Path(__file__).resolve().parent)
+if _TTS_DIR not in sys.path:
+    sys.path.append(_TTS_DIR)   # appended: a tts module must never shadow the stdlib
+
 # Extended regexes for `pkill -f`, matching only processes we spawned.
 UNIX_PATTERNS = [
     r"kokoro_voice\.py",
@@ -163,7 +167,6 @@ def stop_shared_engine():
     """Ask the shared Kokoro engine to exit; every error (none running, stale socket,
     no engine client on this platform) is ignored."""
     try:
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
         import engine_client
         conn = engine_client.EngineConnection.connect(timeout=0.5)
         try:

@@ -4,7 +4,7 @@
 EngineConnection owns one socket. A reader thread routes audio/end/error events
 to the Pending they belong to by id; events without an id (hello, status,
 released, id-less errors) go to a reply queue that the synchronous calls wait on;
-id-bearing warm replies and errors are dropped (warm is fire and forget). Sync calls (status, release) hold one lock across send and reply and drain stale
+id-bearing warm replies and ref-bearing errors are dropped (warm is fire and forget). Sync calls (status, release) hold one lock across send and reply and drain stale
 replies first, so concurrent or late replies never cross. Sends are serialised by
 a lock, so any thread may call any method.
 """
@@ -148,6 +148,8 @@ class EngineConnection:
 
     def _route(self, event, payload):
         name, req_id = event.get("ev"), event.get("id")
+        if "ref" in event:
+            return      # an error that ends nothing (misuse, warm): not a reply, not an end
         with self._lock:
             pending = self._pending.get(req_id) if req_id is not None else None
             if pending is not None and name in ("end", "error"):
@@ -156,7 +158,7 @@ class EngineConnection:
             self._deliver(pending, name, event, payload)
         elif req_id is None:
             self._replies.put(event)
-        # else: an id-bearing event nobody tracks (a warm reply or error): dropped
+        # else: an id-bearing event nobody tracks (a warm reply): dropped
 
     @staticmethod
     def _deliver(pending, name, event, payload):

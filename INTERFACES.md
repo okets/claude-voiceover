@@ -444,7 +444,7 @@ Client rules that matter in practice:
 - Behind an HTTP `CONNECT` proxy, read the proxy's reply exactly up to the blank line
   (`\r\n\r\n`). A buffered reader may swallow audio bytes that follow it.
 - Decode UTF-8 only on whole lines; a multi-byte character may be split across reads.
-- A request that fails gets an `error` and is then always closed by an `end`; see below.
+- A request that fails gets an `error` with its `id` and is then always closed by an `end`; see the error rule below.
 
 ### Auth (TCP only)
 
@@ -470,7 +470,7 @@ Unknown ops and non-object lines get `bad_request`.
 | `flush` | `id`, `n` (integer) | Speak what is buffered now (a trailing partial sentence too) and, when every sentence queued so far has been rendered and sent, reply `flushed` with the same `n` |
 | `end` | `id` | No more text: the buffered rest is spoken, then the request completes |
 | `cancel` | optional `id` | Cancels that request, or every request on the connection when `id` is absent. An unknown id is ignored |
-| `warm` | optional `hold_s` (number, default 0, capped at 600), optional `id` | Loads the model if needed and holds the engine up for `hold_s` seconds. Replies `warm` once loaded; the optional `id` is echoed in that reply and in a `warm` error |
+| `warm` | optional `hold_s` (number, default 0, capped at 600), optional `id` | Loads the model if needed and holds the engine up for `hold_s` seconds. Replies `warm` once loaded; the optional `id` is echoed in that reply (as `id`) and in a `warm` error (as `ref`) |
 | `release` | optional `keep_off_s` (number, default 0) | Leave now: replies `released`, ends open requests, writes `keep_off.json` when `keep_off_s` > 0, exits |
 | `stop` | | Exit now. Open requests end `cancelled`; there is no reply |
 | `auth` | `token` | TCP only; see above |
@@ -505,7 +505,7 @@ request following for seconds.
 | `flushed` | `id`, `n` |
 | `warm` | `loaded` (true), `device`, optional `id` |
 | `released` | `vram_mib` (0) |
-| `error` | `code`, `message`, optional `id` |
+| `error` | `code`, `message`, optional `id` (request failure, followed by `end`) or `ref` (ends nothing); see the rule below |
 
 `status` semantics: `requests` is the number of requests in progress right now (a gauge,
 not a total); `callers` is the number of open connections (the one asking included);
@@ -517,22 +517,23 @@ Codes: `bad_request`, `unsupported_protocol`, `unknown_voice`, `bad_speed`,
 `text_too_long`, `busy`, `no_model`, `synthesis_failed`, `released`, `restarting`,
 `unauthorized`.
 
-An `error` that belongs to a request carries its `id`. When the request itself fails
-(rejected `start`, `unknown_voice`, `bad_speed`, `text_too_long`, `no_model`,
-`synthesis_failed`, `busy` on a request, `restarting` when the engine leaves) the `error` is
-always followed by `{"ev":"end","id":...,"reason":"error",...}` for that id, so a client
-must read to the matching id's `end`. Misuse of a live request does not end it and
-is not followed by an `end`: a `start` that reuses an active id (the id keeps its first
-request), a `text`/`flush`/`end` for an id with no active request or after its input ended,
-a non-string `text`, a non-integer flush `n`. Errors without an `id` (bad line, unknown op, hello
-first, `busy` connection refusal, `unauthorized`) concern the connection. A `warm` error
-carries the `warm` id when one was sent and has no `end`.
+Rule for client authors: an `error` carrying `"id"` is a request failure and is **always**
+followed by `{"ev":"end","id":<same id>,"reason":"error",...}`; read to that `end`. Request
+failures are a rejected `start`, `unknown_voice`, `bad_speed`, `text_too_long`, `no_model`,
+`synthesis_failed`, `busy` on a request, and `restarting` when the engine leaves. An `error`
+that ends nothing carries the id it refers to in `"ref"` instead, and nothing follows it: a
+`start` that reuses an active id (the first request carries on and ends by itself), a
+`text`/`flush`/`end` for an id with no active request or after its input ended, a non-string
+`text`, a non-integer flush `n`, and every `warm` error (`ref` is the `warm` id, when one was sent;
+the success reply `{"ev":"warm","id":...}` keeps `id`). An `error` with neither `id` nor `ref`
+concerns the connection (bad line, unknown op, hello first, `busy` connection refusal,
+`unauthorized`).
 
 Codes in practice: `unknown_voice` (not in the voice file, checked once the model is
 loaded), `bad_speed` (outside 0.5-2.0 or not a number), `no_model` (model files missing:
 run `/voiceover:setup`), `synthesis_failed` (render or load failed), `busy` (16 connections
 already open: the new one gets one id-less `busy` line and is closed; or 64 requests in flight),
-`released` (defined, but the engine does not currently send it), `restarting` (the engine is
+`released` (a defined code the engine does not currently send; the `release` op's reply is the separate `released` event), `restarting` (the engine is
 leaving; reconnect and retry, `ensure` starts a new one).
 
 #### Backpressure and drops

@@ -92,6 +92,13 @@ try:
     conn.warm("not-a-number")
     time.sleep(0.3)
     check("warm error does not poison the next call", conn.status().get("ev") == "status")
+
+    # a misuse error (ref) for a live request must not finish its Pending
+    live = conn.submit("One two three four. Five six seven eight. Nine ten eleven twelve.", "bf_emma")
+    conn._send({"op": "text", "id": live.id, "text": "late"})     # input already ended: error with ref
+    check("a ref error does not end the Pending; it completes on its own end",
+          live.done.wait(10) and live.reason == "complete" and live.error is None, (live.reason, live.error))
+    check("and the connection still answers", conn.status().get("ev") == "status")
     conn.close()
 
     # CLI

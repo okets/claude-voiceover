@@ -142,10 +142,14 @@ class Connection:
     def send(self, obj):
         self.write(encode_line(obj))
 
-    def send_error(self, code, message, req_id=None):
+    def send_error(self, code, message, req_id=None, ref=None):
+        """`req_id`: a request failure, always followed by its `end`. `ref`: an error that ends
+        nothing (misuse naming an id, a warm error); nothing follows it."""
         line = {"ev": "error", "code": code, "message": message}
         if req_id is not None:
             line["id"] = req_id
+        if ref is not None:
+            line["ref"] = ref
         self.send(line)
 
     def send_end(self, req_id, reason, samples):
