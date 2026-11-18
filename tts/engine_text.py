@@ -9,7 +9,7 @@ audio does not wait for a whole sentence to render.
 
 import re
 
-from engine_common import split_sentences
+from engine_common import _SENTENCE_BREAK, split_sentences
 
 CLAUSE_SPLIT_WORDS = 40
 LIVE_FIRST_CLAUSE_MIN_WORDS = 4
@@ -26,7 +26,8 @@ def _boundaries(sentence):
     """(head, tail) pairs, one per clause boundary, both sides non-empty."""
     pairs = []
     for match in _BOUNDARY.finditer(sentence):
-        head, tail = sentence[:match.end()].strip(), sentence[match.end():].strip()
+        head = sentence[:match.end()].strip().rstrip(" -")  # a " - " boundary leaves no dash
+        tail = sentence[match.end():].strip()
         if head and tail:
             pairs.append((head, tail))
     return pairs
@@ -77,7 +78,7 @@ class UtteranceText:
         """Add text; return the sentences now complete. The trailing partial waits."""
         self.chars += len(text)
         self._buffer += text
-        *complete, self._buffer = re.split(r"(?<=[.!?])\s+|\n+", self._buffer)
+        *complete, self._buffer = _SENTENCE_BREAK.split(self._buffer)
         return self._emit(complete)
 
     def drain(self):

@@ -14,7 +14,7 @@ from engine_text import UtteranceText, split_long
 u = UtteranceText()
 check("partial held back", u.feed("The build passed. I am now run") == ["The build passed."])
 check("fragment joins", u.feed("ning the tests") == [] and u.drain() == ["I am now running the tests"])
-check("no punctuation spoken on drain", UtteranceText().feed("ok") == [])
+check("feed holds back text with no sentence break", UtteranceText().feed("ok") == [])
 w = UtteranceText(); w.feed("ok"); check("drain gives ok", w.drain() == ["ok"])
 ws = UtteranceText(); check("whitespace only -> nothing", ws.feed("   ") == [] and ws.drain() == [])
 check("drain empties the buffer", w.drain() == [])
@@ -48,5 +48,8 @@ check("live split is for the first sentence only", lv2.feed("Well, sure thing, I
       ["Well, sure thing, I can check."])
 check("non-live first sentence not split", UtteranceText().feed("Well, sure thing, I can check the build now. ") ==
       ["Well, sure thing, I can check the build now."])
+
+dashed = split_long(" ".join(["a"] * 30) + " - " + " ".join(["b"] * 30))
+check("a ' - ' boundary leaves no dangling dash", len(dashed) == 2 and not dashed[0].endswith("-"), dashed)
 
 report()

@@ -28,6 +28,8 @@ check("over-long line across chunks: one BadLine, rest discarded",
       len(partial) == 1 and isinstance(partial[0], BadLine) and rest == [{"op": "status"}])
 check("non-object JSON -> bad_request", isinstance(LineReader().feed(b"[1]\n")[0], BadLine))
 check("invalid JSON -> bad_request", LineReader().feed(b"{nope\n")[0].code == "bad_request")
+check("deeply nested JSON -> bad_request, not a crash",
+      LineReader().feed(b"[" * 60000 + b"\n")[0].code == "bad_request")
 check("blank lines are ignored", LineReader().feed(b"\n\n") == [])
 check("encode_line is compact, newline-terminated", encode_line({"a": 1, "b": "é"}) == '{"a":1,"b":"é"}\n'.encode())
 check("pcm clip and little-endian", pcm16le([0.0, 1.0, -1.0, 2.0]) == b"\x00\x00\xff\x7f\x01\x80\xff\x7f")

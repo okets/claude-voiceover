@@ -59,6 +59,14 @@ rotated = engine_paths.rotate_token()
 check("rotation changes the token", rotated != token and engine_paths.read_or_create_token() == rotated)
 check("rotated token file is 0600", mode(engine_paths.token_path()) == 0o600)
 
+for garbage in ("", "not-a-token", "A" * 64):
+    engine_paths.token_path().write_text(garbage)
+    repaired = engine_paths.read_or_create_token()
+    check("bad token file %r is repaired" % garbage[:6],
+          len(repaired) == 64 and all(c in "0123456789abcdef" for c in repaired)
+          and engine_paths.token_path().read_text() == repaired and mode(engine_paths.token_path()) == 0o600)
+check("no temp files left in the engine dir", sorted(p.name for p in engine_paths.engine_dir().iterdir()) == ["token"])
+
 # --- settings -----------------------------------------------------------------
 check("idle defaults to 60 s", engine_paths.idle_unload_seconds() == 60)
 write_settings({"engine_port": 47320})
@@ -96,6 +104,7 @@ check("null accepted", all(manage_settings.normalize(k, None) is None
 check("bad ports rejected", all(rejected("engine_port", v) for v in (0, 65536, "80", True, 1.5)))
 check("idle of 5 accepted, 4 rejected",
       manage_settings.normalize("engine_idle_s", 5) == 5 and rejected("engine_idle_s", 4))
+check("non-finite idle rejected", rejected("engine_idle_s", float("inf")) and rejected("engine_idle_s", float("nan")))
 check("plugin root must exist",
       manage_settings.normalize("engine_plugin_root", str(temp_dir())) and
       rejected("engine_plugin_root", str(data_dir / "missing")))

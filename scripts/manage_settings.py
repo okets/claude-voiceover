@@ -12,6 +12,7 @@ Wraps voiceover/settings.py. Stdlib only.
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -103,7 +104,8 @@ def parse_value(raw):
 
 
 def _is_number(value):
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value))
 
 
 def _check_engine_port(value):

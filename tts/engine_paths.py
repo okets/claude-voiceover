@@ -62,17 +62,45 @@ def _new_token() -> str:
     return secrets.token_hex(32)
 
 
-def read_or_create_token() -> str:
-    """The shared secret; created atomically (O_EXCL, 0600) on first use."""
-    path = token_path()
-    try:
-        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, _PRIVATE_FILE)
-    except FileExistsError:
-        return path.read_text().strip()
-    token = _new_token()
+def _valid_token(text: str) -> bool:
+    return len(text) == 64 and all(c in "0123456789abcdef" for c in text)
+
+
+def _write_temp_token() -> Path:
+    """A fresh token in a private temp file next to the real one."""
+    temp = token_path().with_name("token.%d.tmp" % os.getpid())
+    fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, _PRIVATE_FILE)
     with os.fdopen(fd, "w") as handle:
-        handle.write(token)
-    return token
+        handle.write(_new_token())
+    return temp
+
+
+def _read_token(path: Path) -> str:
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return ""
+
+
+def read_or_create_token() -> str:
+    """The shared secret. A new one appears complete and 0600 in one step (temp
+    file + link); an existing file that is not a valid token is replaced."""
+    path = token_path()
+    temp = _write_temp_token()
+    try:
+        try:
+            os.link(str(temp), str(path))
+        except FileExistsError:
+            existing = _read_token(path)
+            if _valid_token(existing):
+                return existing
+            os.replace(str(temp), str(path))  # empty or garbage: repair atomically
+        return _read_token(path)
+    finally:
+        try:
+            temp.unlink()
+        except OSError:
+            pass
 
 
 def rotate_token() -> str:

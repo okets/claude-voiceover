@@ -38,7 +38,7 @@ def _decode_line(raw: bytes):
         return None
     try:
         obj = json.loads(raw.decode("utf-8"))
-    except ValueError:
+    except (ValueError, RecursionError):  # RecursionError: absurdly nested JSON
         return BadLine("bad_request", "line is not valid JSON")
     if not isinstance(obj, dict):
         return BadLine("bad_request", "line is not a JSON object")
