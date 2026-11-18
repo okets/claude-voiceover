@@ -272,18 +272,22 @@ class EngineServer:
     def warm(self, conn, msg):
         """`warm`: load the model if needed, hold it for hold_s, reply once it is loaded."""
         hold_s = msg.get("hold_s", 0)
+        warm_id = msg.get("id") if isinstance(msg.get("id"), str) else None   # echoed back, optional
         if not isinstance(hold_s, (int, float)) or isinstance(hold_s, bool):
-            conn.send_error("bad_request", "hold_s must be a number")
+            conn.send_error("bad_request", "hold_s must be a number", warm_id)
             return
         token = self._policy.hold(hold_s)
         if self._synth.loaded:
-            self._send_warm(conn)
+            self._send_warm(conn, warm_id)
         else:
-            self._warm_waiters.append((conn, token))
+            self._warm_waiters.append((conn, token, warm_id))
             self._request_load()
 
-    def _send_warm(self, conn):
-        conn.send({"ev": "warm", "loaded": True, "device": self._synth.status().get("device")})
+    def _send_warm(self, conn, warm_id=None):
+        reply = {"ev": "warm", "loaded": True, "device": self._synth.status().get("device")}
+        if warm_id is not None:
+            reply["id"] = warm_id
+        conn.send(reply)
 
     def release(self, conn, msg):
         """`release`: leave for a while (keep-off), ending open requests with restarting."""
@@ -547,12 +551,12 @@ class EngineServer:
 
     def _answer_warm_waiters(self, error):
         waiters, self._warm_waiters = self._warm_waiters, []
-        for conn, token in waiters:
+        for conn, token, warm_id in waiters:
             if error:
                 self._policy.drop_hold(token)  # a failed load must not keep the engine alive
-                conn.send_error(*error)
+                conn.send_error(error[0], error[1], warm_id)
             else:
-                self._send_warm(conn)
+                self._send_warm(conn, warm_id)
 
     def _activate(self, req):
         """The model is loaded: check the voice, then let the request's sentences run."""

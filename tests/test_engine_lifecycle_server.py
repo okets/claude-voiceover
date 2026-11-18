@@ -11,6 +11,7 @@ from _harness import check, isolate, report, REPO_ROOT, temp_dir
 
 DATA = isolate()
 sys.path.insert(0, str(REPO_ROOT / "tts"))
+import engine_client
 import engine_paths
 from engine_server import NoModel
 from engine_stub import SineSynth
@@ -121,6 +122,46 @@ check("warm: a missing model replies no_model", c.read_error()["code"] == "no_mo
 c.send({"op": "status"})
 check("warm: a failed load drops the hold", c.read_event()["leases"] == 0)
 nm.request_exit("stop")
+
+# warm ids: echoed in the reply and in a warm error, omitted when absent
+ok, ok_path = start_server(idle_unload_s=60)
+c = Raw(ok_path)
+c.hello()
+c.send({"op": "warm", "id": "w7"})
+reply = c.read_event()
+check("warm id: echoed in the warm reply", reply["ev"] == "warm" and reply.get("id") == "w7", reply)
+c.send({"op": "warm"})
+reply = c.read_event()
+check("warm id: absent without one", reply["ev"] == "warm" and "id" not in reply, reply)
+c.send({"op": "warm", "id": "w8", "hold_s": "soon"})
+err = c.read_error()
+check("warm id: echoed in a bad_request warm error", err["code"] == "bad_request" and err.get("id") == "w8", err)
+ok.request_exit("stop")
+nm2, nm2_path = start_server(NoModelSynth(), idle_unload_s=60)
+c = Raw(nm2_path)
+c.hello()
+c.send({"op": "warm", "id": "w9"})
+err = c.read_error()
+check("warm id: echoed in a failed-load error", err["code"] == "no_model" and err.get("id") == "w9", err)
+nm2.request_exit("stop")
+
+# client: a sync call's error is never swallowed by a warm that is still loading
+lazy, lazy_path = start_server(SineSynth(load_delay=1.0), idle_unload_s=60)
+conn = engine_client.EngineConnection.connect(lazy_path)
+conn.warm()
+t0 = time.monotonic()
+try:
+    conn.release("x")
+    raised = None
+except engine_client.EngineError as exc:
+    raised = exc.code
+check("client: release bad_request surfaces while a warm loads (no timeout)",
+      raised == "bad_request" and time.monotonic() - t0 < 0.9, (raised, time.monotonic() - t0))
+time.sleep(1.2)
+check("client: the id-bearing warm reply never reaches a sync call",
+      conn.status().get("ev") == "status")
+conn.close()
+lazy.request_exit("stop")
 
 # a dead connection waiting on a slow load does not count as busy
 slow, slow_path = start_server(SineSynth(load_delay=1.5), idle_unload_s=0.3)

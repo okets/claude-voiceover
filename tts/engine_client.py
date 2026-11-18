@@ -3,8 +3,8 @@
 
 EngineConnection owns one socket. A reader thread routes audio/end/error events
 to the Pending they belong to by id; events without an id (hello, status,
-released, id-less errors) go to a reply queue that the synchronous calls wait
-on. Sync calls (status, release) hold one lock across send and reply and drain stale
+released, id-less errors) go to a reply queue that the synchronous calls wait on;
+id-bearing warm replies and errors are dropped (warm is fire and forget). Sync calls (status, release) hold one lock across send and reply and drain stale
 replies first, so concurrent or late replies never cross. Sends are serialised by
 a lock, so any thread may call any method.
 """
@@ -102,8 +102,8 @@ class EngineConnection:
         self._pending = {}
         self._replies = queue.Queue()
         self._sync_lock = threading.Lock()   # one sync call at a time: send + reply
-        self._warms_open = 0                 # warm ops whose reply is still due; guarded by _lock
         self._ids = itertools.count(1)
+        self._warm_ids = itertools.count(1)
         self.alive = True
         self._reader = threading.Thread(target=self._read_loop, name="engine-client", daemon=True)
 
@@ -154,18 +154,9 @@ class EngineConnection:
                 del self._pending[req_id]
         if pending is not None:
             self._deliver(pending, name, event, payload)
-        elif req_id is None and not self._fire_and_forget_reply(name):
+        elif req_id is None:
             self._replies.put(event)
-
-    def _fire_and_forget_reply(self, name):
-        """True for the reply (or error) of a warm op, which nobody waits for."""
-        if name not in ("warm", "error"):
-            return False
-        with self._lock:
-            if self._warms_open == 0:
-                return False
-            self._warms_open -= 1
-        return True
+        # else: an id-bearing event nobody tracks (a warm reply or error): dropped
 
     @staticmethod
     def _deliver(pending, name, event, payload):
@@ -253,14 +244,8 @@ class EngineConnection:
         self._send({"op": "cancel", "id": p.id})
 
     def warm(self, hold_s: float = 0) -> None:
-        with self._lock:
-            self._warms_open += 1
-        try:
-            self._send({"op": "warm", "hold_s": hold_s})
-        except EngineError:
-            with self._lock:
-                self._warms_open -= 1
-            raise
+        """Fire and forget: the engine echoes this id, and the router drops the reply."""
+        self._send({"op": "warm", "id": "w%d" % next(self._warm_ids), "hold_s": hold_s})
 
     def status(self) -> dict:
         return self._call({"op": "status"}, {"status"})
