@@ -4,9 +4,12 @@
 Jobs within a connection are strictly first-in, first-out. Scheduling works in
 rounds: each round serves, once, every connection that had a ready job when the
 round began. Within a round, connections whose head job is live go first;
-otherwise the least recently served goes first (never served before any). A connection
-served this round waits for the next one, so a narration sentence never waits
-behind more than one sentence of any other caller.
+otherwise the least recently served goes first (never served before any). A
+connection whose head job is live and that has not been served this round is picked
+at once, even when it arrived mid-round, so a live caller waits for at most the
+sentence in flight. A connection served this round (live or not) waits for the next
+one, so a narration sentence never waits behind more than one sentence of any other
+caller.
 """
 
 from collections import deque
@@ -27,6 +30,7 @@ class Scheduler:
         self._last_served = {}   # conn -> ticket of its latest served job (absent: never served)
         self._tickets = count()
         self._round = []         # conns still to be served this round
+        self._served_round = set()   # conns served this round: each gets one sentence per round
 
     def add(self, job: Job) -> None:
         if job.conn not in self._queues:
@@ -63,15 +67,35 @@ class Scheduler:
     # --- internals ---------------------------------------------------------
 
     def _next_conn(self, exclude):
-        """Serve the current round; when it holds no eligible connection, start a fresh one."""
+        """A live newcomer first, then the current round. A finished round starts a fresh one,
+        and so does a round left holding only excluded connections."""
         for _ in range(2):
             self._round = [c for c in self._round if c in self._queues]
-            pick = next((c for c in self._round if c not in exclude), None)
+            if not self._round:
+                self._start_round()
+            pick = self._live_newcomer(exclude)
+            if pick is None:
+                pick = next((c for c in self._round if c not in exclude), None)
             if pick is not None:
-                self._round.remove(pick)
+                self._take_turn(pick)
                 return pick
-            self._round = self._ordered_conns()
+            self._start_round()
         return None
+
+    def _live_newcomer(self, exclude):
+        """A connection with a live head job not yet served this round (least recently served first)."""
+        waiting = [c for c in self._ordered_conns()
+                   if self._queues[c][0].live and c not in self._served_round and c not in exclude]
+        return waiting[0] if waiting else None
+
+    def _take_turn(self, conn):
+        if conn in self._round:
+            self._round.remove(conn)
+        self._served_round.add(conn)
+
+    def _start_round(self):
+        self._round = self._ordered_conns()
+        self._served_round = set()
 
     def _ordered_conns(self):
         """Live heads first, then least recently served (never served first)."""

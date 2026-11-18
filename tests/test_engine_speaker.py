@@ -3,6 +3,7 @@ against a real stub engine (VOICEOVER_ENGINE_STUB=1) started by ensure()."""
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -21,6 +22,7 @@ from voiceover import spool, speech
 import engine_client
 import engine_common
 import engine_speaker
+import engine_stub
 import kokoro_voice
 
 ROOT = spool.queue_dir().parent
@@ -64,6 +66,14 @@ def wav_ok(blob, tmp=[0]):
     path.write_bytes(blob)
     with wave.open(str(path)) as w:
         return (w.getframerate(), w.getnchannels(), w.getsampwidth()) == (24000, 1, 2) and w.getnframes() > 0
+
+
+def wav_frames(blob, tmp=[0]):
+    tmp[0] += 1
+    path = DATA / ("frames-%d.wav" % tmp[0])
+    path.write_bytes(blob)
+    with wave.open(str(path)) as w:
+        return w.getnframes()
 
 
 kokoro_voice.ensure_models = lambda: True
@@ -257,6 +267,36 @@ try:
     for c in conns:
         c.close()
 
+    # --- I1: the engine dies mid-drain (SIGKILL) -> the next sentence plays via a new engine ------
+    del played[:]
+    lasts[0] = 0.3
+    spool.clear()
+    lease_dir.mkdir(parents=True, exist_ok=True)
+    lease_file.write_text(json.dumps({"expiry": time.time() + 30}))   # keeps the drain waiting for more
+    spool.enqueue("First sentence.", "kokoro", VOICE, utterance="K", session="SK")
+    codes = []
+    thread = threading.Thread(target=lambda: codes.append(run_main("--drain", str(ROOT))))
+    thread.start()
+    deadline = time.monotonic() + 8
+    while not played and time.monotonic() < deadline:
+        time.sleep(0.02)
+    old_pid = engine_status()["pid"]
+    os.kill(old_pid, signal.SIGKILL)
+    deadline = time.monotonic() + 5
+    while engine_client._reachable() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    spool.enqueue("Second sentence.", "kokoro", VOICE, utterance="K", session="SK")
+    deadline = time.monotonic() + 15
+    while len(played) < 2 and time.monotonic() < deadline:
+        time.sleep(0.05)
+    check("I1: after the engine is killed mid-drain, the next sentence still plays",
+          len(played) == 2, len(played))
+    check("I1: through a newly started engine", engine_status()["pid"] != old_pid)
+    lease_file.unlink()
+    thread.join(10)
+    check("I1: the drain ends normally once the lease is gone", not thread.is_alive() and codes == [0], codes)
+    lasts[0] = 0.0
+
     # --- one-shot speak_text ----------------------------------------------------
     del played[:]
     updates = []
@@ -265,9 +305,21 @@ try:
           kokoro_voice.speak_text("Hello there friend.", VOICE, False) is True
           and len(played) == 1 and wav_ok(played[0]), len(played))
     del played[:]
-    check("speak_text --stream plays frame groups as wavs",
-          kokoro_voice.speak_text("Hello there friend.", VOICE, True) is True
-          and len(played) >= 1 and all(wav_ok(b) for b in played), len(played))
+    long_sentence = " ".join(["word"] * 15)          # 15 words of stub audio: 43200 bytes, two frames
+    submitted = []
+    real_conn_submit = engine_client.EngineConnection.submit
+    engine_client.EngineConnection.submit = (
+        lambda self, text, *a, **k: (submitted.append(text), real_conn_submit(self, text, *a, **k))[1])
+    try:
+        streamed = kokoro_voice.speak_text("%s. %s." % (long_sentence, long_sentence), VOICE, True)
+    finally:
+        engine_client.EngineConnection.submit = real_conn_submit
+    check("I3: speak_text --stream submits one request per sentence, up front",
+          submitted == [long_sentence + "."] * 2, submitted)
+    check("I3: and plays each sentence whole, as one wav (no gap at frame boundaries)",
+          streamed is True and len(played) == 2
+          and all(wav_frames(b) == int(15 * engine_stub.SECONDS_PER_WORD * 24000) for b in played),
+          [wav_frames(b) for b in played])
     check("speak_text releases the tts lock", not engine_common.lock_is_live(engine_common.data_dir()))
     check("speak_text with an unknown voice fails quietly",
           kokoro_voice.speak_text("Hello.", "no_such_voice", False) is False)
@@ -297,7 +349,10 @@ try:
     conn.close()
 
     # --- engine down -----------------------------------------------------------------
-    kokoro_voice.ensure = lambda root, timeout=10.0: False
+    def no_engine(root, timeout=10.0):
+        raise engine_client.EngineError("unavailable", "the Kokoro engine did not start")
+    kokoro_voice.connect_or_start = no_engine
+    del played[:]
     spool.clear()
     spool.enqueue("One. Two.", "kokoro", VOICE, utterance="D")
     before = time.time()
@@ -305,7 +360,7 @@ try:
     spawned = json.loads((ROOT / "spawned.json").read_text())
     check("engine down: drain exits 0", code == 0, code)
     check("engine down: spawned.json is pushed ~27 s ahead", spawned["ts"] > before + 25, spawned)
-    check("engine down: nothing played", True)
+    check("engine down: nothing played", played == [], len(played))
 finally:
     stop_engine()
 

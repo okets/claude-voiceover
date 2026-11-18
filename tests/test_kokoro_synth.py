@@ -44,7 +44,7 @@ class FakeKokoro:
     def get_voices(self):
         return VOICES
 
-    def create(self, text, voice, speed, lang, trim=False):
+    def create(self, text, voice, speed=1.0, lang="en-us", trim=False):
         self.calls += 1
         if self.provider == "CUDAExecutionProvider" and self.calls == 2:
             raise RuntimeError("CUDA error")
@@ -235,6 +235,57 @@ loads.clear()
 forced = kokoro_model.KokoroSynth(force_cpu=True)
 forced.load()
 check("force_cpu loads on CPU", loads == ["CPUExecutionProvider"] and forced.status()["device"] == "cpu")
+
+# I4: every CPU load renders one warm-up sentence before it reports loaded
+probes = []
+
+
+class ProbedKokoro(FakeKokoro):
+    owner = None
+
+    def create(self, text, voice=None, speed=1.0, lang="en-us", trim=False):
+        probes.append((text, voice, ProbedKokoro.owner.loaded))
+        return super().create(text, voice, speed, lang, trim)
+
+
+def probed_load_on(provider):
+    loads.append(provider)
+    return ProbedKokoro(provider)
+
+
+def cpu_load_probes(make_synth, before=lambda: None):
+    """The creates a CPU load makes: [(text, voice, loaded at that moment)]."""
+    probes.clear()
+    synth = make_synth()
+    ProbedKokoro.owner = synth
+    before()
+    synth.load()
+    return probes[:], synth
+
+
+kokoro_model._load_on = probed_load_on
+kokoro_model._query_vram_mib = lambda pid: 512
+real_load_kokoro, real_choose = kokoro_model.load_kokoro, kokoro_model.choose_onnx_provider
+kokoro_model.choose_onnx_provider = lambda: "CPUExecutionProvider"
+kokoro_model.load_kokoro = lambda: probed_load_on("CPUExecutionProvider")
+warm_up = [("Ready.", kokoro_model._PROBE_VOICE, False)]
+seen, _ = cpu_load_probes(kokoro_model.KokoroSynth)
+check("I4: a default (CPU) load renders exactly one warm-up before loaded", seen == warm_up, seen)
+seen, _ = cpu_load_probes(lambda: kokoro_model.KokoroSynth(force_cpu=True))
+check("I4: a forced-CPU load renders exactly one warm-up before loaded", seen == warm_up, seen)
+keep_off[0] = {"until": 9e12, "reason": "game"}
+seen, _ = cpu_load_probes(kokoro_model.KokoroSynth)
+keep_off[0] = None
+check("I4: a keep-off (CPU) load renders exactly one warm-up before loaded", seen == warm_up, seen)
+kokoro_model.choose_onnx_provider = lambda: "CUDAExecutionProvider"
+kokoro_model.load_kokoro = failing_load
+seen, _ = cpu_load_probes(kokoro_model.KokoroSynth)
+check("I4: a CPU fallback after a failed load renders exactly one warm-up before loaded", seen == warm_up, seen)
+kokoro_model.load_kokoro = lambda: probed_load_on("CUDAExecutionProvider")
+seen, _ = cpu_load_probes(kokoro_model.KokoroSynth)
+check("I4: a CUDA load adds no second warm-up (its own probe ran inside load_kokoro)", seen == [], seen)
+kokoro_model._load_on, kokoro_model.load_kokoro, kokoro_model.choose_onnx_provider = (
+    fake_load_on, real_load_kokoro, real_choose)
 
 # old names
 check("kokoro_voice.VOICE_SETTINGS is kokoro_model.VOICE_SETTINGS",

@@ -344,3 +344,14 @@ def ensure(plugin_root: Path, timeout: float = 10.0) -> bool:
         if _acquire_start_lock(lock, deadline) and _start_and_wait(plugin_root, deadline):
             return True
     return _reachable()
+
+
+def connect_or_start(plugin_root: Path, timeout: float = 10.0) -> EngineConnection:
+    """A connection to the engine, starting one (ensure) when none answers.
+    Raises EngineError("unavailable") when no engine will start."""
+    conn = _try_connect()
+    if conn is not None:
+        return conn
+    if not ensure(plugin_root, timeout):
+        raise EngineError("unavailable", "the Kokoro engine did not start")
+    return EngineConnection.connect()

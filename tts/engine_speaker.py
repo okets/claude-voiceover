@@ -95,7 +95,7 @@ class EngineSpeaker:
 
     def warm_up(self):
         """Connect and hold the engine warm, so the first real sentence is not cold."""
-        self._conn = self._connect()
+        self._conn = self._open()
         self._conn.warm(WARM_HOLD_S)
         self._warmed_at = self._clock()
 
@@ -136,7 +136,7 @@ class EngineSpeaker:
         return self.resubmit(sentence, voice)
 
     def resubmit(self, sentence, voice):
-        self._conn = self._connect()
+        self._conn = self._open()
         return self._conn.submit(sentence, voice)
 
     def cancel_all(self, pendings):
@@ -155,5 +155,12 @@ class EngineSpeaker:
 
     def _connection(self):
         if self._conn is None or not self._conn.alive:
-            self._conn = self._connect()
+            self._conn = self._open()
         return self._conn
+
+    def _open(self):
+        """A fresh connection; a socket error (the engine is gone) is a retryable `disconnected`."""
+        try:
+            return self._connect()
+        except OSError as error:
+            raise EngineError("disconnected", str(error)) from None

@@ -40,16 +40,26 @@ for i in range(3):
     s.add(job("A", text=str(i)))
 check("FIFO within a connection", [j.text for j in drain(s)] == ["0", "1", "2"])
 
-# --- a live connection joins the next round first ---------------------------
+# --- I2: a live connection arriving mid-round goes next, but only once per round ---------------
 s = Scheduler()
 for i in range(3):
     s.add(job("A", text="a%d" % i))
     s.add(job("B", text="b%d" % i))
-first = s.next()                 # round 1 is [A, B]; A is served
+first = s.next()                 # round 1 is [A, B]; A's sentence is in flight
 s.add(job("C", text="c0", live=True))
+s.add(job("C", text="c1", live=True))
 rest = [j.text for j in drain(s)]
-check("the round in progress finishes before C", first.text == "a0" and rest[0] == "b0", rest)
-check("the next round starts with the live connection", rest[1] == "c0", rest)
+check("I2: the live newcomer is picked right after the in-flight sentence, not after the round",
+      first.text == "a0" and rest[0] == "c0", rest)
+check("I2: the round then carries on, and the live caller waits for the next round",
+      rest == ["c0", "b0", "c1", "a1", "b1", "a2", "b2"], rest)
+s = Scheduler()
+s.add(job("A", text="a0")); s.add(job("A", text="a1")); s.add(job("B", text="b0")); s.add(job("B", text="b1"))
+s.next()
+s.add(job("C", text="c0", live=True))
+s.next()
+s.add(job("C", text="c1", live=True))
+check("I2: a live caller already served this round does not jump again", s.next().text == "b0")
 
 # --- narration never waits more than one sentence behind live ---------------
 s = Scheduler()

@@ -31,10 +31,10 @@ from kokoro_model import (  # noqa: F401  moved; re-exported for existing caller
     VOICES_FILE, VOICES_URL, _CPU, _CUDA, _PROBE_VOICE, _active_provider, _gpu_provider, _load_accelerated,
     _load_on, choose_onnx_provider, download_models, ensure_models, get_voice_settings, load_kokoro, log, models_present)
 from engine_common import (Playback, ProcessPlayback, data_dir, engine_log, global_setting, remove_tts_lock,
-                           try_claim_lock, update_lock_expiry)
+                           split_sentences, try_claim_lock, update_lock_expiry)
 
 if sys.platform != "win32":  # the engine client is POSIX-only; Windows keeps the in-process model
-    from engine_client import EngineConnection, EngineError, ensure
+    from engine_client import EngineError, connect_or_start
 
 DRY_RUN = bool(os.environ.get("VOICEOVER_DRY_RUN"))
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
@@ -398,34 +398,26 @@ def _speak_text_via_engine(text, voice, use_streaming):
         return True  # another narration is playing - skip quietly
     conn = None
     try:
-        if not ensure(PLUGIN_ROOT):
-            log("[ERROR] The Kokoro engine is not available")
-            return False
-        conn = EngineConnection.connect()
-        pending = conn.submit(text, voice)
-        if use_streaming:
-            return _play_stream(pending)
-        pcm = pending.pcm()
-        if pending.error is not None:
-            raise pending.error
-        return play_pcm(pcm, data_dir()) if pcm else True
+        conn = connect_or_start(PLUGIN_ROOT)
+        pieces = split_sentences(text) if use_streaming else [text]
+        return _play_in_order([conn.submit(piece, voice) for piece in pieces])
     finally:
         if conn is not None:
             conn.close()
         remove_tts_lock(data_dir())
 
 
-def _play_stream(pending):
-    """Play each frame group as one wav, as it arrives."""
+def _play_in_order(pendings):
+    """Play each request's audio whole, as one wav, in order, as soon as it is complete.
+    Every request is already submitted, so the engine renders the next while one plays."""
     played = False
-    while True:
-        chunk = pending.chunks.get()
-        if chunk is None:
-            break
-        played = play_pcm(chunk, data_dir()) or played
-    if pending.error is not None:
-        raise pending.error
-    return played or pending.reason == "complete"
+    for pending in pendings:
+        pcm = pending.pcm()
+        if pending.error is not None:
+            raise pending.error
+        if pcm:
+            played = play_pcm(pcm, data_dir()) or played
+    return played or all(pending.reason == "complete" for pending in pendings)
 
 
 def speak_text(text, voice, use_streaming=False):
@@ -501,10 +493,7 @@ def open_engine_speaker(root):
     from engine_speaker import EngineSpeaker
 
     try:
-        if not ensure(PLUGIN_ROOT):
-            log("[ERROR] The Kokoro engine did not start")
-            return None
-        speaker = EngineSpeaker(lambda: EngineConnection.connect(), root / "play", play_file)
+        speaker = EngineSpeaker(lambda: connect_or_start(PLUGIN_ROOT), root / "play", play_file)
         speaker.warm_up()
         return speaker
     except Exception as error:

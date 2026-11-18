@@ -114,6 +114,12 @@ def _load_on(provider):
 _last_accelerated_error = None   # why the latest _load_accelerated failed (None after a success)
 
 
+def warm_up(kokoro):
+    """Render one short sentence, paying onnxruntime's first-run cost now; returns kokoro."""
+    kokoro.create("Ready.", voice=_PROBE_VOICE, speed=1.0)
+    return kokoro
+
+
 def _load_accelerated(provider):
     """The model on an accelerated provider, proven by one short synthesis.
 
@@ -123,9 +129,7 @@ def _load_accelerated(provider):
     global _last_accelerated_error
     _last_accelerated_error = None
     try:
-        kokoro = _load_on(provider)
-        kokoro.create("Ready.", voice=_PROBE_VOICE, speed=1.0)
-        return kokoro
+        return warm_up(_load_on(provider))
     except Exception as error:
         _last_accelerated_error = error
         log("[voiceover] %s failed, falling back to CPU: %s" % (provider, error))
@@ -234,6 +238,8 @@ class KokoroSynth:
             self._placement = ("cpu", fallback)
         else:
             self._load_requested()
+        if self._placement[0] == "cpu":
+            warm_up(self._kokoro)   # an accelerated load already rendered its probe
         self.loaded = True
         threading.Thread(target=self._vram_loop, name="vram-timer", daemon=True).start()
 
