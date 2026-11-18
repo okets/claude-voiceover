@@ -1,11 +1,14 @@
 # tests/test_engine_listeners.py
 """Engine listeners: systemd adoption, self-bind, single-instance lock, token-checked TCP."""
 
+import gc
 import json
 import os
 import socket
 import stat
 import sys
+import time
+import warnings
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -56,6 +59,52 @@ rest = c.read_until_end("t1")
 check("TCP: auth + hello + start in one write -> hello, then audio",
       first.ev == "hello" and rest[0].ev == "audio" and rest[-1]["reason"] == "complete", [first] + rest)
 check("TCP_NODELAY is set on the accepted socket", srv.last_tcp_nodelay not in (None, 0), srv.last_tcp_nodelay)
+
+# bytes pipelined after a bad token are never processed
+calls_before = srv._synth.synth_calls
+c = Raw(addr, tcp=True)
+c.sock.sendall(json.dumps({"op": "auth", "token": "cd" * 32}).encode() + b"\n"
+               + json.dumps({"op": "hello", "proto": 1}).encode() + b"\n"
+               + json.dumps(start_line(id="x1", text="No.", end=True)).encode() + b"\n")
+check("TCP: bad auth + hello + start in one write -> unauthorized, EOF, nothing processed",
+      c.read_event().get("code") == "unauthorized" and c.closed_by_peer()
+      and srv.snapshot()["requests"] == 0 and srv._synth.synth_calls == calls_before)
+stop_server(srv)
+
+# --- IPv6 (any non-Unix listener needs the token) ---------------------------------------------------
+try:
+    v6 = socket.socket(socket.AF_INET6)
+    v6.bind(("::1", 0))
+    v6.listen(8)
+except OSError:
+    v6 = None
+if v6 is None:
+    print("SKIP  IPv6 not available on this host")
+else:
+    srv = serve(SineSynth(), [v6], token=TOKEN)
+    addr6 = v6.getsockname()[:2]
+    check("IPv6: no token -> unauthorized, then EOF", unauthorized_then_eof(addr6, {"op": "hello", "proto": 1}))
+    c = Raw(addr6, tcp=True)
+    c.send({"op": "auth", "token": TOKEN})
+    check("IPv6: right token works, and TCP_NODELAY is set", c.hello().ev == "hello"
+          and srv.last_tcp_nodelay not in (None, 0))
+    stop_server(srv)
+
+# --- auth deadline: idle unauthenticated peers do not hold connection slots ------------------------------
+listener = socket.socket(socket.AF_INET)
+listener.bind(("127.0.0.1", 0))
+listener.listen(8)
+unix_path = str(WORK / "cap.sock")
+cap_unix = socket.socket(socket.AF_UNIX)
+cap_unix.bind(unix_path)
+cap_unix.listen(8)
+srv = serve(SineSynth(), [listener, cap_unix], token=TOKEN, max_connections=2, auth_timeout_s=0.3)
+idle = [Raw(listener.getsockname(), tcp=True, timeout=3.0) for _ in range(2)]
+time.sleep(0.1)
+check("idle TCP peers fill the connection cap", srv.snapshot()["callers"] == 2)
+check("an idle TCP peer is closed without a reply after the deadline",
+      all(p.sock.recv(100) == b"" for p in idle))
+check("a Unix client can connect once they are gone", Raw(unix_path).hello().ev == "hello")
 stop_server(srv)
 
 # --- no token on the Unix socket -----------------------------------------------------------------
@@ -95,6 +144,30 @@ check("with a port: Unix socket plus 127.0.0.1:port",
 for s in with_port:
     s.close()
 
+# --- bind failure leaves no open listener ------------------------------------------------------------------
+taken = socket.socket()
+taken.bind(("127.0.0.1", 0))
+taken.listen(1)
+raised = False
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    try:
+        bind_listeners(sock_path, taken.getsockname()[1])
+    except OSError:
+        raised = True
+    gc.collect()
+leak_warnings = [w for w in caught if issubclass(w.category, ResourceWarning)]
+probe_unix = socket.socket(socket.AF_UNIX)
+try:
+    probe_unix.connect(str(sock_path))
+    still_listening = True
+except OSError:
+    still_listening = False
+probe_unix.close()
+taken.close()
+check("a taken TCP port raises, and the Unix socket is not left listening",
+      raised and not still_listening and not leak_warnings, (raised, still_listening, leak_warnings))
+
 # --- single instance --------------------------------------------------------------------------------
 lock = WORK / "engine.lock"
 first_fd = hold_single_instance(lock)
@@ -104,6 +177,12 @@ os.close(first_fd)
 second_fd = hold_single_instance(lock)
 check("a hold succeeds once the first fd is closed", isinstance(second_fd, int))
 os.close(second_fd)
+try:
+    hold_single_instance(WORK / "no-such-dir" / "engine.lock")
+    other_errors_propagate = False
+except FileNotFoundError:
+    other_errors_propagate = True
+check("an error other than 'already held' propagates", other_errors_propagate)
 
 
 # --- systemd adoption ------------------------------------------------------------------------------

@@ -67,7 +67,7 @@ def bind_listeners(sock_path: Path, port):
     if port is not None:
         try:
             listeners.append(_bind_tcp(port))
-        except OSError:
+        except BaseException:
             listeners[0].close()
             raise
     return listeners
@@ -79,18 +79,25 @@ def _bind_unix(sock_path):
     old_umask = os.umask(0o177)  # the socket is created 0600, never briefly wider
     try:
         sock.bind(str(sock_path))
+        os.chmod(sock_path, SOCKET_MODE)
+        sock.listen(LISTEN_BACKLOG)
+    except BaseException:
+        sock.close()
+        raise
     finally:
         os.umask(old_umask)
-    os.chmod(sock_path, SOCKET_MODE)
-    sock.listen(LISTEN_BACKLOG)
     return sock
 
 
 def _bind_tcp(port):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((TCP_HOST, port))
-    sock.listen(LISTEN_BACKLOG)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((TCP_HOST, port))
+        sock.listen(LISTEN_BACKLOG)
+    except BaseException:
+        sock.close()
+        raise
     return sock
 
 
@@ -99,9 +106,12 @@ def hold_single_instance(lock: Path):
     fd = os.open(str(lock), os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    except BlockingIOError:
         os.close(fd)
         return None
+    except BaseException:
+        os.close(fd)
+        raise
     return fd
 
 
@@ -156,7 +166,7 @@ def _text_problem(msg):
 class EngineServer:
     def __init__(self, synth, *, idle_unload_s, token, plugin_version, plugin_root,
                  max_connections=16, max_requests=64, out_buffer_bytes=2 * 1024 * 1024,
-                 slow_reader_s=30.0):
+                 slow_reader_s=30.0, auth_timeout_s=5.0):
         self._synth = synth
         self._idle_unload_s = idle_unload_s   # used by the lifecycle work (Task 7)
         self._token = token                   # required on TCP connections only
@@ -167,6 +177,7 @@ class EngineServer:
         self._max_requests = max_requests
         self._out_buffer_bytes = out_buffer_bytes
         self._slow_reader_s = slow_reader_s
+        self._auth_timeout_s = auth_timeout_s
         self._conns = set()
         self._handlers = set()
         self._awaiting_load = []              # requests waiting for the model, loop thread
@@ -255,7 +266,8 @@ class EngineServer:
             writer.close()
             return
         conn = Connection(self, reader, writer, self._out_buffer_bytes, self._slow_reader_s,
-                          token=self._token, needs_auth=self._prepare_tcp(writer))
+                          token=self._token, needs_auth=self._prepare_remote(writer),
+                          auth_timeout_s=self._auth_timeout_s)
         self._conns.add(conn)
         task = asyncio.current_task()
         self._handlers.add(task)
@@ -266,15 +278,18 @@ class EngineServer:
             self._handlers.discard(task)
 
     @staticmethod
-    def _is_tcp(writer):
+    def _is_remote(writer):
+        """Fail closed: anything that is not a Unix socket (IPv4, IPv6, unknown) needs the token."""
         sock = writer.get_extra_info("socket")
-        return sock is not None and sock.family == socket.AF_INET
+        return sock is None or sock.family != socket.AF_UNIX
 
-    def _prepare_tcp(self, writer):
-        """TCP callers get TCP_NODELAY (set explicitly, then read back for tests)."""
-        if not self._is_tcp(writer):
+    def _prepare_remote(self, writer):
+        """Non-Unix callers get TCP_NODELAY (set explicitly, then read back for tests)."""
+        if not self._is_remote(writer):
             return False
         sock = writer.get_extra_info("socket")
+        if sock is None:
+            return True
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.last_tcp_nodelay = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY)
         return True

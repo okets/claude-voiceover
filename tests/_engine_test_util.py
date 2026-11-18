@@ -21,8 +21,9 @@ class Raw:
     """A blocking test client speaking raw protocol lines."""
 
     def __init__(self, path, timeout=5.0, tcp=False):
-        """`path` is a Unix socket path, or with tcp=True a ("127.0.0.1", port) address."""
-        self.sock = socket.socket(socket.AF_INET if tcp else socket.AF_UNIX)
+        """`path` is a Unix socket path, or with tcp=True a ("127.0.0.1", port) or ("::1", port) address."""
+        family = (socket.AF_INET6 if ":" in path[0] else socket.AF_INET) if tcp else socket.AF_UNIX
+        self.sock = socket.socket(family)
         self.sock.settimeout(timeout)
         self.sock.connect(path)
         self.buf = b""

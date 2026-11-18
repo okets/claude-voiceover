@@ -26,7 +26,7 @@ def _is_protocol(value):
 
 class Connection:
     def __init__(self, server, reader, writer, out_buffer_bytes, slow_reader_s,
-                 token=None, needs_auth=False):
+                 token=None, needs_auth=False, auth_timeout_s=5.0):
         self.id = next(_connection_ids)
         self.requests = {}      # request id -> Request, in start order
         self._server = server
@@ -38,6 +38,7 @@ class Connection:
         self._slow_timer = None
         self._over_since = None  # when the output buffer last went over its limit
         self._token = token
+        self._auth_deadline = time.monotonic() + auth_timeout_s
         self._needs_auth = needs_auth   # TCP callers must send a valid auth line first
         self._said_hello = False
         self._closing = False
@@ -66,13 +67,24 @@ class Connection:
 
     async def _read_loop(self):
         while not self._closing:
-            data = await self._reader.read(READ_SIZE)
+            data = await self._read()
             if not data:
                 return
             for item in self._lines.feed(data):
                 self._handle(item)
                 if self._closing:
                     return
+
+    async def _read(self):
+        """One read; until the caller has authenticated it must arrive before the auth deadline.
+        Returns b"" (closing quietly) when that deadline passes."""
+        if not self._needs_auth:
+            return await self._reader.read(READ_SIZE)
+        try:
+            return await asyncio.wait_for(self._reader.read(READ_SIZE),
+                                          max(0.0, self._auth_deadline - time.monotonic()))
+        except asyncio.TimeoutError:
+            return b""
 
     def close(self):
         """Flush what is queued, then close."""
