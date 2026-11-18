@@ -27,130 +27,22 @@ import time
 import urllib.request
 from pathlib import Path
 
+from kokoro_model import (  # noqa: F401  moved; re-exported for existing callers and tests
+    DEFAULT_SAMPLE_RATE, DEFAULT_VOICE, DEFAULT_VOICE_SETTINGS, MODEL_FILE, MODEL_URL, MODELS_DIR, VOICE_SETTINGS,
+    VOICES_FILE, VOICES_URL, _CPU, _CUDA, _PROBE_VOICE, _active_provider, _gpu_provider, _load_accelerated,
+    _load_on, choose_onnx_provider, download_models, ensure_models, get_voice_settings, load_kokoro, models_present)
 from engine_common import (Playback, ProcessPlayback, data_dir, engine_log, global_setting, remove_tts_lock,
                            try_claim_lock, update_lock_expiry)
 
 DRY_RUN = bool(os.environ.get("VOICEOVER_DRY_RUN"))
 
-MODELS_DIR = Path.home() / ".kokoro-tts" / "models"
-MODEL_FILE = MODELS_DIR / "kokoro-v1.0.onnx"
-VOICES_FILE = MODELS_DIR / "voices-v1.0.bin"
-MODEL_URL = (
-    "https://github.com/thewh1teagle/kokoro-onnx/releases/download/"
-    "model-files-v1.0/kokoro-v1.0.onnx"
-)
-VOICES_URL = (
-    "https://github.com/thewh1teagle/kokoro-onnx/releases/download/"
-    "model-files-v1.0/voices-v1.0.bin"
-)
-
-DEFAULT_VOICE = "am_echo"
 PLAYBACK_GRACE_SECONDS = 10  # a clip's player may run this much past its length
-DEFAULT_SAMPLE_RATE = 24000  # Kokoro default
-DEFAULT_VOICE_SETTINGS = {"speed": 1.0, "lang": "en-us", "trim": True}
-
-# Per-voice delivery settings for all 13 Kokoro voices.
-VOICE_SETTINGS = {
-    "af_alloy": {"speed": 1.1, "lang": "en-us", "trim": True},
-    "af_river": {"speed": 1.1, "lang": "en-us", "trim": True},
-    "af_sky": {"speed": 1.05, "lang": "en-us", "trim": True},
-    "af_sarah": {"speed": 1.0, "lang": "en-us", "trim": True},
-    "af_nicole": {"speed": 1.3, "lang": "en-us", "trim": True},
-    "am_adam": {"speed": 1.0, "lang": "en-us", "trim": True},
-    "am_echo": {"speed": 1.0, "lang": "en-us", "trim": True},
-    "am_puck": {"speed": 0.94, "lang": "en-us", "trim": True},
-    "am_michael": {"speed": 1.1, "lang": "en-us", "trim": True},
-    "bf_emma": {"speed": 1.0, "lang": "en-us", "trim": True},
-    "bm_daniel": {"speed": 1.3, "lang": "en-us", "trim": True},
-    "bm_lewis": {"speed": 1.0, "lang": "en-us", "trim": True},
-    "bm_george": {"speed": 1.2, "lang": "en-us", "trim": True},
-}
 
 
 def log(message):
     """Diagnostics go to stderr; stdout stays silent for the hook protocol."""
     print(message, file=sys.stderr)
 
-
-# --- model loading: CPU by default, NVIDIA GPU when tts_device is "gpu" -------
-
-_CPU = "CPUExecutionProvider"
-_CUDA = "CUDAExecutionProvider"
-
-
-def _gpu_provider():
-    """CUDA when the gpu extra is installed and usable, else None.
-
-    The gpu extra ships CUDA and cuDNN as pip wheels; onnxruntime only finds
-    them after preload_dlls(). Without that step it silently falls back to CPU.
-    """
-    try:
-        import onnxruntime
-        if hasattr(onnxruntime, "preload_dlls"):
-            onnxruntime.preload_dlls()
-        if _CUDA in onnxruntime.get_available_providers():
-            return _CUDA
-    except Exception as error:
-        log("[voiceover] GPU unavailable, using CPU: " + str(error))
-    return None
-
-
-def choose_onnx_provider():
-    """The ONNX provider for the tts_device setting.
-
-    An ONNX_PROVIDER already in the environment wins. Otherwise CPU, unless the
-    machine opted into "gpu" and CUDA is usable. CPU is always named explicitly
-    (by _load_on), so no installed package can change CPU behaviour.
-    """
-    if os.environ.get("ONNX_PROVIDER"):
-        return os.environ["ONNX_PROVIDER"]
-    wants_gpu = global_setting("tts_device", "cpu") == "gpu"
-    return (_gpu_provider() if wants_gpu else None) or _CPU
-
-
-def _active_provider(kokoro):
-    """The provider the loaded session really runs on, for diagnostics only."""
-    try:
-        return kokoro.sess.get_providers()[0]
-    except Exception:
-        return "unknown"
-
-
-_PROBE_VOICE = "af_sky"
-
-
-def _load_on(provider):
-    """A Kokoro model whose ONNX session runs on provider."""
-    os.environ["ONNX_PROVIDER"] = provider
-    from kokoro_onnx import Kokoro
-
-    return Kokoro(str(MODEL_FILE), str(VOICES_FILE))
-
-
-def _load_accelerated(provider):
-    """The model on an accelerated provider, proven by one short synthesis.
-
-    CUDA can load and still fail on first use (driver too old for the CUDA
-    build, no kernel image for the card, out of VRAM). Returns None on failure.
-    """
-    try:
-        kokoro = _load_on(provider)
-        kokoro.create("Ready.", voice=_PROBE_VOICE, speed=1.0)
-        return kokoro
-    except Exception as error:
-        log("[voiceover] %s failed, falling back to CPU: %s" % (provider, error))
-        engine_log("device", "fallback provider=%s error=%s" % (provider, error))
-        return None
-
-
-def load_kokoro():
-    """Load the Kokoro model on the configured device, falling back to CPU."""
-    requested = choose_onnx_provider()
-    kokoro = _load_accelerated(requested) if requested != _CPU else None
-    if kokoro is None:
-        kokoro = _load_on(_CPU)
-    engine_log("device", "requested=%s active=%s" % (requested, _active_provider(kokoro)))
-    return kokoro
 
 # --- audio playback (inline port of the cross-platform player) --------------
 
@@ -195,40 +87,7 @@ def _play_linux(file_path, timeout):
 
 # --- model management --------------------------------------------------------
 
-def models_present():
-    return MODEL_FILE.exists() and VOICES_FILE.exists()
-
-
-def download_models():
-    """Download kokoro-v1.0.onnx and voices-v1.0.bin to ~/.kokoro-tts/models."""
-    log("[INSTALL] First run - downloading Kokoro models...")
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    for url, dest in ((MODEL_URL, MODEL_FILE), (VOICES_URL, VOICES_FILE)):
-        if dest.exists():
-            continue
-        log("[DOWNLOAD] " + url)
-        partial = dest.with_suffix(dest.suffix + ".part")
-        urllib.request.urlretrieve(url, partial)
-        partial.replace(dest)
-    log("[OK] Kokoro models installed")
-
-
-def ensure_models():
-    if models_present():
-        return True
-    try:
-        download_models()
-        return True
-    except Exception as error:
-        log("[ERROR] Model download failed: " + str(error))
-        return False
-
-
 # --- synthesis ---------------------------------------------------------------
-
-def get_voice_settings(voice):
-    """Per-voice settings with a sane default for unknown voices."""
-    return VOICE_SETTINGS.get(voice, DEFAULT_VOICE_SETTINGS)
 
 
 def play_chunk(samples, sample_rate, root):
