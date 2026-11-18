@@ -46,6 +46,7 @@ class Connection:
             "hello": self._op_hello, "auth": self._op_ignored, "status": self._op_status,
             "stop": self._op_stop, "start": self._op_start, "text": self._op_text,
             "flush": self._op_flush, "end": self._op_end, "cancel": self._op_cancel,
+            "warm": self._op_warm, "release": self._op_release,
         }
 
     @staticmethod
@@ -220,3 +221,9 @@ class Connection:
 
     def _op_cancel(self, msg):
         self._server.cancel_requests(self, msg.get("id"))
+
+    def _op_warm(self, msg):
+        self._server.warm(self, msg)
+
+    def _op_release(self, msg):
+        self._server.release(self, msg)

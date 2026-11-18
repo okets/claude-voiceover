@@ -22,10 +22,13 @@ import os
 import socket
 import sys
 import threading
+import time
 import traceback
 from pathlib import Path
 
+import engine_paths
 from engine_connection import Connection
+from engine_lifecycle import LifecyclePolicy, QuietInputs, quiet_exit_reason
 from engine_protocol import LIMITS, PROTOCOL, split_frames
 from engine_scheduler import Job, Scheduler
 from engine_text import UtteranceText
@@ -166,9 +169,12 @@ def _text_problem(msg):
 class EngineServer:
     def __init__(self, synth, *, idle_unload_s, token, plugin_version, plugin_root,
                  max_connections=16, max_requests=64, out_buffer_bytes=2 * 1024 * 1024,
-                 slow_reader_s=30.0, auth_timeout_s=5.0):
+                 slow_reader_s=30.0, auth_timeout_s=5.0, quiet_check_s=10.0):
         self._synth = synth
-        self._idle_unload_s = idle_unload_s   # used by the lifecycle work (Task 7)
+        self._idle_unload_s = idle_unload_s
+        self._policy = LifecyclePolicy(idle_unload_s, quiet_check_s)
+        self._start_device = None             # tts_device when serving began
+        self._warm_waiters = []               # (conn) waiting for the model to answer warm
         self._token = token                   # required on TCP connections only
         self.last_tcp_nodelay = None          # test hook: TCP_NODELAY of the last accepted TCP socket
         self._plugin_version = plugin_version
@@ -214,11 +220,69 @@ class EngineServer:
             self._loop = loop
             already = self._exit_reason is not None
         servers = [await self._listen(sock) for sock in listeners]
+        self._start_device = engine_paths.read_global_settings().get("tts_device")
         worker.start()
         if already:
             self._set_exit_future()
+        ticker = loop.create_task(self._tick_lifecycle())
         await self._exit_future
+        ticker.cancel()
         await self._shutdown(servers, worker)
+
+    # --- lifecycle wiring (the decisions live in engine_lifecycle) -------------------
+
+    def _busy(self):
+        """Something queued, active, or waiting on the model: the engine must stay."""
+        return bool(self._registry or self._warm_waiters)
+
+    async def _tick_lifecycle(self):
+        while True:
+            await asyncio.sleep(self._policy.tick_s)
+            reason = self._lifecycle_exit()
+            if reason:
+                self.request_exit(reason)
+                return
+
+    def _lifecycle_exit(self):
+        if self._policy.idle_due(self._busy()):
+            return "idle"
+        if self._policy.quiet_due() and self._is_quiet():
+            return quiet_exit_reason(self._quiet_inputs())
+        return None
+
+    def _is_quiet(self):
+        return not self._busy() and not self._policy.leases() and not self._conns
+
+    def _quiet_inputs(self):
+        loaded = bool(self._synth.loaded)
+        return QuietInputs(plugin_root=self._plugin_root, start_device=self._start_device,
+                           pointer=engine_paths.read_pointer(), settings=engine_paths.read_global_settings(),
+                           engine_status=self._synth.status() if loaded else {},
+                           keep_off=engine_paths.read_keep_off())
+
+    def warm(self, conn, msg):
+        """`warm`: load the model if needed, hold it for hold_s, reply once it is loaded."""
+        hold_s = msg.get("hold_s", 0)
+        if not isinstance(hold_s, (int, float)) or isinstance(hold_s, bool):
+            conn.send_error("bad_request", "hold_s must be a number")
+            return
+        self._policy.hold(hold_s)
+        if self._synth.loaded:
+            self._send_warm(conn)
+        else:
+            self._warm_waiters.append(conn)
+            self._request_load()
+
+    def _send_warm(self, conn):
+        conn.send({"ev": "warm", "loaded": True, "device": self._synth.status().get("device")})
+
+    def release(self, conn, msg):
+        """`release`: leave for a while (keep-off), ending open requests with restarting."""
+        keep_off_s = msg.get("keep_off_s")
+        if isinstance(keep_off_s, (int, float)) and not isinstance(keep_off_s, bool) and keep_off_s > 0:
+            engine_paths.write_keep_off(keep_off_s, "release")
+        conn.send({"ev": "released", "vram_mib": 0})
+        self.request_exit("release")
 
     async def _listen(self, sock):
         if sock.family == socket.AF_UNIX:
@@ -316,7 +380,15 @@ class EngineServer:
         return {"proto": PROTOCOL, "plugin": self._plugin_version, "pid": os.getpid(),
                 "loaded": loaded, "device": engine.get("device"), "requested": engine.get("requested"),
                 "fallback": engine.get("fallback"), "vram_mib": engine.get("vram_mib"),
-                "callers": len(self._conns), "requests": len(self._registry)}
+                "callers": len(self._conns), "requests": len(self._registry),
+                "warm_until": self._warm_until(), "idle_unload_s": self._idle_unload_s,
+                "idle_s": self._policy.idle_s(self._busy()), "uptime_s": self._policy.uptime_s(),
+                "leases": self._policy.leases()}
+
+    def _warm_until(self):
+        """Wall-clock time the last warm hold ends, or None."""
+        remaining = self._policy.warm_remaining()
+        return None if remaining is None else time.time() + remaining
 
     # --- requests (loop thread) --------------------------------------------------------
 
@@ -343,6 +415,7 @@ class EngineServer:
         req = Request(conn, req_id, msg["voice"], msg.get("speed"), msg.get("lang", DEFAULT_LANG),
                       msg.get("live") is True)
         conn.requests[req_id] = req
+        self._policy.note_activity()
         with self._cond:
             self._registry[(conn.id, req_id)] = req
         return req
@@ -437,6 +510,9 @@ class EngineServer:
 
     def _await_model(self, req):
         self._awaiting_load.append(req)
+        self._request_load()
+
+    def _request_load(self):
         if not self._load_in_flight:
             self._load_in_flight = True
             with self._cond:
@@ -447,6 +523,7 @@ class EngineServer:
         """Loop thread: the worker's load attempt finished; `error` is (code, message) or None."""
         self._load_in_flight = False
         waiting, self._awaiting_load = self._awaiting_load, []
+        self._answer_warm_waiters(error)
         for req in waiting:
             if req.ended:
                 continue
@@ -454,6 +531,14 @@ class EngineServer:
                 self._fail(req, *error)
             else:
                 self._guarded(req, self._activate, req)
+
+    def _answer_warm_waiters(self, error):
+        waiters, self._warm_waiters = self._warm_waiters, []
+        for conn in waiters:
+            if error:
+                conn.send_error(*error)
+            else:
+                self._send_warm(conn)
 
     def _activate(self, req):
         """The model is loaded: check the voice, then let the request's sentences run."""
@@ -531,6 +616,7 @@ class EngineServer:
 
     def _forget(self, req, promote=True):
         req.ended = True
+        self._policy.note_activity()
         req.conn.requests.pop(req.id, None)
         with self._cond:
             self._registry.pop((req.conn.id, req.id), None)
