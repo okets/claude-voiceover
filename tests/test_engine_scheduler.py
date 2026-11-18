@@ -1,0 +1,77 @@
+# tests/test_engine_scheduler.py
+"""Round-robin sentence scheduler: per-connection FIFO, live priority within a round."""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _harness import check, isolate, report, REPO_ROOT
+
+isolate()
+sys.path.insert(0, str(REPO_ROOT / "tts"))
+from engine_scheduler import Job, Scheduler
+
+
+def job(conn, req="r", text="t", live=False):
+    return Job(conn, req, text, live)
+
+
+def drain(scheduler):
+    out = []
+    while True:
+        item = scheduler.next()
+        if item is None:
+            return out
+        out.append(item)
+
+
+# --- fairness ---------------------------------------------------------------
+s = Scheduler()
+for i in range(3):
+    s.add(job("A", text="a%d" % i))
+for i in range(2):
+    s.add(job("B", text="b%d" % i))
+check("A, B alternate", [j.text for j in drain(s)] == ["a0", "b0", "a1", "b1", "a2"])
+check("empty scheduler has no work", not s.has_work() and s.next() is None)
+
+# --- a connection is FIFO ---------------------------------------------------
+s = Scheduler()
+for i in range(3):
+    s.add(job("A", text=str(i)))
+check("FIFO within a connection", [j.text for j in drain(s)] == ["0", "1", "2"])
+
+# --- a live connection joins the next round first ---------------------------
+s = Scheduler()
+for i in range(3):
+    s.add(job("A", text="a%d" % i))
+    s.add(job("B", text="b%d" % i))
+first = s.next()                 # round 1 is [A, B]; A is served
+s.add(job("C", text="c0", live=True))
+rest = [j.text for j in drain(s)]
+check("the round in progress finishes before C", first.text == "a0" and rest[0] == "b0", rest)
+check("the next round starts with the live connection", rest[1] == "c0", rest)
+
+# --- narration never waits more than one sentence behind live ---------------
+s = Scheduler()
+for i in range(5):
+    s.add(job("L", text="L", live=True))
+for i in range(2):
+    s.add(job("N", text="N"))
+check("L, N, L, N, L, L, L", "".join(j.text for j in drain(s)) == "LNLNLLL")
+
+# --- cancel -----------------------------------------------------------------
+s = Scheduler()
+s.add(job("A", "r1", "x")); s.add(job("A", "r2", "y")); s.add(job("A", "r1", "z")); s.add(job("B", "r1", "w"))
+check("cancel by request returns the count", s.cancel("A", "r1") == 2)
+check("only that request's jobs go", [j.text for j in drain(s)] == ["y", "w"])
+s = Scheduler()
+s.add(job("A", "r1")); s.add(job("A", "r2")); s.add(job("B", "r1"))
+check("cancel a whole connection", s.cancel("A") == 2 and s.pending("A") == 0 and s.pending("B") == 1)
+check("cancelling nothing returns 0", s.cancel("zzz") == 0)
+s = Scheduler(); s.add(job("A")); s.add(job("B")); s.next()
+s.cancel("B")
+check("a cancelled connection is skipped mid-round", s.next() is None and not s.has_work())
+
+check("pending counts queued jobs", (lambda q: (q.add(job("A")), q.add(job("A")), q.pending("A"))[2])(Scheduler()) == 2)
+
+report()
