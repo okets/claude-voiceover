@@ -3,6 +3,7 @@ numpy and onnxruntime stubbed. Under test is OUR wiring: NoModel, voices, speeds
 keep-off, load fallback and the mid-run CUDA -> CPU fallback."""
 
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -78,7 +79,7 @@ check("and loads nothing", loads == [])
 kokoro_model.models_present = lambda: True
 
 # voices, speeds, construction
-synth = kokoro_model.KokoroSynth()
+synth = kokoro_model.KokoroSynth(vram_interval=0.05)
 check("voices() before load() is empty", kokoro_model.KokoroSynth().voices() == set())
 check("construction is cheap: not loaded", synth.loaded is False and loads == [])
 synth.load()
@@ -86,6 +87,9 @@ check("loaded after load()", synth.loaded)
 check("voices() returns the 54 names", synth.voices() == set(VOICES) and len(synth.voices()) == 54)
 check("default speed bm_daniel 1.3", synth.default_speed("bm_daniel") == 1.3)
 check("default speed af_heart 1.0", synth.default_speed("af_heart") == 1.0)
+deadline = time.time() + 2
+while synth.status()["vram_mib"] is None and time.time() < deadline:
+    time.sleep(0.01)
 check("status on cuda", synth.status() == {"device": "cuda", "requested": "cuda", "fallback": None, "vram_mib": 512},
       synth.status())
 
@@ -101,6 +105,25 @@ except AssertionError:
     status_ok = False
 subprocess.run = real_run
 check("status() spawns nothing and serves the cached vram", status_ok)
+
+# synthesize() never spawns either; the timer thread refreshes the cache
+subprocess.run = no_spawn
+calls = []
+kokoro_model._query_vram_mib = lambda pid: (calls.append(pid), 600 + len(calls))[1]
+try:
+    quiet = kokoro_model.KokoroSynth(vram_interval=0.05)
+    quiet.load()
+    quiet._kokoro = FakeKokoro("CPUExecutionProvider")  # no create failure; placement stays cuda
+    quiet.synthesize("x", "voice_1", 1.0, "en-us")
+    synth_ok = True
+except AssertionError:
+    synth_ok = False
+subprocess.run = real_run
+check("synthesize() spawns nothing", synth_ok)
+before = quiet.status()["vram_mib"]
+time.sleep(0.3)
+check("the timer thread refreshes the cached vram", len(calls) >= 3 and quiet.status()["vram_mib"] > (before or 0), calls)
+kokoro_model._query_vram_mib = lambda pid: 512
 
 # input errors do not fall back
 class BadInput(FakeKokoro):

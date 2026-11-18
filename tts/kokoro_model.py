@@ -9,6 +9,7 @@ inside functions, so this module imports in the stdlib-only test suite.
 import os
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -206,16 +207,17 @@ INPUT_ERRORS = (ValueError, TypeError, KeyError)   # the caller's fault: CPU wou
 class KokoroSynth:
     """The real Synth: Kokoro on CUDA when it works, else CPU. Construction is cheap; load() does the work.
 
-    status() only reads cached state, since the engine answers it on its event loop. The VRAM figure
-    is refreshed on the worker thread, after load() and after synthesize()."""
+    status() and synthesize() only read cached state: the VRAM figure is refreshed by a daemon timer
+    thread (started by load(), every VRAM_CACHE_SECONDS while on cuda), so nvidia-smi never sits on
+    the synthesis path or the event loop."""
 
-    def __init__(self, force_cpu=False):
+    def __init__(self, force_cpu=False, vram_interval=VRAM_CACHE_SECONDS):
         self.loaded = False
+        self._vram_interval = vram_interval
         self._force_cpu = force_cpu
         self._kokoro = None
         self._requested = "cpu"
         self._placement = ("cpu", None)   # (device, fallback), replaced as one value
-        self._vram_read_at = 0.0
         self._vram = None
 
     def load(self):
@@ -233,7 +235,7 @@ class KokoroSynth:
         else:
             self._load_requested()
         self.loaded = True
-        self._refresh_vram()
+        threading.Thread(target=self._vram_loop, name="vram-timer", daemon=True).start()
 
     @staticmethod
     def _keep_off():
@@ -283,7 +285,6 @@ class KokoroSynth:
                 raise
             self._fall_back_to_cpu(error)
             samples, _rate = self._kokoro.create(text, voice, speed, lang, trim=True)
-        self._refresh_vram()
         return pcm16le(samples)
 
     def _fall_back_to_cpu(self, error):
@@ -297,9 +298,15 @@ class KokoroSynth:
         return {"device": device, "requested": self._requested,
                 "fallback": fallback, "vram_mib": self._vram if device == "cuda" else None}
 
+    def _vram_loop(self):
+        """Daemon timer thread: refresh the cached VRAM figure every interval while on cuda."""
+        while True:
+            self._refresh_vram()
+            time.sleep(self._vram_interval)
+
     def _refresh_vram(self):
-        """Worker-thread only: query nvidia-smi, at most every VRAM_CACHE_SECONDS, and only on cuda."""
-        if self._placement[0] != "cuda" or time.time() - self._vram_read_at < VRAM_CACHE_SECONDS:
+        if self._placement[0] != "cuda":
             return
-        self._vram = _query_vram_mib(os.getpid())
-        self._vram_read_at = time.time()
+        vram = _query_vram_mib(os.getpid())
+        if self._placement[0] == "cuda":    # a fallback may have landed during the query
+            self._vram = vram
