@@ -16,6 +16,7 @@ import argparse
 import os
 import platform
 import shutil
+import getpass
 import socket
 import subprocess
 import sys
@@ -24,7 +25,7 @@ from pathlib import Path
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PLUGIN_ROOT))
-sys.path.insert(0, str(PLUGIN_ROOT / "tts"))
+sys.path.append(str(PLUGIN_ROOT / "tts"))
 
 import engine_launcher  # noqa: E402
 import engine_paths  # noqa: E402
@@ -39,6 +40,7 @@ MODEL_FILES = {
 
 FIRST_SHARE_PORT = 47320
 LAST_PORT = 65535
+AUTO_PORT = "auto"
 TOKEN_NOTE = "Put this token in your assistant's secrets; `voiceover-engine token` shows it again."
 
 LINUX_PLAYERS = ["ffplay", "aplay", "paplay", "mpv"]
@@ -202,36 +204,59 @@ def linger_enabled(user):
 
 
 def warn_if_no_linger():
-    user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or getpass.getuser()
     if linger_enabled(user):
         return
     print("Warning: lingering is off for %s, so the engine stops when you log out." % user)
     print("  To keep it available after logout, run:  loginctl enable-linger %s" % user)
 
 
+def _port_arg(text):
+    return text if text == AUTO_PORT else int(text)
+
+
 def _launcher(*argv):
     return engine_launcher.main(list(argv))
 
 
-def share_engine(requested_port=None):
+def _choose_port(requested):
+    """(port, error): the requested port if usable, else our configured one, else the first free.
+    The configured port counts as available: our own socket unit holds it."""
+    configured = engine_paths.engine_port()
+    if requested == AUTO_PORT:
+        return (configured if configured is not None else first_free_port()), None
+    if not 1 <= requested <= LAST_PORT:
+        return None, "Port %d is outside 1-%d." % (requested, LAST_PORT)
+    if requested != configured and not port_is_free(requested):
+        return None, "Port %d is already in use on 127.0.0.1; pick another with --share-engine PORT." % requested
+    return requested, None
+
+
+def _install_everything(port):
+    """prepare, shim, units; an error message, or None."""
+    settings.set_setting("engine_port", port)
+    project = engine_launcher.default_project(PLUGIN_ROOT, engine_paths.read_global_settings())
+    if _launcher("prepare", str(PLUGIN_ROOT), "--project", str(project)) != 0:
+        return "Could not prepare the engine environment (is uv installed?)."
+    engine_pointer.install_shim()
+    if _launcher("install-service") != 0:
+        return "Could not install the systemd units."
+    return None
+
+
+def share_engine(requested_port=AUTO_PORT):
     """Opt in to sharing the engine: port, prepared environment, systemd units, token. Returns an exit code."""
     if not sys.platform.startswith("linux"):
         print("--share-engine is Linux only (it uses systemd user units).")
         return 1
-    if requested_port is not None and not port_is_free(requested_port):
-        print("Port %d is already in use on 127.0.0.1; pick another with --share-engine PORT." % requested_port)
-        return 1
-    port = requested_port if requested_port is not None else first_free_port()
-    if port is None or not settings.set_setting("engine_port", port):
-        print("Could not choose or save a TCP port for the engine.")
-        return 1
-    project = engine_launcher._default_project(PLUGIN_ROOT, engine_paths.read_global_settings())
-    if _launcher("prepare", str(PLUGIN_ROOT), "--project", str(project)) != 0:
-        print("Could not prepare the engine environment (is uv installed?).")
-        return 1
-    engine_pointer.install_shim()
-    if _launcher("install-service") != 0:
-        print("Could not install the systemd units.")
+    port, error = _choose_port(requested_port)
+    if error is None and port is None:
+        error = "No free TCP port found for the engine."
+    previous = settings.get_machine_setting("engine_port")
+    error = error or _install_everything(port)
+    if error:
+        settings.set_setting("engine_port", previous)
+        print(error)
         return 1
     print("Engine shared on 127.0.0.1:%d and %s" % (port, engine_paths.socket_path()))
     warn_if_no_linger()
@@ -252,13 +277,13 @@ def main(argv=None):
     parser = argparse.ArgumentParser(prog="setup_tts.py", description="Claude Voiceover first-run setup")
     parser.add_argument("--download", action="store_true", help="Download Kokoro models (~300MB, skips files already cached)")
     parser.add_argument("--test", action="store_true", help="Speak a sample line to verify audio")
-    parser.add_argument("--share-engine", nargs="?", const=0, type=int, metavar="PORT",
+    parser.add_argument("--share-engine", nargs="?", const=AUTO_PORT, type=_port_arg, metavar="PORT",
                         help="Linux: share the engine over a systemd socket (and 127.0.0.1:PORT; default first free from 47320)")
     parser.add_argument("--unshare-engine", action="store_true", help="Remove the systemd units and the engine port")
     args = parser.parse_args(argv)
 
     if args.share_engine is not None:
-        return share_engine(args.share_engine or None)
+        return share_engine(args.share_engine)
     if args.unshare_engine:
         return unshare_engine()
     if args.download:

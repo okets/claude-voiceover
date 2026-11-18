@@ -136,7 +136,7 @@ def _prepare_pointer(root, project, take_lock=True):
     return EXIT_OK if _publish_pointer(root, info, take_lock) else EXIT_UNREACHABLE
 
 
-def _default_project(root, settings, system=None, machine=None):
+def default_project(root, settings, system=None, machine=None):
     """tts-gpu for an opted-in, capable machine, else tts.
 
     Twin of voiceover.speech.kokoro_project/gpu_capable, duplicated because tts/ cannot
@@ -173,7 +173,7 @@ def _serve(args):
     else:
         python = _pointer_python()
         if not python:
-            project = _default_project(root, engine_paths.read_global_settings())
+            project = default_project(root, engine_paths.read_global_settings())
             if _prepare_pointer(root, project, take_lock=False) != EXIT_OK or not _pointer_python():
                 print("voiceover-engine: no engine environment could be prepared", file=sys.stderr)
                 return EXIT_UNREACHABLE
@@ -248,14 +248,19 @@ def run_systemctl(*args) -> int:
         return EXIT_UNREACHABLE
 
 
+def _escape(text) -> str:
+    """systemd expands % specifiers and $ variables in unit values; double both to keep them literal."""
+    return str(text).replace("%", "%%").replace("$", "$$")
+
+
 def _quote(text) -> str:
-    """systemd splits ExecStart/Environment values on whitespace; quote only when it matters."""
-    text = str(text)
+    """Escape for systemd, and quote when whitespace would split the value."""
+    text = _escape(text)
     return '"%s"' % text.replace("\\", "\\\\").replace('"', '\\"') if any(c.isspace() for c in text) else text
 
 
 def socket_unit(sock: Path, port) -> str:
-    listen = ["ListenStream=%s" % sock] + (["ListenStream=127.0.0.1:%d" % port] if port else [])
+    listen = ["ListenStream=%s" % _escape(sock)] + (["ListenStream=127.0.0.1:%d" % port] if port else [])
     lines = ["[Unit]", "Description=Voiceover shared Kokoro engine (socket)", "", "[Socket]"] + listen + [
         "SocketMode=0600", "DirectoryMode=0700", "NoDelay=true", "Accept=no", "",
         "[Install]", "WantedBy=sockets.target", ""]
@@ -267,6 +272,29 @@ def service_unit(python: str, shim: Path, data_dir_env) -> str:
     lines = ["[Unit]", "Description=Voiceover shared Kokoro engine", "", "[Service]",
              "ExecStart=%s %s serve" % (_quote(python), _quote(shim))] + env + [""]
     return "\n".join(lines)
+
+
+def _python_candidates():
+    """Where a system python3 might be, in order. Tests replace this."""
+    return ["/usr/bin/python3", shutil.which("python3")]
+
+
+def _ephemeral(path, roots) -> bool:
+    """A python that moves or vanishes with the plugin: under a plugin root, or in a .venv."""
+    text = str(path)
+    return "/.venv/" in text or any(text == str(r) or text.startswith(str(r).rstrip("/") + "/") for r in roots)
+
+
+def unit_python():
+    """The interpreter for ExecStart: a stable system python3, never the plugin's own; None if none."""
+    roots = [_DEFAULT_ROOT]
+    pointed = (engine_paths.read_pointer() or {}).get("plugin_root")
+    if pointed:
+        roots.append(pointed)
+    for candidate in _python_candidates():
+        if candidate and os.path.isfile(candidate) and not _ephemeral(candidate, roots):
+            return candidate
+    return None
 
 
 def _unit_dir() -> Path:
@@ -293,8 +321,12 @@ def _install_service(args):
     if not shim.is_file():
         print("voiceover-engine: launcher shim missing at %s (run setup first)" % shim, file=sys.stderr)
         return EXIT_UNREACHABLE
+    python = unit_python()
+    if not python:
+        print("voiceover-engine: no system python3 found for the unit (install python3)", file=sys.stderr)
+        return EXIT_UNREACHABLE
     texts = {_SOCKET_UNIT: socket_unit(engine_paths.socket_path(), engine_paths.engine_port()),
-             _UNIT_NAME + ".service": service_unit(sys.executable, shim, os.environ.get("VOICEOVER_DATA_DIR"))}
+             _UNIT_NAME + ".service": service_unit(python, shim, os.environ.get("VOICEOVER_DATA_DIR"))}
     try:
         _unit_dir().mkdir(parents=True, exist_ok=True)
         for name, path in _unit_files().items():
@@ -302,14 +334,9 @@ def _install_service(args):
     except OSError as error:
         print("voiceover-engine: cannot write units: %s" % error, file=sys.stderr)
         return EXIT_UNREACHABLE
-    return _enable_now_code(run_systemctl("daemon-reload"))
-
-
-def _enable_now_code(reload_code):
-    """After daemon-reload: enable --now the socket; EXIT_OK only when both succeed."""
-    if reload_code != 0:
+    if run_systemctl("daemon-reload") != 0:
         return EXIT_UNREACHABLE
-    return EXIT_OK if run_systemctl("enable", "--now", _SOCKET_UNIT) == 0 else EXIT_UNREACHABLE
+    return _enable_socket(args, restart_if_active=True)
 
 
 def _uninstall_service(args):
@@ -330,11 +357,21 @@ def _engine_answers() -> bool:
         return False
 
 
-def _enable(args):
-    """Hand the socket to systemd: a self-started engine holds engine.sock, so stop it first."""
-    if _engine_answers() and run_systemctl("is-active", _SOCKET_UNIT) != 0:
+def _enable_socket(args, restart_if_active=False):
+    """Hand the socket to systemd. A self-started engine holds engine.sock, so stop it first
+    (unless the socket is already active). `restart_if_active` applies a changed ListenStream."""
+    active = run_systemctl("is-active", _SOCKET_UNIT) == 0
+    if not active and _engine_answers():
         _stop(args)
-    return EXIT_OK if run_systemctl("enable", "--now", _SOCKET_UNIT) == 0 else EXIT_UNREACHABLE
+    if run_systemctl("enable", "--now", _SOCKET_UNIT) != 0:
+        return EXIT_UNREACHABLE
+    if active and restart_if_active and run_systemctl("restart", _SOCKET_UNIT) != 0:
+        return EXIT_UNREACHABLE
+    return EXIT_OK
+
+
+def _enable(args):
+    return _enable_socket(args)
 
 
 def _disable(args):

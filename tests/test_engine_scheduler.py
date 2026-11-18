@@ -99,4 +99,10 @@ s.add(job("A", text="a0")); s.add(job("A", text="a1")); s.next()
 s.add(job("B", text="b0", live=False)); s.add(job("C", text="c0", live=True))
 check("live heads still go first, among the least recently served", s.next().text == "c0")
 
+s = Scheduler()
+for i in range(2):
+    s.add(job("A", text="a%d" % i)); s.add(job("B", text="b%d" % i, live=True))
+check("setup: A is served before B", [s.next(exclude={"B"}).text, s.next().text] == ["a0", "b0"])
+check("a live head beats an older-served non-live connection", [s.next().text, s.next().text] == ["b1", "a1"])
+
 report()

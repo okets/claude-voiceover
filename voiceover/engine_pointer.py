@@ -53,7 +53,7 @@ def _newer_than_own(pointer) -> bool:
     return engine_paths.version_tuple(own) < engine_paths.version_tuple(pointer.get("plugin_version", ""))
 
 
-def _install_shim() -> None:
+def install_shim() -> None:
     """Put the launcher shim at <state>/bin/voiceover-engine (0755) when its bytes differ,
     unless a newer plugin version owns the pointer (an older copy must not overwrite its shim)."""
     if _newer_than_own(engine_paths.read_pointer()):
@@ -70,9 +70,6 @@ def _install_shim() -> None:
     temp.write_bytes(wanted)
     os.chmod(str(temp), _SHIM_MODE)
     os.replace(str(temp), str(target))
-
-
-install_shim = _install_shim   # public name for setup, which installs the shim before the unit uses it
 
 
 def _candidate_root(plugin_root: Path, override) -> Path:
@@ -111,7 +108,7 @@ def refresh(plugin_root: Path = speech._PLUGIN_ROOT) -> bool:
     try:
         if _windows() or not _due():
             return False
-        _install_shim()
+        install_shim()
         return _prepare_if_needed(plugin_root)
     except Exception:
         return False

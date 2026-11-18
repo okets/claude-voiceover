@@ -119,12 +119,12 @@ try:
     check("refresh spawns for a higher version",
           engine_pointer.refresh(make_root("2.0.0")) is True and len(spawned) == 2)
     (engine_paths.engine_dir() / "pointer_checked").unlink()
-    real_installer = engine_pointer._install_shim
-    engine_pointer._install_shim = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+    real_installer = engine_pointer.install_shim
+    engine_pointer.install_shim = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
     try:
         check("refresh never raises", engine_pointer.refresh(here) is False)
     finally:
-        engine_pointer._install_shim = real_installer
+        engine_pointer.install_shim = real_installer
     (engine_paths.engine_dir() / "pointer_checked").unlink(missing_ok=True)
     real_platform = engine_pointer._windows
     engine_pointer._windows = lambda: True
@@ -245,16 +245,16 @@ try:
     check("serve's prepare used the cpu project by default", uv_calls[-1][1] == str(root / "tts"), uv_calls)
 
     check("default project: gpu setting on x86_64 Linux is tts-gpu",
-          engine_launcher._default_project(root, {"tts_device": "gpu"}, "linux", "x86_64") == root / "tts-gpu")
+          engine_launcher.default_project(root, {"tts_device": "gpu"}, "linux", "x86_64") == root / "tts-gpu")
     check("default project: gpu on macOS is tts",
-          engine_launcher._default_project(root, {"tts_device": "gpu"}, "darwin", "arm64") == root / "tts")
+          engine_launcher.default_project(root, {"tts_device": "gpu"}, "darwin", "arm64") == root / "tts")
     check("default project: gpu on arm64 Linux is tts",
-          engine_launcher._default_project(root, {"tts_device": "gpu"}, "linux", "aarch64") == root / "tts")
+          engine_launcher.default_project(root, {"tts_device": "gpu"}, "linux", "aarch64") == root / "tts")
     check("default project: gpu on a non-Linux/Windows platform is tts",
-          engine_launcher._default_project(root, {"tts_device": "gpu"}, "freebsd14", "amd64") == root / "tts"
-          and engine_launcher._default_project(root, {"tts_device": "gpu"}, "win32", "AMD64") == root / "tts-gpu")
+          engine_launcher.default_project(root, {"tts_device": "gpu"}, "freebsd14", "amd64") == root / "tts"
+          and engine_launcher.default_project(root, {"tts_device": "gpu"}, "win32", "AMD64") == root / "tts-gpu")
     check("default project: no gpu setting is tts",
-          engine_launcher._default_project(root, {}, "linux", "x86_64") == root / "tts")
+          engine_launcher.default_project(root, {}, "linux", "x86_64") == root / "tts")
 
     reset_state()
     engine_launcher._run_uv = lambda uv, project: None
