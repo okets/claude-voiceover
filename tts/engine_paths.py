@@ -180,3 +180,41 @@ def read_keep_off():
 def write_keep_off(seconds: float, reason: str) -> None:
     """Ask launchers not to start the engine for `seconds`."""
     _write_json_atomic(keep_off_path(), {"until": time.time() + seconds, "reason": reason})
+
+
+# --- the version pointer's rule (shared by the hooks and the launcher's prepare) ---
+
+def plugin_version(root: Path) -> str:
+    """The version in <root>/.claude-plugin/plugin.json, or "unknown"."""
+    try:
+        with open(Path(root) / ".claude-plugin" / "plugin.json", encoding="utf-8") as handle:
+            return str(json.load(handle).get("version", "unknown"))
+    except (OSError, ValueError, AttributeError):
+        return "unknown"
+
+
+def version_tuple(version) -> tuple:
+    """"1.10.0" -> (1, 10, 0); a part without leading digits counts as 0."""
+    parts = []
+    for part in str(version).split("."):
+        digits = ""
+        for char in part:
+            if not char.isdigit():
+                break
+            digits += char
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+
+def should_replace(current, candidate_root, candidate_version, override) -> bool:
+    """Whether the candidate should become the pointer.
+
+    An override (the engine_plugin_root setting) wins: replace exactly when it differs from the
+    current root. Otherwise replace when there is no pointer, its root is gone, or the candidate's
+    version is higher; an equal version keeps the current pointer (a dev checkout never flips it)."""
+    current_root = (current or {}).get("plugin_root")
+    if override:
+        return str(override) != str(current_root)
+    if current_root is None or not Path(current_root).exists():
+        return True
+    return version_tuple(candidate_version) > version_tuple((current or {}).get("plugin_version", ""))

@@ -4,7 +4,6 @@
 Only --stub works until the real synth lands; numpy and kokoro are imported lazily.
 """
 
-import json
 import sys
 import time
 from pathlib import Path
@@ -15,14 +14,6 @@ from engine_server import (EngineServer, adopt_systemd_listeners, bind_listeners
 from engine_stub import SineSynth
 
 _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
-
-
-def _plugin_version(root: Path) -> str:
-    try:
-        with open(root / ".claude-plugin" / "plugin.json", encoding="utf-8") as handle:
-            return str(json.load(handle).get("version", "unknown"))
-    except (OSError, ValueError, AttributeError):
-        return "unknown"
 
 
 def _log(message: str) -> None:
@@ -69,7 +60,7 @@ def main(argv) -> int:
         return 0
     server = EngineServer(synth, idle_unload_s=engine_paths.idle_unload_seconds(),
                           token=engine_paths.read_or_create_token(),
-                          plugin_version=_plugin_version(_PLUGIN_ROOT),
+                          plugin_version=engine_paths.plugin_version(_PLUGIN_ROOT),
                           plugin_root=str(_PLUGIN_ROOT))
     reason = server.serve_forever(listeners)
     _log("exit: %s" % reason)
