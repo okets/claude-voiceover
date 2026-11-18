@@ -20,6 +20,7 @@ sys.path.insert(0, str(REPO_ROOT / "tts"))
 import engine_client
 import engine_launcher
 import engine_paths
+import kokoro_engine
 
 
 def engine_pids():
@@ -136,6 +137,21 @@ try:
     check("ensure recovers within 3 s", engine_client.ensure(REPO_ROOT, timeout=3.0)
           and time.monotonic() - start < 3.0)
     check("new engine is a different process", engine_pids() and not set(engine_pids()) & set(victim))
+
+    # R10: --stub-delay-ms reaches the synth (per sentence), through the launcher's exec
+    check("kokoro_engine: --stub-delay-ms builds SineSynth with synth_delay",
+          kokoro_engine._choose_synth(True, 250)._synth_delay == 0.25)
+    check("kokoro_engine: delay parsed from argv", kokoro_engine._stub_delay_ms(["--stub", "--stub-delay-ms", "40"]) == 40
+          and kokoro_engine._stub_delay_ms(["--stub"]) == 0)
+    execs = []
+    real_execv = os.execv
+    os.execv = lambda python, argv: execs.append(argv)
+    try:
+        engine_launcher.main(["serve", "--stub", "--stub-delay-ms", "75", "--plugin-root", str(REPO_ROOT)])
+    finally:
+        os.execv = real_execv
+    check("launcher serve passes --stub-delay-ms through to kokoro_engine.py",
+          execs and execs[0][2:] == ["--stub", "--stub-delay-ms", "75"], execs)
 
     # S6: a waiter that gets start.lock only after its deadline still succeeds if an engine is up
     run_cli("stop")

@@ -45,16 +45,24 @@ def _choose_listeners():
     return bind_listeners(engine_paths.socket_path(), engine_paths.engine_port()), lock_fd
 
 
-def _choose_synth(stub: bool):
+def _stub_delay_ms(argv) -> int:
+    """The value after --stub-delay-ms, else 0 (also 0 when it is missing or not a number)."""
+    try:
+        return max(0, int(argv[argv.index("--stub-delay-ms") + 1]))
+    except (ValueError, IndexError):
+        return 0
+
+
+def _choose_synth(stub: bool, stub_delay_ms: int = 0):
     if stub:
-        return SineSynth()
+        return SineSynth(synth_delay=stub_delay_ms / 1000)
     from kokoro_model import KokoroSynth   # lazy: pulls in numpy and onnxruntime
     return KokoroSynth()
 
 
 def main(argv) -> int:
     stub = "--stub" in argv
-    synth = _choose_synth(stub)   # construction stays cheap: the model loads later, on demand
+    synth = _choose_synth(stub, _stub_delay_ms(argv))   # construction stays cheap: the model loads later, on demand
     listeners, _lock_fd = _choose_listeners()
     if listeners is None:
         _log("another engine holds the lock; exiting")

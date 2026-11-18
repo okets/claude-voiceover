@@ -29,6 +29,7 @@ def _parser():
     serve = sub.add_parser("serve")
     serve.add_argument("--plugin-root", default=str(_DEFAULT_ROOT))
     serve.add_argument("--stub", action="store_true")
+    serve.add_argument("--stub-delay-ms", type=int, default=0)
     ensure = sub.add_parser("ensure")
     ensure.add_argument("--plugin-root", default=str(_DEFAULT_ROOT))
     sub.add_parser("status")
@@ -49,7 +50,8 @@ def _serve(args):
         if not python:
             print("voiceover-engine: no engine installed yet (run prepare)", file=sys.stderr)
             return EXIT_UNREACHABLE
-    argv = [python, script] + (["--stub"] if args.stub else [])
+    stub_args = ["--stub"] + (["--stub-delay-ms", str(args.stub_delay_ms)] if args.stub_delay_ms else [])
+    argv = [python, script] + (stub_args if args.stub else [])
     os.execv(python, argv)   # exec keeps the pid, so LISTEN_PID stays valid
 
 
