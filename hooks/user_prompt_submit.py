@@ -19,6 +19,17 @@ PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PLUGIN_ROOT))
 
 
+def refresh_engine_pointer(cwd):
+    """Keep the shared engine's pointer and launcher shim fresh for every Kokoro user, at any
+    level, and for share-only users. Own try: never costs the hook (refresh is rate-limited)."""
+    try:
+        from voiceover import engine_pointer
+        if engine_pointer.wanted(cwd):
+            engine_pointer.refresh()
+    except Exception:
+        pass
+
+
 def main():
     payload = json.load(sys.stdin)
 
@@ -29,6 +40,7 @@ def main():
 
     cwd = payload.get("cwd")
     session = payload.get("session_id")
+    refresh_engine_pointer(cwd)
     if narrator.mod_owns_prompt(session, cwd):
         # The mod narrates this session: it pins the turn, cuts over and warms
         # the engine itself. Only the other levels' clear is left to do here.

@@ -98,6 +98,12 @@ check("macOS is never gpu-capable", not speech.gpu_capable("darwin", "x86_64")
 check("arm linux is not gpu-capable", not speech.gpu_capable("linux", "aarch64"))
 
 # --- the uv command ----------------------------------------------------------------
+linux_cmd = speech.kokoro_command("--drain", "/tmp/root")
+check("linux/macOS: plain python runs the client, no uv",
+      linux_cmd[0] == sys.executable and linux_cmd[1] == str(speech._TTS_DIR / "kokoro_voice.py")
+      and linux_cmd[2:] == ["--drain", "/tmp/root"], linux_cmd)
+real_platform = sys.platform
+sys.platform = "win32"  # Windows keeps the uv command, on the configured device
 set_device(None)
 cpu_cmd = speech.kokoro_command("--voice", "af_sky", "hello")
 check("cpu: the default tts project", cpu_cmd[:4] == ["uv", "run", "--project", str(speech._TTS_DIR)], cpu_cmd)
@@ -114,6 +120,7 @@ speech.gpu_capable = lambda system=None, machine=None: False
 check("gpu on an incapable machine (macOS): the default project",
       speech.kokoro_command("--drain", "/tmp/root")[3] == str(speech._TTS_DIR))
 speech.gpu_capable = real_capable
+sys.platform = real_platform
 
 # --- the engine's provider choice --------------------------------------------------
 set_device(None)

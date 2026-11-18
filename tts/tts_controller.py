@@ -2,7 +2,10 @@
 """
 TTS kill switch for the claude-voiceover plugin.
 
-Usage: python3 tts_controller.py stop
+Usage: python3 tts_controller.py stop [--all]
+
+`stop` stops narration only. `stop --all` also stops the shared Kokoro engine
+(the one reachable through the current data dir), cancelling any request in flight.
 
 Stops every engine, one-shot and narrator drainers alike, by killing their
 engine processes (kokoro_voice.py / macos_say.py, plus the `say -v` and
@@ -17,6 +20,10 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
+
+_TTS_DIR = str(Path(__file__).resolve().parent)
+if _TTS_DIR not in sys.path:
+    sys.path.append(_TTS_DIR)   # appended: a tts module must never shadow the stdlib
 
 # Extended regexes for `pkill -f`, matching only processes we spawned.
 UNIX_PATTERNS = [
@@ -156,12 +163,25 @@ def stop_tts():
     clear_projects()
 
 
-def main():
-    command = sys.argv[1] if len(sys.argv) > 1 else "stop"
-    if command != "stop":
-        print("Usage: tts_controller.py stop", file=sys.stderr)
+def stop_shared_engine():
+    """Ask the shared Kokoro engine to exit; every error (none running, stale socket,
+    no engine client on this platform) is ignored."""
+    try:
+        import engine_client   # POSIX only: needs fcntl
+        engine_client.run_on_engine(lambda conn: conn.stop(), timeout=0.5)
+    except Exception:
+        pass
+
+
+def main(argv=None):
+    args = sys.argv[1:] if argv is None else list(argv)
+    command, flags = (args[0] if args else "stop"), args[1:]
+    if command != "stop" or flags not in ([], ["--all"]):
+        print("Usage: tts_controller.py stop [--all]", file=sys.stderr)
         return 1
     stop_tts()
+    if flags:
+        stop_shared_engine()
     return 0
 
 

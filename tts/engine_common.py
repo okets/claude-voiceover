@@ -352,7 +352,8 @@ def split_sentences(text):
             if piece and piece.strip()]
 
 
-def _read_json(path):
+def read_json(path):
+    """A JSON object from path, or None when it is missing, unreadable or not an object."""
     try:
         with open(path, encoding="utf-8") as handle:
             loaded = json.load(handle)
@@ -371,7 +372,7 @@ def _own_pending(root, engine_names):
     """(path, item) for this engine's readable pending items, oldest first."""
     own = []
     for path in sorted(queue_dir(root).glob("*.json")):
-        item = _read_json(path)
+        item = read_json(path)
         if item is not None and _owned(item, engine_names):
             own.append((path, item))
     return own
@@ -457,7 +458,7 @@ def stop_requested(root, item) -> bool:
         created = 0.0
     directory = Path(root) / _STOP_DIR_NAME
     for name in {_stop_file_name(item.get("session")), _stop_file_name(None)}:
-        request = _read_json(directory / name)
+        request = read_json(directory / name)
         try:
             if request and float(request.get("ts")) > created:
                 return True
@@ -720,6 +721,7 @@ def drain(root, open_speaker, engine_names, lock_seconds=60.0,
             if item is None:
                 if lease_is_live(root):
                     keeper.keep()  # a session's turn is running: stay warm
+                    getattr(speaker, "idle", lambda: None)()
                     time.sleep(poll_seconds)
                     continue
                 remove_tts_lock(root)

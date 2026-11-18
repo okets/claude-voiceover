@@ -41,6 +41,11 @@ DEFAULTS = {
     "notification_sounds": True,        # quiet-mode mp3 pings
     "voice": None,                      # explicit kokoro voice id, else per-project hash
     "speak_subagent_completions": True, # verbose level only
+    # machine-wide only (global settings file; read by the engine too, see "Shared engine"):
+    "tts_device": "cpu",                # cpu | gpu
+    "engine_port": None,                # TCP port of the shared Kokoro engine on 127.0.0.1; null = socket only
+    "engine_idle_s": None,              # seconds the engine keeps the model; null = 330 with a port, else 60
+    "engine_plugin_root": None,         # plugin directory the engine runs from; null = this install
 }
 
 LEVELS = ["silent", "quiet", "concise", "verbose", "narrator"]   # numeric aliases 0..4 accepted everywhere
@@ -151,7 +156,9 @@ def speak(text, min_level="concise", cwd=None, interrupt=False, full=False) -> b
     # gates: is_tts_enabled + level_at_least(min_level); truncates via truncate_for_speech;
     # honors tts lock (skip if locked & not interrupt; interrupt -> stop_speech first);
     # engine dispatch:
-    #   kokoro       -> subprocess: uv run --project <plugin>/tts <plugin>/tts/kokoro_voice.py --voice <voice> --stream <text>
+    #   kokoro       -> subprocess: kokoro_command("--voice", <voice>, "--stream", <text>): Linux/macOS run
+    #                   plain `python3 <plugin>/tts/kokoro_voice.py ...` (a client of the shared engine);
+    #                   Windows runs `uv run --project <plugin>/tts[-gpu] <plugin>/tts/kokoro_voice.py ...`
     #   macos-female -> subprocess: python3 <plugin>/tts/macos_say.py --voice Samantha <text>
     #   macos-male   -> subprocess: python3 <plugin>/tts/macos_say.py --voice Daniel <text>
     #   none         -> no-op
@@ -167,11 +174,13 @@ def ensure_drainer(cwd=None) -> bool
     # holds a lease (the pre-warm), unless a live lock whose owner pid still runs holds it (a dead
     # owner counts as free) or one was spawned <3s ago (<project>/spawned.json; the engine clears it
     # once loaded). Also removes the 1.3 machine-wide queue. Called unconditionally by narrator paths.
+    # (the "engine" here is the project's narrator drainer; on Linux/macOS it is a client of the shared engine)
 def prewarm(cwd=None, session=None, ttl=lease.LEASE_TTL) -> bool   # lease.hold + ensure_drainer
 def request_stop(cwd=None, session=None) -> None
     # ask the project's engine to stop session's sentence now (None: any): <project>/stop/<slug|_all>.json
     # {"ts"}. The engine honours only items queued before the request.
-def stop_speech() -> None                     # one-shot speaker only (lock_path()); also clears stale lock
+def stop_speech() -> None                     # one-shot speaker only (lock_path()); also clears stale lock; never the shared engine
+def kokoro_command(*args) -> list             # argv for the Kokoro narration client (plain python off Windows, uv run on Windows)
 def play_sound(name: str, cwd=None) -> None   # 'notification' | 'decide'; gated by notification_sounds
 def truncate_for_speech(text: str, limit: int = 220) -> str   # port semantic_truncate suite
 def lock_path() -> Path                       # data_dir()/tts.lock: the ONE-SHOT speaker's lock (expiry timestamp inside)
@@ -350,21 +359,306 @@ the lock-owner liveness check hooks use.
 ## tts/
 
 - `tts/pyproject.toml` — name "claude-voiceover-tts", deps: kokoro-onnx>=0.4.9, soundfile>=0.13.1, numpy>=1.24.0
+- `tts/kokoro_engine.py` — the shared Kokoro engine (Linux/macOS), the only process that holds the
+  model there; run through `tts/engine_launcher.py serve`. Its name deliberately matches no kill
+  pattern. Protocol and lifecycle: "Shared engine (protocol 1)" below. Modules, all stdlib-only
+  except `kokoro_engine.py`/`kokoro_model.py` (numpy, onnxruntime and kokoro-onnx are imported
+  lazily): `engine_server`, `engine_connection`, `engine_protocol`, `engine_scheduler`,
+  `engine_text`, `engine_lifecycle`, `engine_listeners`, `engine_paths`, `engine_client`, `engine_launcher`,
+  `engine_speaker`, `engine_stub` (test synth), `voiceover_engine_shim.py`, and `kokoro_model.py`
+  (model files, device choice, `KokoroSynth`, shared with the Windows in-process path).
 - `tts/kokoro_voice.py --drain <project dir>` / `tts/macos_say.py --drain <project dir>` —
-  the narrator engines: `engine_common.drain()` over that project's spool. Kokoro's
-  `open_speaker` loads the model once and warms it up; its speaker synthesizes the next
-  sentence on a worker thread while one plays. macOS speaks each sentence with
-  `say --voice=<Name>` (text on stdin).
-- `tts/kokoro_voice.py --voice <voice_id> [--stream] <text>` — the one-shot speaker, port as-is (13 voices, per-voice speed, model
-  auto-download to ~/.kokoro-tts/models, plays via voiceover/audio_player logic duplicated
-  locally or inline — this file may NOT import voiceover/ (different process/venv); it stays
-  self-contained like today).
+  the narrator drainers: `engine_common.drain()` over that project's spool. On Linux/macOS the
+  Kokoro drainer is a client of the shared engine (`engine_speaker.EngineSpeaker`: it requests each
+  sentence, writes a wav and plays it, prefetches the next, and warms the engine while it waits on
+  a lease; when the engine has gone (exited or killed) it reconnects through `ensure`, starting a
+  new one; it runs under plain `python3`). On Windows it keeps the in-process `KokoroSpeaker`
+  (loads the model once, synthesizes the next sentence on a worker thread), spawned with `uv run`.
+  macOS system voices speak each sentence with `say --voice=<Name>` (text on stdin).
+- `tts/kokoro_voice.py --voice <voice_id> [--stream] <text>` — the one-shot speaker (13 voices, per-voice speed,
+  model auto-download to ~/.kokoro-tts/models; ensures the model files before using the engine). On
+  Linux/macOS it asks the shared engine (starting it with `ensure`); `--stream` submits one request
+  per sentence up front and plays each sentence's audio whole, in order. On Windows it synthesizes in-process.
+  This file may NOT import voiceover/; it stays self-contained.
 - `tts/macos_say.py --voice <Name> <text>` — collapse of the 3 old macos_*_tts.py scripts;
   stdlib only; uses `say`.
-- `tts/tts_controller.py stop` — kill switch: kills every lock owner's process group (the
+- `tts/tts_controller.py stop [--all]` — kill switch: kills every lock owner's process group (the
   one-shot speaker's lock and every project's `projects/*/tts.lock`, pid verified against
   our engine names), pattern-kills our engine and audio-child lines, then `clear_projects()`
-  drops every project's lock, spawn marker, stop files, queue, leases and wavs.
+  drops every project's lock, spawn marker, stop files, queue, leases and wavs. It stops narration
+  only: the shared engine and any interface request in flight are untouched. `--all` also sends
+  the engine `stop` (through `engine_client`, every error ignored), cancelling whatever it was serving.
+
+## Shared engine (protocol 1)
+
+On Linux and macOS one engine process per user holds the Kokoro model and serves every
+caller: the narrator's drainers, the one-shot speaker, and any other program the user
+lets in. Callers send text and get PCM audio back. This section is the contract an
+outside client can code against. The code is `tts/engine_server.py`,
+`engine_connection.py`, `engine_lifecycle.py`, `engine_listeners.py`, `engine_protocol.py`, `engine_client.py`
+(the stdlib client the plugin itself uses), `engine_launcher.py`, `engine_paths.py` and
+`voiceover/engine_pointer.py`. Windows keeps the in-process `KokoroSpeaker` and has no engine.
+
+### Transports and paths
+
+Everything lives under `<state>/engine/` (`<state>` = the data dir: `$VOICEOVER_DATA_DIR`,
+else `~/.claude-voiceover`; the directory is mode 0700, enforced on every use):
+
+| File | What |
+|------|------|
+| `engine.sock` | the Unix socket (0600). Always served. No auth: file permissions are the guard |
+| `engine.lock` | flock held by the one running engine (single instance); an engine adopted from systemd takes it too, and serves even if it is held (systemd guarantees one instance) |
+| `start.lock` | flock that serialises starters (`ensure`) and pointer writes |
+| `prepare.lock` | one `prepare` at a time |
+| `token` | the TCP secret: 64 lowercase hex characters, mode 0600 |
+| `current.json` | the version pointer (below) |
+| `keep_off.json` | `{"until": <epoch s>, "reason": str}`; until `until`, an engine that starts (launchers still start it) loads on the CPU and reports `fallback.reason` `keep_off`, and leaves for `card_return` once it has expired |
+| `engine.log` | the engine's own log, plus the stdout/stderr of the processes `ensure` spawns |
+
+`<state>/bin/voiceover-engine` is the launcher shim (0755), the stable entry point for
+the systemd unit and for other programs.
+
+TCP is optional: when the machine-wide `engine_port` setting is an integer 1-65535 the
+engine also listens on `127.0.0.1:<port>`, loopback only. Every accepted TCP socket gets
+`TCP_NODELAY`. A port that cannot be bound (another program holds it) is logged to `engine.log`
+and the engine serves the Unix socket only: narration is unaffected, TCP callers get no answer
+until the port is free and the engine restarts. An AF_UNIX path is limited to 107 bytes on Linux (103 on macOS); a longer
+`engine.sock` path makes the engine log one line to `engine.log` and exit 1, `ensure`
+returns False, and `voiceover-engine serve` prints one stderr line naming the path and the
+limit. Use a shorter `VOICEOVER_DATA_DIR`.
+
+Settings (machine-wide, in `<state>/settings.json`): `engine_port` (null = socket only),
+`engine_idle_s` (seconds the loaded model stays after the last activity; default 330 when
+`engine_port` is set, else 60), `engine_plugin_root` (pin the plugin directory the engine
+runs from), `tts_device` (`cpu` | `gpu`).
+
+### Wire format
+
+One UTF-8 JSON object per line (`\n` terminated, blank lines ignored). Audio events are a
+header line followed by exactly `bytes` raw bytes. Audio is signed 16-bit PCM,
+**little-endian**, mono, 24000 Hz, announced in `hello` as
+`{"format":"pcm_s16le","rate":24000,"channels":1}`. Limits, also announced in `hello`:
+`{"line":65536,"text":6000,"frame":32768}`: a line over 65536 bytes is `bad_request` (the
+rest of that line is dropped); one request may carry at most 6000 characters of text in
+total (`text_too_long`); an audio frame is even-length and at most 32768 bytes, so never
+assume a frame size, and a sentence may arrive as several frames.
+
+Client rules that matter in practice:
+- After each `audio` line read exactly `bytes` bytes, then go on with lines.
+- Behind an HTTP `CONNECT` proxy, read the proxy's reply exactly up to the blank line
+  (`\r\n\r\n`). A buffered reader may swallow audio bytes that follow it.
+- Decode UTF-8 only on whole lines; a multi-byte character may be split across reads.
+- A request that fails gets an `error` with its `id` and is then always closed by an `end`; see the error rule below.
+
+### Auth (TCP only)
+
+The first line on a TCP connection must be `{"op":"auth","token":"<token>"}`. A wrong,
+missing or non-first auth line gets `{"ev":"error","code":"unauthorized",...}` and the
+connection is closed; `unauthorized` means the token is wrong: do not retry, tell the
+owner (`voiceover-engine token` prints it, `rotate-token` replaces it). A connection that
+has not authenticated within 5 s is closed silently. `auth`, `hello` and the first `start`
+may be pipelined in one write. After authenticating, an `auth` line is accepted and ignored.
+The Unix socket needs no auth line (an `auth` line there is ignored).
+
+### Ops (client to engine)
+
+`hello` must come first (anything else before it: `bad_request` "hello comes first").
+Unknown ops and non-object lines get `bad_request`.
+
+| Op | Fields | Effect |
+|----|--------|--------|
+| `hello` | `proto` (1) | Replies `hello`. A different proto: `unsupported_protocol`, then the connection closes. Missing proto: `bad_request` |
+| `status` | | Replies `status` |
+| `start` | `id` (string, unique among the connection's active requests), `voice` (string), optional `text`, `end` (true), `speed` (0.5-2.0), `lang` (default `en-us`), `live` (true) | Opens a request. `text` is fed as if sent by `text`; `end:true` also ends the input |
+| `text` | `id`, `text` | Appends text to an active request |
+| `flush` | `id`, `n` (integer) | Speak what is buffered now (a trailing partial sentence too) and, when every sentence queued so far has been rendered and sent, reply `flushed` with the same `n` |
+| `end` | `id` | No more text: the buffered rest is spoken, then the request completes |
+| `cancel` | optional `id` (string) | Cancels that request, or every request on the connection when `id` is absent. An unknown id is ignored; a non-string `id` gets `bad_request` with that value as `ref` |
+| `warm` | optional `hold_s` (number, default 0, capped at 600), optional `id` | Loads the model if needed and holds the engine up for `hold_s` seconds. Replies `warm` once loaded; the optional `id` is echoed in that reply (as `id`) and in a `warm` error (as `ref`) |
+| `release` | optional `keep_off_s` (finite number 0-86400, default 0) | Leave now: replies `released`, ends open requests, writes `keep_off.json` when `keep_off_s` > 0, exits. Anything else (not a number, NaN, Infinity, negative, over 86400) gets an id-less `bad_request` and the engine stays |
+| `stop` | | Exit now. Open requests end `cancelled`; there is no reply |
+| `auth` | `token` | TCP only; see above |
+
+Without a `speed`, the voice's own default applies (the `VOICE_SETTINGS` speed, else 1.0).
+Text is split into sentences at `. ! ?` followed by whitespace, and at newlines; a sentence
+over 40 words is split at the clause boundary nearest its middle. Text with no sentence
+punctuation is spoken when the input ends or is flushed (`start` "ok" then `end` speaks
+"ok"); whitespace-only text with `end` gives `end`/`complete` with `samples` 0 and no
+synthesis. Sentences of one connection are rendered in strict order; requests on one
+connection are served in start order (only the oldest renders; a later one waits for it),
+and each ends before the next one's audio starts.
+
+`live: true` (on `start`) marks a latency-sensitive caller. The first sentence of a live
+utterance is also split early at its first clause boundary (after at least 4 words), so first audio
+does not wait for a whole sentence. In the scheduler a live caller goes first among the
+waiters at the next sentence boundary, even when it arrives in the middle of a round (it still
+gets one sentence per round). It never preempts a sentence already being synthesized, so a live
+caller waits at most one in-flight sentence. Callers are served in
+rounds, so no caller waits behind more than one sentence of any other caller. The
+my_agent framework maps its surfaces `call` and `filler` to `live:true` and `voice-note`
+and `narration` to `live:false`, and it sends `warm` when its client starts, often with no
+request following for seconds.
+
+### Events (engine to client)
+
+| Event | Fields |
+|-------|--------|
+| `hello` | `proto` (1), `plugin` (the plugin version, from `.claude-plugin/plugin.json`), `audio`, `limits`, `loaded` (model in memory), `device` (`"cpu"`, `"cuda"` or null before load) |
+| `status` | `proto`, `plugin`, `pid`, `loaded`, `device`, `requested` (`"cpu"`/`"cuda"`), `fallback` (null, or `{"reason", "at"}` when the GPU was not used; reasons: `keep_off`, `load_failed: <error>`, `synthesis_failed: <error>`), `vram_mib`, `callers`, `requests`, `warm_until` (epoch s or null), `idle_unload_s`, `idle_s`, `uptime_s`, `leases` |
+| `audio` | `id`, `seq` (0, 1, 2... per request), `bytes`; then exactly `bytes` raw bytes follow the line |
+| `end` | `id`, `reason` (`complete` \| `cancelled` \| `error`), `samples` (audio samples sent for this request; 24000 per second). Exactly one per request |
+| `flushed` | `id`, `n` |
+| `warm` | `loaded` (true), `device`, optional `id` |
+| `released` | `vram_mib` (0) |
+| `error` | `code`, `message`, optional `id` (request failure, followed by `end`) or `ref` (ends nothing); see the rule below |
+
+`status` semantics: `requests` is the number of requests in progress right now (a gauge,
+not a total); `callers` is the number of open connections (the one asking included);
+`leases` is the number of active warm holds.
+
+#### Errors
+
+Codes: `bad_request`, `unsupported_protocol`, `unknown_voice`, `bad_speed`,
+`text_too_long`, `busy`, `no_model`, `synthesis_failed`, `released`, `restarting`,
+`unauthorized`.
+
+Rule for client authors: an `error` carrying `"id"` is a request failure and is **always**
+followed by `{"ev":"end","id":<same id>,"reason":"error",...}`; read to that `end`. Request
+failures are a rejected `start`, `unknown_voice`, `bad_speed`, `text_too_long`, `no_model`,
+`synthesis_failed`, `busy` on a request, and `restarting` when the engine leaves. An `error`
+that ends nothing carries the id it refers to in `"ref"` instead, and nothing follows it: a
+`start` that reuses an active id (the first request carries on and ends by itself), a
+`text`/`flush`/`end` for an id with no active request or after its input ended, a non-string
+`text`, a non-integer flush `n`, a `cancel` whose `id` is not a string (`ref` is that value), and every `warm` error (`ref` is the `warm` id, when one was sent;
+the success reply `{"ev":"warm","id":...}` keeps `id`). An `error` with neither `id` nor `ref`
+concerns the connection (bad line, unknown op, hello first, `busy` connection refusal,
+`unauthorized`).
+
+Codes in practice: `unknown_voice` (not in the voice file, checked once the model is
+loaded), `bad_speed` (outside 0.5-2.0 or not a number), `no_model` (model files missing:
+run `/voiceover:setup`), `synthesis_failed` (render or load failed), `busy` (16 TCP connections
+already open: the new one gets one id-less `busy` line and is closed; Unix-socket connections are
+never counted or refused, so unauthenticated TCP peers cannot lock local callers out; or 64
+requests already active on this connection: the limit is per connection),
+`released` (a defined code the engine does not currently send; the `release` op's reply is the separate `released` event), `restarting` (the engine is
+leaving; reconnect and retry, `ensure` starts a new one).
+
+#### Backpressure and drops
+
+A caller that stops reading is not allowed to hold the engine: rendering for that
+connection pauses while 2 MiB are unsent, and a connection stuck over the limit for 30 s is
+dropped. A caller that disconnects has its queued and in-flight work discarded at once. An
+engine bug in one request ends that request with `synthesis_failed`, never the process.
+
+### Lifecycle
+
+- **Start.** `engine_launcher.py ensure` (the stdlib client's `ensure()`) connects, and if
+  nothing answers spawns `engine_launcher.py serve` detached under `start.lock` (single
+  flight) and polls until it answers (default 10 s). `serve` first checks the pointer: when it
+  is unusable (root or python gone) or this plugin copy supersedes it (the version rule below),
+  it runs `prepare` itself; then it replaces itself with the pointer's
+  `<plugin_root>/tts/kokoro_engine.py` run by the pointer's `python`, so code and environment
+  always come from one plugin version. Still no usable pointer: one stderr line, exit 1. The real
+  engine imports numpy, onnxruntime and kokoro-onnx before it binds; the model loads on the first
+  request or `warm`, and a CPU load renders one short warm-up sentence first. Under systemd
+  socket activation the engine adopts the passed sockets (`LISTEN_PID`/`LISTEN_FDS`) instead of
+  binding, and keeps their files when it exits. A second self-started engine finds `engine.lock`
+  held and exits 0; one that finds an `engine.sock` that still answers (systemd's, or an engine
+  that does not hold the lock) exits 0 without touching it; a stale `engine.sock` left by a
+  killed engine (nothing answers) is replaced on bind.
+- **Idle.** The model unloads, by the process exiting, when nothing has happened for
+  `engine_idle_s` seconds (330 s with `engine_port`, else 60 s) and no request, warm wait
+  or warm hold is open. Any request activity resets the clock.
+- **Warm.** `warm` with `hold_s` keeps the engine alive for that long (at most 600 s per hold,
+  holds are independent) so the first real request is not cold. Callers that expect speech
+  soon (the narrator re-warms every 30 s for 60 s while it waits) send it repeatedly.
+- **Quiet-moment exits.** Every 10 s, when no request is open, no warm hold is active and
+  no connection is open, the engine leaves for `update` if the pointer's or the
+  `engine_plugin_root` setting's plugin directory differs from its own, or `tts_device`
+  changed since it started; or for `card_return` if it fell back to the CPU for `keep_off`
+  and that keep-off has expired (the GPU is back). Launchers then start a fresh engine.
+- **Exits close connections.** Every exit (`idle`, `update`, `card_return`, `release`, `stop`)
+  closes all open connections. A client that keeps a connection open, idle between requests,
+  must treat EOF as "the engine left": reconnect (through `ensure`, or the systemd socket, which
+  starts a new engine) and resend what it still needs.
+- **Release.** `release` ends open requests with `error restarting` + `end error`, answers
+  `released`, writes `keep_off.json` when `keep_off_s` > 0 and exits. With a keep-off in
+  force a restarted engine loads on the CPU and reports `fallback.reason` `keep_off`
+  (use it to hand the GPU to another program).
+- **Stop.** `stop` ends every open request as `cancelled` (no `error`) and exits. Any other
+  exit that finds requests open ends them `error restarting` + `end error`.
+- **Kill switch.** `tts_controller.py stop` and the one-shot interrupt stop narration only; no
+  kill pattern matches `kokoro_engine.py`, and an interface request in flight keeps
+  playing. `tts_controller.py stop --all` also sends `stop` to the engine reachable through
+  the current data dir.
+
+### Launcher (`voiceover-engine`)
+
+Run through the shim: `<state>/bin/voiceover-engine <command>`, or
+`python3 tts/engine_launcher.py <command>`. Exit codes: 0 ok, 1 engine unreachable
+(`prepare`: failed), 2 usage.
+
+| Command | What |
+|---------|------|
+| `serve [--plugin-root R] [--stub] [--stub-delay-ms N]` | run the engine in this process (exec); `--stub` serves a sine-tone synth for tests |
+| `prepare ROOT --project P` | `uv sync` project P, then publish the pointer (below) |
+| `ensure [--plugin-root R]` | start the engine if it is not answering |
+| `status` | print the `status` event as JSON |
+| `release [--keep-off SECONDS]` | the `release` op |
+| `stop` | the `stop` op |
+| `token` / `rotate-token` | print the TCP token (creating it) / replace it |
+| `install-service` / `uninstall-service` | write / remove the systemd user units (Linux) |
+| `enable` / `disable` | hand the socket to systemd (stopping a self-started engine first) / back: `disable` stops the socket unit and the engine; the next narration `ensure` self-starts an engine again (Unix socket, plus TCP while `engine_port` is set) |
+
+The shim finds the plugin through `--plugin-root`, else `current.json`'s `plugin_root`, puts
+its `tts/` on `sys.path` and hands over to `engine_launcher.main`; so a program that knows only
+`<state>/bin/voiceover-engine` keeps working across plugin updates.
+
+#### The pointer, `<state>/engine/current.json`
+
+```json
+{"plugin_root": "/path/to/plugin", "plugin_version": "1.6.0", "uv": "/usr/bin/uv",
+ "python": "/path/to/tts/.venv/bin/python", "project": "/path/to/plugin/tts"}
+```
+
+`python` is the engine's interpreter (it has kokoro-onnx), `project` the uv project
+it came from (`tts` or `tts-gpu`). `prepare` builds the environment first and replaces the
+pointer atomically only afterwards, so the pointer never names something that does not run.
+The `UserPromptSubmit` hook installs the shim and starts `prepare` (rate-limited to once a
+minute, never on Windows) for every session whose engine resolves to `kokoro`, at any level, and
+whenever a pointer already exists (a machine that only shares the engine); `serve` repairs or
+supersedes the pointer itself too (see Start). Version rule (`engine_paths.should_replace`): a candidate
+replaces the pointer when there is no usable pointer (root missing, python not an executable
+file), when the wanted project kind differs (`tts` vs `tts-gpu`), or when its version is
+**strictly higher** (numeric, dot by dot); an equal or lower version keeps the pointer, so a
+dev checkout never flips an installed engine. With `engine_plugin_root` set, only that
+directory may become the pointer, and it replaces when the current root differs. A shim from
+an older plugin never overwrites that of a newer pointer.
+
+#### systemd units (Linux, `setup_tts.py --share-engine [PORT]` / `--unshare-engine`)
+
+`install-service` writes `~/.config/systemd/user/voiceover-engine.socket` and
+`voiceover-engine.service` (under `$XDG_CONFIG_HOME` when set), reloads systemd and enables
+the socket. The socket unit has `ListenStream=<engine.sock>` (plus `ListenStream=127.0.0.1:<port>` when
+`engine_port` is set), `SocketMode=0600`, `DirectoryMode=0700`, `NoDelay=true`, `Accept=no`,
+`WantedBy=sockets.target`. The service unit has
+`ExecStart=<system python3> <shim> serve` and `Environment=VOICEOVER_DATA_DIR=...` when the
+data dir is overridden, and no `Restart=`: the engine exits when idle and the socket starts it
+again. The interpreter is a stable system `python3`, never the plugin's own or a `.venv`.
+`%` is doubled in every value; `$` is doubled only in `ExecStart` (systemd expands `$`
+only in Exec lines). `setup_tts.py --share-engine` also creates the token, without printing it
+(so it never lands in a Claude Code transcript), says to run `voiceover-engine token` in the
+user's own terminal, and warns when `loginctl` shows lingering off (the engine then stops at
+logout). `--unshare-engine` removes the units, clears `engine_port` (so a self-started engine
+binds no TCP port afterwards) and stops the engine.
+
+### Reference numbers
+
+Measured through a proxy with the stub synthesizer (a boxed my_agent probe):
+spawn to `hello` 247 ms median; `start` to first audio frame 5.4 ms (server overhead only);
+`SIGTERM` to a new client's first frame 301 ms (stub), 687 ms with a 450 ms-per-sentence
+synthesizer; `cancel` to `end`/`cancelled` median 2.3 ms; a live caller waits for one in-flight
+sentence.
 
 ## hooks/
 
@@ -523,7 +817,7 @@ All commands invoke scripts with `"${CLAUDE_PLUGIN_ROOT}/scripts/<script>.py"` p
 
 ## .claude-plugin/
 
-- `plugin.json` — name "voiceover", displayName "Claude Voiceover", version 1.5.0,
+- `plugin.json` — name "voiceover", displayName "Claude Voiceover", version 1.6.0,
   description packed with search terms (voice, text-to-speech, TTS, narration, notification
   sounds, Kokoro, offline, local), author Hanan (okets), homepage/repository
   https://github.com/okets/claude-voiceover, license MIT.
