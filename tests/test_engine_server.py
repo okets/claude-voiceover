@@ -196,8 +196,12 @@ t = time.time()
 c.send({"op": "cancel", "id": "long"})
 end = c.read_until_end("long")[-1]
 check("cancelled within 0.3 s", end["reason"] == "cancelled" and time.time() - t < 0.3, end)
+time.sleep(0.2)  # long enough for the sentence that was in flight to finish rendering
 c.send({"op": "start", "id": "next", "voice": "bf_emma", "text": "Hi.", "end": True})
-check("next served, no stray ids", {e["id"] for e in c.read_until_end("next")} == {"next"})
+after_cancel = c.read_until_end("next")
+check("next served, no stray ids", {e["id"] for e in after_cancel} == {"next"})
+check("no audio frame for an id after its end(cancelled)",
+      not [e for e in after_cancel if e.ev == "audio" and e["id"] == "long"])
 
 c.send({"op": "start", "id": "a", "voice": "bf_emma", "text": "Word. " * 30})
 c.send({"op": "start", "id": "b", "voice": "bf_emma", "text": "Word. " * 30})
@@ -211,6 +215,20 @@ check("active id reuse -> bad_request", c.read_error()["code"] == "bad_request")
 c.send({"op": "cancel", "id": "dup"})
 check("the original dup is still cancellable", c.read_until_end("dup")[-1]["reason"] == "cancelled")
 
+# --- requests on one connection are served in start order -------------------------------------------
+c.send({"op": "start", "id": "A", "voice": "bf_emma"})
+c.send({"op": "text", "id": "A", "text": "One. Tw"})
+c.send({"op": "start", "id": "B", "voice": "bf_emma", "text": "Bee. Bee.", "end": True})
+first = c.read_event()
+check("the head request renders while a later one waits", first.ev == "audio" and first["id"] == "A")
+c.send({"op": "text", "id": "A", "text": "o."})
+c.send({"op": "end", "id": "A"})
+order = [first] + c.read_until_end("B")
+ids = [e["id"] for e in order if e.ev in ("audio", "end")]
+check("all of A's audio and its end arrive before any of B's audio",
+      ids == ["A", "A", "A", "B", "B", "B"] and order[-1]["reason"] == "complete"
+      and [e["reason"] for e in order if e.ev == "end"] == ["complete", "complete"], ids)
+
 # --- errors -----------------------------------------------------------------------------------------
 check("unknown voice", err_for(c, {"voice": "zz_top"}) == "unknown_voice")
 check("bad speed", err_for(c, {"speed": 3.0}) == "bad_speed")
@@ -222,6 +240,12 @@ check("speed 2.0 accepted", end_for(c, {"speed": 2.0, "text": "Hi.", "end": True
 before = synth.synth_calls
 end_for(c, {"text": " \n ", "end": True})
 check("whitespace-only makes no synthesis call", synth.synth_calls == before)
+c.send({"op": "start", "id": "fl", "voice": "bf_emma"})
+for bad_n in ({}, {"n": "1"}, {"n": True}):
+    c.send(dict({"op": "flush", "id": "fl"}, **bad_n))
+    check("flush without an integer n -> bad_request %r" % bad_n, c.read_error()["code"] == "bad_request")
+c.send({"op": "cancel", "id": "fl"})
+c.read_until_end("fl")
 c.send({"op": "frobnicate"})
 check("unknown op -> bad_request", c.read_error()["code"] == "bad_request")
 c.send({"op": "text", "id": "nobody", "text": "x"})
@@ -295,6 +319,10 @@ t = time.time()
 status = fresh_status(path)
 check("status answers while the model is loading", status["loaded"] is False and time.time() - t < 0.4)
 check("request completes after the load", c.read_until_end("slowload")[-1]["reason"] == "complete")
+stop_server(srv)
+srv, path = start_server(SineSynth(load_delay=0.6))  # a fresh model: the request is still waiting for it
+c = Raw(path)
+c.hello()
 c.send(start_line(id="gone", text="Hi.", end=True))
 c.send({"op": "cancel", "id": "gone"})
 check("cancel before activation ends the request once", c.read_until_end("gone")[-1]["reason"] == "cancelled")
@@ -338,6 +366,57 @@ while time.time() < deadline and not dropped:
 check("a reader that never reads is dropped within 2 s", dropped, "elapsed %.2f" % (time.time() - t))
 stop_server(srv)
 
+# --- a stalled reader is not rendered for beyond the buffer limit; a reader that drains is not dropped ----
+SENTENCE_BYTES = 40 * 2880
+synth = SineSynth()
+srv, path = start_server(synth, slow_reader_s=0.6, out_buffer_bytes=65536)
+slow = Raw(path)
+slow.hello()
+slow.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+slow.send(start_line(id="flood", text=("word " * 39 + "word. ") * 24, end=True))
+time.sleep(0.3)
+conn = next(iter(srv._conns))
+check("a non-reading caller's buffer stays bounded: limit + the sentence that tripped it",
+      conn.buffered_bytes() <= 65536 + SENTENCE_BYTES and synth.synth_calls < 24,
+      (conn.buffered_bytes(), synth.synth_calls))
+slow.sock.settimeout(5)
+got = slow.read_until_end("flood")
+check("a reader that drains in time gets everything and is not dropped",
+      got[-1]["reason"] == "complete" and got[-1]["samples"] == 24 * 40 * 1440, got[-1])
+time.sleep(1.0)  # well past slow_reader_s since the stall began
+check("the drained caller is still connected", srv.snapshot()["callers"] == 1)
+slow.send({"op": "status"})
+check("and still answers", slow.read_event().ev == "status")
+stop_server(srv)
+
+# --- a failure in loop-side work ends that request only (M7) ----------------------------------------------
+class FlakyVoiceSynth(SineSynth):
+    def default_speed(self, voice):
+        if voice == "af_sky":
+            raise RuntimeError("no speed for this voice")
+        return 1.0
+
+
+srv, path = start_server(FlakyVoiceSynth(load_delay=0.2))
+c, d = Raw(path), Raw(path)
+c.hello(); d.hello()
+real_stderr, sys.stderr = sys.stderr, io.StringIO()
+c.send(start_line(id="bad", voice="af_sky", text="Hi.", end=True))
+d.send(start_line(id="good", text="Hi.", end=True))
+bad = c.read_until_end("bad")
+good = d.read_until_end("good")
+logged, sys.stderr = sys.stderr.getvalue(), real_stderr
+check("a request whose activation raises ends with synthesis_failed, while loading",
+      [e["code"] for e in bad if e.ev == "error"] == ["synthesis_failed"] and bad[-1]["reason"] == "error")
+check("the others waiting on the same load still complete", good[-1]["reason"] == "complete")
+real_stderr, sys.stderr = sys.stderr, io.StringIO()
+c.send(start_line(id="bad2", voice="af_sky", text="Hi.", end=True))
+bad2 = c.read_until_end("bad2")
+sys.stderr = real_stderr
+check("and when the model is already loaded", bad2[-1]["reason"] == "error" and "no speed" in logged)
+check("the connection stays usable", end_for(c, {"text": "Hi.", "end": True}) == ("complete", 1440))
+stop_server(srv)
+
 # --- request_exit ---------------------------------------------------------------------------------------------------
 srv, path = start_server(SineSynth(synth_delay=0.1))
 c = Raw(path)
@@ -358,8 +437,8 @@ c.send(start_line(id="rel", text="Word. " * 20, end=True))
 c.read_event()
 srv.request_exit("release")
 tail = c.read_until_end("rel")
-check("release ends open requests with released",
-      tail[-1]["reason"] == "error" and [e["code"] for e in tail if e.ev == "error"] == ["released"])
+check("a release exit ends open requests with restarting, like any other exit",
+      tail[-1]["reason"] == "error" and [e["code"] for e in tail if e.ev == "error"] == ["restarting"])
 srv.thread.join(5)
 
 srv, path = start_server(SineSynth(synth_delay=0.1))

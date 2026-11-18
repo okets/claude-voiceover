@@ -7,6 +7,7 @@ the slow-reader watchdog and op dispatch; request state lives in EngineServer.
 
 import asyncio
 import sys
+import time
 import traceback
 from itertools import count
 
@@ -14,6 +15,7 @@ from engine_protocol import (AUDIO, BadLine, LIMITS, LineReader, PROTOCOL,
                              audio_header, encode_line)
 
 READ_SIZE = 65536
+WATCH_INTERVAL_S = 0.1
 _connection_ids = count(1)
 
 
@@ -32,6 +34,7 @@ class Connection:
         self._out_limit = out_buffer_bytes
         self._slow_reader_s = slow_reader_s
         self._slow_timer = None
+        self._over_since = None  # when the output buffer last went over its limit
         self._said_hello = False
         self._closing = False
         self._ops = {
@@ -92,16 +95,32 @@ class Connection:
         transport.write(data)
         self._watch_buffer(transport)
 
-    def _watch_buffer(self, transport):
-        if self._slow_timer is None and transport.get_write_buffer_size() > self._out_limit:
-            loop = asyncio.get_running_loop()
-            self._slow_timer = loop.call_later(self._slow_reader_s, self._drop_if_still_stalled)
+    def buffered_bytes(self):
+        return self._writer.transport.get_write_buffer_size()
 
-    def _drop_if_still_stalled(self):
+    def _watch_buffer(self, transport):
+        """Over the limit: stop rendering for this caller, and time how long it stays over."""
+        if self._over_since is None and self.buffered_bytes() > self._out_limit:
+            self._over_since = time.monotonic()
+            self._server.set_blocked(self.id, True)
+            self._schedule_tick()
+
+    def _schedule_tick(self):
+        interval = min(WATCH_INTERVAL_S, self._slow_reader_s / 10)
+        self._slow_timer = asyncio.get_running_loop().call_later(interval, self._tick)
+
+    def _tick(self):
         self._slow_timer = None
         transport = self._writer.transport
-        if not transport.is_closing() and transport.get_write_buffer_size() > self._out_limit:
+        if transport.is_closing():
+            return
+        if self.buffered_bytes() <= self._out_limit:
+            self._over_since = None  # drained: the stall period is over
+            self._server.set_blocked(self.id, False)
+        elif time.monotonic() - self._over_since >= self._slow_reader_s:
             transport.abort()
+        else:
+            self._schedule_tick()
 
     def send(self, obj):
         self.write(encode_line(obj))

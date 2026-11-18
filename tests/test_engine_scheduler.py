@@ -74,4 +74,16 @@ check("a cancelled connection is skipped mid-round", s.next() is None and not s.
 
 check("pending counts queued jobs", (lambda q: (q.add(job("A")), q.add(job("A")), q.pending("A"))[2])(Scheduler()) == 2)
 
+# --- exclude: skipped for this pick, place kept ----------------------------------------------
+s = Scheduler(); s.add(job("A", text="a1")); s.add(job("B", text="b1")); s.add(job("A", text="a2"))
+check("an excluded connection is skipped", s.next(exclude={"A"}).text == "b1")
+check("with only excluded work, next is None and the work stays", s.next(exclude={"A"}) is None and s.pending("A") == 2)
+check("an excluded connection keeps its place once allowed again", [j.text for j in drain(s)] == ["a1", "a2"])
+s = Scheduler(); s.add(job("A", text="a1")); s.add(job("B", text="b1"))
+s.next(exclude={"A"})
+s.add(job("C", text="c1"))
+check("newcomers are served while another connection stays excluded", s.next(exclude={"A"}).text == "c1")
+s = Scheduler(); s.add(job("A", text="a1")); s.add(job("B", text="b1"))
+check("exclude does not reorder the others", [s.next(exclude={"A"}).text, s.next().text] == ["b1", "a1"])
+
 report()

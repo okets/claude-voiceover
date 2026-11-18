@@ -33,7 +33,7 @@ DEFAULT_LANG = "en-us"
 SHUTDOWN_WAIT_S = 2.0
 
 # Exit reason -> how a request still open at that moment ends: (error code or None, end reason).
-_EXIT_ENDINGS = {"stop": (None, "cancelled"), "release": ("released", "error")}
+_EXIT_ENDINGS = {"stop": (None, "cancelled")}
 _DEFAULT_EXIT_ENDING = ("restarting", "error")
 
 
@@ -106,7 +106,9 @@ class EngineServer:
         self._cond = threading.Condition()
         self._scheduler = Scheduler()
         self._registry = {}                   # (conn id, request id) -> Request
+        self._blocked = frozenset()           # connections whose output buffer is over its limit
         self._load_wanted = False
+        self._delivery_pending = False        # a rendered sentence has not reached the loop yet
         self._shutting_down = False
         # Exit handshake:
         self._exit_lock = threading.Lock()
@@ -197,9 +199,16 @@ class EngineServer:
         """The caller is gone: drop its queued work and discard what is in flight."""
         self._conns.discard(conn)
         for req in list(conn.requests.values()):
-            self._forget(req)
+            self._forget(req, promote=False)
         with self._cond:
             self._scheduler.cancel(conn.id)
+            self._blocked -= {conn.id}
+
+    def set_blocked(self, conn_id, blocked):
+        """A caller's output buffer went over (or back under) its limit: stop/resume rendering for it."""
+        with self._cond:
+            self._blocked = self._blocked | {conn_id} if blocked else self._blocked - {conn_id}
+            self._cond.notify()
 
     def snapshot(self):
         """What hello and status report."""
@@ -247,7 +256,7 @@ class EngineServer:
         if req.ended:
             return
         if self._synth.loaded:
-            self._activate(req)
+            self._guarded(req, self._activate, req)
         else:
             self._await_model(req)
 
@@ -271,7 +280,9 @@ class EngineServer:
 
     def flush_request(self, conn, msg):
         req = self._find(conn, msg)
-        if req:
+        if req and (not isinstance(msg.get("n"), int) or isinstance(msg.get("n"), bool)):
+            conn.send_error("bad_request", "flush needs an integer n", req.id)
+        elif req:
             self._add_sentences(req, req.text.drain())
             req.markers.append((req.queued, msg.get("n")))
             self._release_markers(req)
@@ -305,10 +316,18 @@ class EngineServer:
     def _add_sentences(self, req, sentences):
         for sentence in sentences:
             req.queued += 1
-            if req.ready:
+            if self._may_render(req):
                 self._enqueue(req, sentence)
             else:
                 req.held.append(sentence)
+
+    @staticmethod
+    def _is_head(req):
+        """Requests on a connection are served in start order: only the oldest one renders."""
+        return next(iter(req.conn.requests.values()), None) is req
+
+    def _may_render(self, req):
+        return req.ready and self._is_head(req)
 
     def _enqueue(self, req, sentence):
         with self._cond:
@@ -335,7 +354,7 @@ class EngineServer:
             if error:
                 self._fail(req, *error)
             else:
-                self._activate(req)
+                self._guarded(req, self._activate, req)
 
     def _activate(self, req):
         """The model is loaded: check the voice, then let the request's sentences run."""
@@ -345,16 +364,39 @@ class EngineServer:
         if req.speed is None:
             req.speed = self._synth.default_speed(req.voice)
         req.ready = True
-        held, req.held = req.held, []
-        for sentence in held:
-            self._enqueue(req, sentence)
-        self._maybe_finish(req)
+        self._release(req)
+
+    def _release(self, req):
+        """Hand a ready head request its buffered sentences, and finish it if nothing is left."""
+        if self._may_render(req):
+            held, req.held = req.held, []
+            for sentence in held:
+                self._enqueue(req, sentence)
+            self._release_markers(req)
+            self._maybe_finish(req)
 
     # --- results (loop thread) ---------------------------------------------------------------
 
     def _rendered(self, req, pcm, error):
-        if req.ended:
-            return  # cancelled or dropped while this sentence was in flight
+        """One sentence at a time: the worker renders the next only after this one is
+        written, so the output-buffer check below always sees every rendered byte."""
+        try:
+            if not req.ended:  # else cancelled or dropped while this sentence was in flight
+                self._guarded(req, self._deliver, req, pcm, error)
+        finally:
+            with self._cond:
+                self._delivery_pending = False
+                self._cond.notify()
+
+    def _guarded(self, req, work, *args):
+        """Run loop-side work for one request; a failure ends that request only (M7)."""
+        try:
+            work(*args)
+        except Exception as exc:
+            traceback.print_exc(file=sys.stderr)
+            self._fail(req, "synthesis_failed", "internal error: %s" % exc)
+
+    def _deliver(self, req, pcm, error):
         if error:
             self._fail(req, "synthesis_failed", error)
             return
@@ -367,12 +409,12 @@ class EngineServer:
         self._maybe_finish(req)
 
     def _release_markers(self, req):
-        while req.markers and req.markers[0][0] <= req.done:
+        while self._is_head(req) and req.markers and req.markers[0][0] <= req.done:
             _, n = req.markers.pop(0)
             req.conn.send({"ev": "flushed", "id": req.id, "n": n})
 
     def _maybe_finish(self, req):
-        if req.ready and req.input_ended and req.done == req.queued and not req.ended:
+        if self._is_head(req) and req.ready and req.input_ended and req.done == req.queued and not req.ended:
             self._finish(req, "complete")
 
     def _fail(self, req, code, message):
@@ -387,12 +429,20 @@ class EngineServer:
         self._forget(req)
         req.conn.send_end(req.id, reason, req.samples)
 
-    def _forget(self, req):
+    def _forget(self, req, promote=True):
         req.ended = True
         req.conn.requests.pop(req.id, None)
         with self._cond:
             self._registry.pop((req.conn.id, req.id), None)
             self._scheduler.cancel(req.conn.id, req.id)
+        if promote:
+            self._promote(req.conn)
+
+    def _promote(self, conn):
+        """The head request ended: the next one becomes head and may render."""
+        head = next(iter(conn.requests.values()), None)
+        if head is not None:
+            self._guarded(head, self._release, head)
 
     def _end_everything(self, exit_reason):
         code, reason = _EXIT_ENDINGS.get(exit_reason, _DEFAULT_EXIT_ENDING)
@@ -422,9 +472,10 @@ class EngineServer:
                 if self._load_wanted:
                     self._load_wanted = False
                     return "load", None, None
-                job = self._scheduler.next()
+                job = None if self._delivery_pending else self._scheduler.next(self._blocked)
                 req = self._registry.get((job.conn, job.req)) if job else None
                 if req is not None:
+                    self._delivery_pending = True
                     return "job", req, job
                 if job is None:
                     self._cond.wait()

@@ -34,9 +34,11 @@ class Scheduler:
             self._waiting_since[job.conn] = next(self._tickets)
         self._queues[job.conn].append(job)
 
-    def next(self):
-        """The next job to synthesize, or None when nothing is queued."""
-        conn = self._next_conn()
+    def next(self, exclude=()):
+        """The next job to synthesize, or None when nothing is queued.
+
+        Connections in `exclude` are skipped for this pick and keep their place."""
+        conn = self._next_conn(exclude)
         if conn is None:
             return None
         job = self._queues[conn].popleft()
@@ -61,14 +63,16 @@ class Scheduler:
 
     # --- internals ---------------------------------------------------------
 
-    def _next_conn(self):
-        while True:
+    def _next_conn(self, exclude):
+        """Serve the current round; when it holds no eligible connection, start a fresh one."""
+        for _ in range(2):
             self._round = [c for c in self._round if c in self._queues]
-            if self._round:
-                return self._round.pop(0)
-            if not self._queues:
-                return None
+            pick = next((c for c in self._round if c not in exclude), None)
+            if pick is not None:
+                self._round.remove(pick)
+                return pick
             self._round = self._ordered_conns()
+        return None
 
     def _ordered_conns(self):
         """Live heads first, then by when each connection started waiting."""
