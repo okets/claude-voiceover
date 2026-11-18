@@ -54,11 +54,12 @@ def _choose_synth(stub: bool):
 
 def main(argv) -> int:
     stub = "--stub" in argv
+    synth = _choose_synth(stub)   # construction stays cheap: the model loads later, on demand
     listeners, _lock_fd = _choose_listeners()
     if listeners is None:
         _log("another engine holds the lock; exiting")
         return 0
-    server = EngineServer(_choose_synth(stub), idle_unload_s=engine_paths.idle_unload_seconds(),
+    server = EngineServer(synth, idle_unload_s=engine_paths.idle_unload_seconds(),
                           token=engine_paths.read_or_create_token(),
                           plugin_version=_plugin_version(_PLUGIN_ROOT),
                           plugin_root=str(_PLUGIN_ROOT))

@@ -42,6 +42,9 @@ def main(argv) -> int:
     if not root:
         print("voiceover-engine: no engine installed (no current.json)", file=sys.stderr)
         return 1
+    if not (Path(root) / "tts" / "engine_launcher.py").is_file():
+        print("voiceover-engine: plugin not found at %s" % root, file=sys.stderr)
+        return 1
     sys.path.insert(0, str(Path(root) / "tts"))
     import engine_launcher
     return engine_launcher.main(rest)

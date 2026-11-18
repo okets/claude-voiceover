@@ -4,7 +4,9 @@
 EngineConnection owns one socket. A reader thread routes audio/end/error events
 to the Pending they belong to by id; events without an id (hello, status,
 released, id-less errors) go to a reply queue that the synchronous calls wait
-on. Sends are serialised by one lock, so any thread may call any method.
+on. Sync calls (status, release) hold one lock across send and reply and drain stale
+replies first, so concurrent or late replies never cross. Sends are serialised by
+a lock, so any thread may call any method.
 """
 
 import fcntl
@@ -99,6 +101,8 @@ class EngineConnection:
         self._lock = threading.Lock()       # guards _pending and alive
         self._pending = {}
         self._replies = queue.Queue()
+        self._sync_lock = threading.Lock()   # one sync call at a time: send + reply
+        self._warms_open = 0                 # warm ops whose reply is still due; guarded by _lock
         self._ids = itertools.count(1)
         self.alive = True
         self._reader = threading.Thread(target=self._read_loop, name="engine-client", daemon=True)
@@ -150,8 +154,18 @@ class EngineConnection:
                 del self._pending[req_id]
         if pending is not None:
             self._deliver(pending, name, event, payload)
-        elif req_id is None and name != "warm":
+        elif req_id is None and not self._fire_and_forget_reply(name):
             self._replies.put(event)
+
+    def _fire_and_forget_reply(self, name):
+        """True for the reply (or error) of a warm op, which nobody waits for."""
+        if name not in ("warm", "error"):
+            return False
+        with self._lock:
+            if self._warms_open == 0:
+                return False
+            self._warms_open -= 1
+        return True
 
     @staticmethod
     def _deliver(pending, name, event, payload):
@@ -196,9 +210,22 @@ class EngineConnection:
             if event.get("ev") == "error":
                 raise EngineError(event.get("code", "error"), event.get("message", ""))
 
+    def _drain_replies(self):
+        """Drop replies left over from earlier calls (late, or from fire-and-forget ops)."""
+        while True:
+            try:
+                event = self._replies.get_nowait()
+            except queue.Empty:
+                return
+            if event is _CLOSED:
+                self._replies.put(_CLOSED)
+                return
+
     def _call(self, op, expected):
-        self._send(op)
-        return self._reply(expected)
+        with self._sync_lock:
+            self._drain_replies()
+            self._send(op)
+            return self._reply(expected)
 
     # --- public ops --------------------------------------------------------------
 
@@ -226,7 +253,14 @@ class EngineConnection:
         self._send({"op": "cancel", "id": p.id})
 
     def warm(self, hold_s: float = 0) -> None:
-        self._send({"op": "warm", "hold_s": hold_s})
+        with self._lock:
+            self._warms_open += 1
+        try:
+            self._send({"op": "warm", "hold_s": hold_s})
+        except EngineError:
+            with self._lock:
+                self._warms_open -= 1
+            raise
 
     def status(self) -> dict:
         return self._call({"op": "status"}, {"status"})
@@ -269,25 +303,56 @@ def _serve_command(plugin_root: Path):
 
 
 def _spawn(plugin_root: Path):
+    """Start a detached engine; the Popen, or None if it could not be started."""
     command = _serve_command(plugin_root)
     if os.environ.get(_STUB_ENV) == "1":
         command.append("--stub")
-    with open(engine_paths.log_path(), "ab") as log:
-        subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                         start_new_session=True, close_fds=True)
+    try:
+        with open(engine_paths.log_path(), "ab") as log:
+            return subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                    start_new_session=True, close_fds=True)
+    except OSError:
+        return None
+
+
+def _acquire_start_lock(lock, deadline):
+    """flock start.lock without blocking past the deadline; True when held."""
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(CONNECT_POLL_S)
+
+
+def _start_and_wait(plugin_root, deadline):
+    """Under start.lock: spawn unless an engine appeared, then poll until it answers."""
+    if _reachable():
+        return True
+    child = _spawn(plugin_root)
+    if child is None:
+        return False
+    while time.monotonic() < deadline:
+        if _reachable():
+            return True
+        child.poll()    # reap it if it exits (e.g. another engine won the lock)
+        time.sleep(CONNECT_POLL_S)
+    return False
 
 
 def ensure(plugin_root: Path, timeout: float = 10.0) -> bool:
-    """True once an engine answers; starts one (single-flight under start.lock) if needed."""
+    """True once an engine answers; starts one (single-flight under start.lock) if needed.
+    Never blocks past `timeout`, and a last probe settles a deadline that passed mid-wait."""
     deadline = time.monotonic() + timeout
     if _reachable():
         return True
-    with open(engine_paths.start_lock_path(), "a+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        if not _reachable():
-            _spawn(plugin_root)
-        while time.monotonic() < deadline:
-            if _reachable():
-                return True
-            time.sleep(CONNECT_POLL_S)
-    return False
+    try:
+        lock = open(engine_paths.start_lock_path(), "a+")
+    except OSError:
+        return False
+    with lock:
+        if _acquire_start_lock(lock, deadline) and _start_and_wait(plugin_root, deadline):
+            return True
+    return _reachable()
