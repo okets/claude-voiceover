@@ -59,7 +59,7 @@ def _install_shim() -> None:
     if _newer_than_own(engine_paths.read_pointer()):
         return
     wanted = (speech._TTS_DIR / _SHIM_NAME).read_bytes()
-    target = data_dir() / "bin" / "voiceover-engine"
+    target = engine_paths.shim_path()
     try:
         if target.read_bytes() == wanted:
             return
@@ -70,6 +70,9 @@ def _install_shim() -> None:
     temp.write_bytes(wanted)
     os.chmod(str(temp), _SHIM_MODE)
     os.replace(str(temp), str(target))
+
+
+install_shim = _install_shim   # public name for setup, which installs the shim before the unit uses it
 
 
 def _candidate_root(plugin_root: Path, override) -> Path:

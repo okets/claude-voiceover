@@ -32,6 +32,11 @@ def socket_path() -> Path:
     return _file("engine.sock")
 
 
+def shim_path() -> Path:
+    """<data>/bin/voiceover-engine, the launcher shim the systemd unit executes."""
+    return engine_common.data_dir() / "bin" / "voiceover-engine"
+
+
 def lock_path() -> Path:
     return _file("engine.lock")
 

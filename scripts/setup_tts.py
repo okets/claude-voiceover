@@ -5,6 +5,8 @@ Usage:
     setup_tts.py                Print a status report and next steps
     setup_tts.py --download     Download the Kokoro models (~300MB, one time)
     setup_tts.py --test         Speak a sample line through the resolved engine
+    setup_tts.py --share-engine [PORT]   Linux: serve the engine to other programs (systemd)
+    setup_tts.py --unshare-engine        Undo --share-engine
 
 Checks tooling (uv, audio playback), reuses an existing ~/.kokoro-tts cache,
 and never re-downloads models that are already present. Stdlib only.
@@ -14,6 +16,7 @@ import argparse
 import os
 import platform
 import shutil
+import socket
 import subprocess
 import sys
 import urllib.request
@@ -21,8 +24,11 @@ from pathlib import Path
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PLUGIN_ROOT))
+sys.path.insert(0, str(PLUGIN_ROOT / "tts"))
 
-from voiceover import settings  # noqa: E402
+import engine_launcher  # noqa: E402
+import engine_paths  # noqa: E402
+from voiceover import engine_pointer, settings  # noqa: E402
 from voiceover.speech import kokoro_command  # noqa: E402
 
 KOKORO_DIR = Path.home() / ".kokoro-tts" / "models"
@@ -30,6 +36,10 @@ MODEL_FILES = {
     "kokoro-v1.0.onnx": "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx",
     "voices-v1.0.bin": "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin",
 }
+
+FIRST_SHARE_PORT = 47320
+LAST_PORT = 65535
+TOKEN_NOTE = "Put this token in your assistant's secrets; `voiceover-engine token` shows it again."
 
 LINUX_PLAYERS = ["ffplay", "aplay", "paplay", "mpv"]
 
@@ -162,12 +172,95 @@ def speak_test():
         return False
 
 
+def port_is_free(port):
+    """True when 127.0.0.1:port can be bound right now (the probe socket is closed at once)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        try:
+            probe.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
+def first_free_port(start=FIRST_SHARE_PORT):
+    return next((port for port in range(start, LAST_PORT + 1) if port_is_free(port)), None)
+
+
+def run_loginctl(*args):
+    """loginctl's stdout, or None when it cannot run. Tests replace this."""
+    try:
+        done = subprocess.run(["loginctl", *args], capture_output=True, text=True, timeout=30,
+                              stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout if done.returncode == 0 else None
+
+
+def linger_enabled(user):
+    out = run_loginctl("show-user", user, "-p", "Linger")
+    return out is not None and out.strip() == "Linger=yes"
+
+
+def warn_if_no_linger():
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+    if linger_enabled(user):
+        return
+    print("Warning: lingering is off for %s, so the engine stops when you log out." % user)
+    print("  To keep it available after logout, run:  loginctl enable-linger %s" % user)
+
+
+def _launcher(*argv):
+    return engine_launcher.main(list(argv))
+
+
+def share_engine(requested_port=None):
+    """Opt in to sharing the engine: port, prepared environment, systemd units, token. Returns an exit code."""
+    if not sys.platform.startswith("linux"):
+        print("--share-engine is Linux only (it uses systemd user units).")
+        return 1
+    if requested_port is not None and not port_is_free(requested_port):
+        print("Port %d is already in use on 127.0.0.1; pick another with --share-engine PORT." % requested_port)
+        return 1
+    port = requested_port if requested_port is not None else first_free_port()
+    if port is None or not settings.set_setting("engine_port", port):
+        print("Could not choose or save a TCP port for the engine.")
+        return 1
+    project = engine_launcher._default_project(PLUGIN_ROOT, engine_paths.read_global_settings())
+    if _launcher("prepare", str(PLUGIN_ROOT), "--project", str(project)) != 0:
+        print("Could not prepare the engine environment (is uv installed?).")
+        return 1
+    engine_pointer.install_shim()
+    if _launcher("install-service") != 0:
+        print("Could not install the systemd units.")
+        return 1
+    print("Engine shared on 127.0.0.1:%d and %s" % (port, engine_paths.socket_path()))
+    warn_if_no_linger()
+    print("Token: %s" % engine_paths.read_or_create_token())
+    print(TOKEN_NOTE)
+    return 0
+
+
+def unshare_engine():
+    code = _launcher("uninstall-service")
+    settings.set_setting("engine_port", None)
+    _launcher("stop")
+    print("Engine no longer shared." if code == 0 else "Could not remove the systemd units.")
+    return 0 if code == 0 else 1
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="setup_tts.py", description="Claude Voiceover first-run setup")
     parser.add_argument("--download", action="store_true", help="Download Kokoro models (~300MB, skips files already cached)")
     parser.add_argument("--test", action="store_true", help="Speak a sample line to verify audio")
+    parser.add_argument("--share-engine", nargs="?", const=0, type=int, metavar="PORT",
+                        help="Linux: share the engine over a systemd socket (and 127.0.0.1:PORT; default first free from 47320)")
+    parser.add_argument("--unshare-engine", action="store_true", help="Remove the systemd units and the engine port")
     args = parser.parse_args(argv)
 
+    if args.share_engine is not None:
+        return share_engine(args.share_engine or None)
+    if args.unshare_engine:
+        return unshare_engine()
     if args.download:
         ok = download_models()
         if not ok:

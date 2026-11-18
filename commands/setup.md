@@ -42,6 +42,14 @@ Walk the user through getting narration working. Arguments: `$ARGUMENTS`
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/setup_tts.py" --test
    ```
 
-6. Close with a one-line summary: which engine and voice are active, and that `/voiceover:level` adjusts how chatty the narration is.
+6. Optional: share the engine with another program (Linux): ask the user; if yes run:
+
+   ```bash
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/setup_tts.py" --share-engine
+   ```
+
+   Relay the token it prints and tell them to put it in their assistant's secrets (`voiceover-engine token` shows it again). `--unshare-engine` undoes it.
+
+7. Close with a one-line summary: which engine and voice are active, and that `/voiceover:level` adjusts how chatty the narration is.
 
 If the user previously used smarter-claude, point them at `/voiceover:migrate` to clean up the old install.

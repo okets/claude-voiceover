@@ -1,6 +1,6 @@
 # tts/engine_launcher.py
 """Command line for the shared Kokoro engine: serve, ensure, status, release,
-stop, token, rotate-token. Stdlib only.
+stop, token, rotate-token, install-service, uninstall-service, enable, disable. Stdlib only.
 
 Exit codes: 0 ok, 1 engine unreachable (prepare: failed), 2 usage.
 """
@@ -46,7 +46,7 @@ def _parser():
     sub.add_parser("status")
     release = sub.add_parser("release")
     release.add_argument("--keep-off", type=float, default=0.0)
-    for name in ("stop", "token", "rotate-token"):
+    for name in ("stop", "token", "rotate-token", "install-service", "uninstall-service", "enable", "disable"):
         sub.add_parser(name)
     return parser
 
@@ -232,8 +232,121 @@ def _rotate_token(args):
     return EXIT_OK
 
 
+# --- systemd user socket activation ------------------------------------------------------
+
+_UNIT_NAME = "voiceover-engine"
+_SOCKET_UNIT = _UNIT_NAME + ".socket"
+_SYSTEMCTL_TIMEOUT_S = 60
+
+
+def run_systemctl(*args) -> int:
+    """`systemctl --user <args>`; its exit code, or 1 when it cannot run. Tests replace this."""
+    try:
+        return subprocess.run(["systemctl", "--user", *args], stdin=subprocess.DEVNULL,
+                              timeout=_SYSTEMCTL_TIMEOUT_S).returncode
+    except (OSError, subprocess.SubprocessError):
+        return EXIT_UNREACHABLE
+
+
+def _quote(text) -> str:
+    """systemd splits ExecStart/Environment values on whitespace; quote only when it matters."""
+    text = str(text)
+    return '"%s"' % text.replace("\\", "\\\\").replace('"', '\\"') if any(c.isspace() for c in text) else text
+
+
+def socket_unit(sock: Path, port) -> str:
+    listen = ["ListenStream=%s" % sock] + (["ListenStream=127.0.0.1:%d" % port] if port else [])
+    lines = ["[Unit]", "Description=Voiceover shared Kokoro engine (socket)", "", "[Socket]"] + listen + [
+        "SocketMode=0600", "DirectoryMode=0700", "NoDelay=true", "Accept=no", "",
+        "[Install]", "WantedBy=sockets.target", ""]
+    return "\n".join(lines)
+
+
+def service_unit(python: str, shim: Path, data_dir_env) -> str:
+    env = ["Environment=%s" % _quote("VOICEOVER_DATA_DIR=%s" % data_dir_env)] if data_dir_env else []
+    lines = ["[Unit]", "Description=Voiceover shared Kokoro engine", "", "[Service]",
+             "ExecStart=%s %s serve" % (_quote(python), _quote(shim))] + env + [""]
+    return "\n".join(lines)
+
+
+def _unit_dir() -> Path:
+    config = os.environ.get("XDG_CONFIG_HOME")
+    return (Path(config) if config else Path.home() / ".config") / "systemd" / "user"
+
+
+def _unit_files() -> dict:
+    return {_UNIT_NAME + ".socket": _unit_dir() / (_UNIT_NAME + ".socket"),
+            _UNIT_NAME + ".service": _unit_dir() / (_UNIT_NAME + ".service")}
+
+
+def _linux_only() -> bool:
+    if sys.platform.startswith("linux"):
+        return True
+    print("voiceover-engine: systemd units are Linux only", file=sys.stderr)
+    return False
+
+
+def _install_service(args):
+    if not _linux_only():
+        return EXIT_UNREACHABLE
+    shim = engine_paths.shim_path()
+    if not shim.is_file():
+        print("voiceover-engine: launcher shim missing at %s (run setup first)" % shim, file=sys.stderr)
+        return EXIT_UNREACHABLE
+    texts = {_SOCKET_UNIT: socket_unit(engine_paths.socket_path(), engine_paths.engine_port()),
+             _UNIT_NAME + ".service": service_unit(sys.executable, shim, os.environ.get("VOICEOVER_DATA_DIR"))}
+    try:
+        _unit_dir().mkdir(parents=True, exist_ok=True)
+        for name, path in _unit_files().items():
+            path.write_text(texts[name], encoding="utf-8")
+    except OSError as error:
+        print("voiceover-engine: cannot write units: %s" % error, file=sys.stderr)
+        return EXIT_UNREACHABLE
+    return _enable_now_code(run_systemctl("daemon-reload"))
+
+
+def _enable_now_code(reload_code):
+    """After daemon-reload: enable --now the socket; EXIT_OK only when both succeed."""
+    if reload_code != 0:
+        return EXIT_UNREACHABLE
+    return EXIT_OK if run_systemctl("enable", "--now", _SOCKET_UNIT) == 0 else EXIT_UNREACHABLE
+
+
+def _uninstall_service(args):
+    if not _linux_only():
+        return EXIT_UNREACHABLE
+    run_systemctl("disable", "--now", _SOCKET_UNIT)
+    for path in _unit_files().values():
+        path.unlink(missing_ok=True)
+    run_systemctl("daemon-reload")
+    return EXIT_OK
+
+
+def _engine_answers() -> bool:
+    try:
+        engine_client.EngineConnection.connect().close()
+        return True
+    except (OSError, engine_client.EngineError):
+        return False
+
+
+def _enable(args):
+    """Hand the socket to systemd: a self-started engine holds engine.sock, so stop it first."""
+    if _engine_answers() and run_systemctl("is-active", _SOCKET_UNIT) != 0:
+        _stop(args)
+    return EXIT_OK if run_systemctl("enable", "--now", _SOCKET_UNIT) == 0 else EXIT_UNREACHABLE
+
+
+def _disable(args):
+    code = run_systemctl("disable", "--now", _SOCKET_UNIT)
+    _stop(args)
+    return EXIT_OK if code == 0 else EXIT_UNREACHABLE
+
+
 _COMMANDS = {"serve": _serve, "prepare": _prepare, "ensure": _ensure, "status": _status, "release": _release,
-             "stop": _stop, "token": _token, "rotate-token": _rotate_token}
+             "stop": _stop, "token": _token, "rotate-token": _rotate_token,
+             "install-service": _install_service, "uninstall-service": _uninstall_service,
+             "enable": _enable, "disable": _disable}
 
 
 def main(argv) -> int:
