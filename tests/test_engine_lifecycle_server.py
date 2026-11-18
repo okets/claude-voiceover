@@ -118,7 +118,20 @@ c = Raw(nm_path)
 c.hello()
 c.send({"op": "warm"})
 check("warm: a missing model replies no_model", c.read_error()["code"] == "no_model")
+c.send({"op": "status"})
+check("warm: a failed load drops the hold", c.read_event()["leases"] == 0)
 nm.request_exit("stop")
+
+# a dead connection waiting on a slow load does not count as busy
+slow, slow_path = start_server(SineSynth(load_delay=1.5), idle_unload_s=0.3)
+c = Raw(slow_path)
+c.hello()
+c.send({"op": "warm"})
+time.sleep(0.1)
+c.close_abruptly()
+t0 = time.monotonic()
+check("warm: a waiter that disconnected does not block the idle exit",
+      wait_exit(slow, 3) == "idle", time.monotonic() - t0)
 
 # --- stop and release -----------------------------------------------------------
 srv.request_exit("stop")
@@ -148,6 +161,33 @@ c.send({"op": "release"})
 check("release without keep_off_s: replies and exits, no keep-off file",
       c.read_event().ev == "released" and wait_exit(srv, 3) == "release"
       and engine_paths.read_keep_off() is None)
+
+c = None
+srv, path = start_server(idle_unload_s=60)
+c = Raw(path)
+c.hello()
+c.send({"op": "release", "keep_off_s": "long"})
+check("release: a non-numeric keep_off_s is bad_request and the engine stays",
+      c.read_error()["code"] == "bad_request" and not srv.result)
+srv.request_exit("stop")
+wait_exit(srv, 3)
+
+
+class FlakyStatusSynth(SineSynth):
+    failures = 3
+
+    def status(self):
+        if self.failures > 0:
+            self.failures -= 1
+            raise RuntimeError("status broke")
+        return super().status()
+
+
+flaky = FlakyStatusSynth()
+flaky.load()
+srv, path = start_server(flaky, idle_unload_s=0.3, quiet_check_s=0.1)
+time.sleep(0.5)
+check("ticker: a raising status() does not stop the idle exit", wait_exit(srv, 3) == "idle", srv.result)
 
 # --- status ----------------------------------------------------------------------
 srv, path = start_server(idle_unload_s=42)

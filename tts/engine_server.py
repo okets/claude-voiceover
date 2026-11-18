@@ -27,6 +27,7 @@ import traceback
 from pathlib import Path
 
 import engine_paths
+from engine_common import engine_log
 from engine_connection import Connection
 from engine_lifecycle import LifecyclePolicy, QuietInputs, quiet_exit_reason
 from engine_protocol import LIMITS, PROTOCOL, split_frames
@@ -238,10 +239,18 @@ class EngineServer:
     async def _tick_lifecycle(self):
         while True:
             await asyncio.sleep(self._policy.tick_s)
-            reason = self._lifecycle_exit()
+            reason = self._guarded_lifecycle_exit()
             if reason:
                 self.request_exit(reason)
                 return
+
+    def _guarded_lifecycle_exit(self):
+        """A failing check is logged and skipped: the ticker must never die (VRAM would stay held)."""
+        try:
+            return self._lifecycle_exit()
+        except Exception as exc:
+            engine_log("error", "lifecycle check failed: %s: %s" % (type(exc).__name__, exc))
+            return None
 
     def _lifecycle_exit(self):
         if self._policy.idle_due(self._busy()):
@@ -266,11 +275,11 @@ class EngineServer:
         if not isinstance(hold_s, (int, float)) or isinstance(hold_s, bool):
             conn.send_error("bad_request", "hold_s must be a number")
             return
-        self._policy.hold(hold_s)
+        token = self._policy.hold(hold_s)
         if self._synth.loaded:
             self._send_warm(conn)
         else:
-            self._warm_waiters.append(conn)
+            self._warm_waiters.append((conn, token))
             self._request_load()
 
     def _send_warm(self, conn):
@@ -278,8 +287,11 @@ class EngineServer:
 
     def release(self, conn, msg):
         """`release`: leave for a while (keep-off), ending open requests with restarting."""
-        keep_off_s = msg.get("keep_off_s")
-        if isinstance(keep_off_s, (int, float)) and not isinstance(keep_off_s, bool) and keep_off_s > 0:
+        keep_off_s = msg.get("keep_off_s", 0)
+        if not isinstance(keep_off_s, (int, float)) or isinstance(keep_off_s, bool):
+            conn.send_error("bad_request", "keep_off_s must be a number")
+            return
+        if keep_off_s > 0:
             engine_paths.write_keep_off(keep_off_s, "release")
         conn.send({"ev": "released", "vram_mib": 0})
         self.request_exit("release")
@@ -361,6 +373,7 @@ class EngineServer:
     def drop_connection(self, conn):
         """The caller is gone: drop its queued work and discard what is in flight."""
         self._conns.discard(conn)
+        self._warm_waiters = [w for w in self._warm_waiters if w[0] is not conn]
         for req in list(conn.requests.values()):
             self._forget(req, promote=False)
         with self._cond:
@@ -534,8 +547,9 @@ class EngineServer:
 
     def _answer_warm_waiters(self, error):
         waiters, self._warm_waiters = self._warm_waiters, []
-        for conn in waiters:
+        for conn, token in waiters:
             if error:
+                self._policy.drop_hold(token)  # a failed load must not keep the engine alive
                 conn.send_error(*error)
             else:
                 self._send_warm(conn)

@@ -62,11 +62,19 @@ class LifecyclePolicy:
         self._last_activity = self._clock()
 
     def hold(self, hold_s):
-        """Keep the engine loaded for hold_s (capped); counts as activity."""
+        """Keep the engine loaded for hold_s (capped); counts as activity.
+        Returns a token for drop_hold, or None when there is nothing to hold."""
         self.note_activity()
         hold_s = min(max(hold_s, 0.0), MAX_HOLD_S)
-        if hold_s > 0:
-            self._holds.append(self._clock() + hold_s)
+        if hold_s <= 0:
+            return None
+        until = self._clock() + hold_s
+        self._holds.append(until)
+        return until
+
+    def drop_hold(self, token):
+        if token in self._holds:
+            self._holds.remove(token)
 
     def _live_holds(self):
         now = self._clock()
