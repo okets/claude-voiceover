@@ -51,6 +51,7 @@ class FakeKokoro:
 
 kokoro_voice.ensure_models = lambda: True
 kokoro_voice.DRY_RUN = False
+kokoro_voice.use_engine = lambda: False  # this file covers the in-process (Windows) path
 kokoro_voice.play_audio_file = lambda path, timeout=30: True
 kokoro_voice.playback_command = lambda path: [sys.executable, "-c", "pass"]
 fake = FakeKokoro()

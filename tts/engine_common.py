@@ -720,6 +720,7 @@ def drain(root, open_speaker, engine_names, lock_seconds=60.0,
             if item is None:
                 if lease_is_live(root):
                     keeper.keep()  # a session's turn is running: stay warm
+                    getattr(speaker, "idle", lambda: None)()
                     time.sleep(poll_seconds)
                     continue
                 remove_tts_lock(root)

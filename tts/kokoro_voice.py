@@ -33,7 +33,11 @@ from kokoro_model import (  # noqa: F401  moved; re-exported for existing caller
 from engine_common import (Playback, ProcessPlayback, data_dir, engine_log, global_setting, remove_tts_lock,
                            try_claim_lock, update_lock_expiry)
 
+if sys.platform != "win32":  # the engine client is POSIX-only; Windows keeps the in-process model
+    from engine_client import EngineConnection, EngineError, ensure
+
 DRY_RUN = bool(os.environ.get("VOICEOVER_DRY_RUN"))
+PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 
 PLAYBACK_GRACE_SECONDS = 10  # a clip's player may run this much past its length
 
@@ -345,24 +349,88 @@ class KokoroSpeaker:
             lang=settings["lang"], trim=settings["trim"])
 
 
+def use_engine() -> bool:
+    """Linux/macOS narrate through the shared engine; Windows loads the model itself."""
+    return sys.platform != "win32"
+
+
+def _speak_text_in_process(text, voice, use_streaming):
+    if not ensure_models():
+        return False
+    # Claim BEFORE the slow model load: callers and sibling engines must
+    # see this narration during the multi-second spin-up, not only once
+    # playback begins. play_samples() refreshes the expiry with the real
+    # audio duration and removes the lock when playback ends.
+    if not try_claim_lock(data_dir(), 10.0 + 0.4 * len(text.split())):
+        return True  # another narration is playing - skip quietly
+    try:
+        kokoro = load_kokoro()
+        if use_streaming:
+            return speak_streaming(kokoro, text, voice)
+        return speak_standard(kokoro, text, voice)
+    except Exception:
+        remove_tts_lock(data_dir())
+        raise
+
+
+def play_pcm(pcm, root):
+    """Play one block of engine audio as a wav; extends the lock, never removes it."""
+    from engine_speaker import write_wav
+
+    tmp_file = tempfile.NamedTemporaryFile(prefix="voiceover-oneshot-", suffix=".wav", delete=False)
+    tmp_path = tmp_file.name
+    tmp_file.close()
+    try:
+        duration = write_wav(tmp_path, pcm)
+        update_lock_expiry(root, duration + 20.0)
+        return play_audio_file(tmp_path, timeout=max(30, int(duration) + 10))
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def _speak_text_via_engine(text, voice, use_streaming):
+    if not try_claim_lock(data_dir(), 10.0 + 0.4 * len(text.split())):
+        return True  # another narration is playing - skip quietly
+    conn = None
+    try:
+        if not ensure(PLUGIN_ROOT):
+            log("[ERROR] The Kokoro engine is not available")
+            return False
+        conn = EngineConnection.connect()
+        pending = conn.submit(text, voice)
+        if use_streaming:
+            return _play_stream(pending)
+        pcm = pending.pcm()
+        if pending.error is not None:
+            raise pending.error
+        return play_pcm(pcm, data_dir()) if pcm else True
+    finally:
+        if conn is not None:
+            conn.close()
+        remove_tts_lock(data_dir())
+
+
+def _play_stream(pending):
+    """Play each frame group as one wav, as it arrives."""
+    played = False
+    while True:
+        chunk = pending.chunks.get()
+        if chunk is None:
+            break
+        played = play_pcm(chunk, data_dir()) or played
+    if pending.error is not None:
+        raise pending.error
+    return played or pending.reason == "complete"
+
+
 def speak_text(text, voice, use_streaming=False):
     try:
-        if not ensure_models():
-            return False
-        # Claim BEFORE the slow model load: callers and sibling engines must
-        # see this narration during the multi-second spin-up, not only once
-        # playback begins. play_samples() refreshes the expiry with the real
-        # audio duration and removes the lock when playback ends.
-        if not try_claim_lock(data_dir(), 10.0 + 0.4 * len(text.split())):
-            return True  # another narration is playing - skip quietly
-        try:
-            kokoro = load_kokoro()
-            if use_streaming:
-                return speak_streaming(kokoro, text, voice)
-            return speak_standard(kokoro, text, voice)
-        except Exception:
-            remove_tts_lock(data_dir())
-            raise
+        if use_engine():
+            return _speak_text_via_engine(text, voice, use_streaming)
+        return _speak_text_in_process(text, voice, use_streaming)
     except Exception as error:
         log("[ERROR] Speech failed: " + str(error))
         return False
@@ -415,6 +483,33 @@ def print_usage():
         log("  " + voice_id)
 
 
+def open_kokoro_speaker(root):
+    """Windows: load the model in this process."""
+    try:
+        speaker = KokoroSpeaker(load_kokoro(), root / "play")
+        speaker.warm_up()
+        return speaker
+    except Exception as error:
+        log("[ERROR] Model load failed: " + str(error))
+        return None
+
+
+def open_engine_speaker(root):
+    """Linux/macOS: a client of the shared engine, started on demand; None when it will not start."""
+    from engine_speaker import EngineSpeaker
+
+    try:
+        if not ensure(PLUGIN_ROOT):
+            log("[ERROR] The Kokoro engine did not start")
+            return None
+        speaker = EngineSpeaker(lambda: EngineConnection.connect(), root / "play", play_file)
+        speaker.warm_up()
+        return speaker
+    except Exception as error:
+        log("[ERROR] Engine connection failed: " + str(error))
+        return None
+
+
 def main():
     if "--drain" in sys.argv[1:]:
         from engine_common import DryRunSpeaker, drain, drain_root
@@ -427,16 +522,10 @@ def main():
             return drain(root, DryRunSpeaker, {"kokoro"})
 
         def open_speaker():
-            """Load the model ONCE, and only after the lock is ours."""
+            """Set the speaker up ONCE, and only after the lock is ours."""
             if not ensure_models():
                 return None
-            try:
-                speaker = KokoroSpeaker(load_kokoro(), root / "play")
-                speaker.warm_up()
-                return speaker
-            except Exception as error:
-                log("[ERROR] Model load failed: " + str(error))
-                return None
+            return open_engine_speaker(root) if use_engine() else open_kokoro_speaker(root)
 
         return drain(root, open_speaker, {"kokoro"})
 
