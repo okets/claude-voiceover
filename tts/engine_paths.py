@@ -6,6 +6,7 @@ that govern it. Stdlib only; imports no other engine module but engine_common.
 import json
 import os
 import secrets
+import sys
 import time
 from pathlib import Path
 
@@ -14,6 +15,14 @@ import engine_common
 DEFAULT_IDLE_SECONDS = 60.0
 IDLE_SECONDS_WITH_PORT = 330.0
 _PRIVATE_DIR, _PRIVATE_FILE = 0o700, 0o600
+
+
+UNIX_PATH_LIMIT = 103 if sys.platform == "darwin" else 107   # sockaddr_un.sun_path minus its NUL
+
+
+def socket_path_too_long(path) -> bool:
+    """True when `path` cannot be bound as an AF_UNIX socket on this platform."""
+    return len(os.fsencode(str(path))) > UNIX_PATH_LIMIT
 
 
 def engine_dir() -> Path:

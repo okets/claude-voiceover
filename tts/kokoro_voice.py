@@ -392,6 +392,8 @@ def play_pcm(pcm, root):
 
 
 def _speak_text_via_engine(text, voice, use_streaming):
+    if not ensure_models():  # a missing model downloads first, as in the in-process path
+        return False
     if not try_claim_lock(data_dir(), 10.0 + 0.4 * len(text.split())):
         return True  # another narration is playing - skip quietly
     conn = None

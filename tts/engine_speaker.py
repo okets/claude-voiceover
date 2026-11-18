@@ -14,6 +14,7 @@ from pathlib import Path
 
 from engine_client import EngineError
 from engine_common import Playback
+from kokoro_model import DEFAULT_VOICE
 
 SAMPLE_RATE = 24000
 SAMPLE_WIDTH = 2        # pcm_s16le
@@ -110,11 +111,13 @@ class EngineSpeaker:
 
     def prefetch(self, sentence, voice):
         """Ask the engine for a sentence the next item will begin with."""
+        voice = voice or DEFAULT_VOICE
         key = (sentence, voice)
         if key not in self._ahead:
             self._ahead[key] = self.submit(sentence, voice)
 
     def begin(self, sentence, voice, upcoming=None):
+        voice = voice or DEFAULT_VOICE
         pending = self._ahead.pop((sentence, voice), None) or self.submit(sentence, voice)
         self.cancel_all([])  # anything else rendered ahead belongs to an abandoned item
         self._count += 1

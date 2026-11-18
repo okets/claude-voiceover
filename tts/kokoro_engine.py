@@ -54,7 +54,14 @@ def _choose_synth(stub: bool, stub_delay_ms: int = 0):
 def main(argv) -> int:
     stub = "--stub" in argv
     synth = _choose_synth(stub, _stub_delay_ms(argv))   # construction stays cheap: the model loads later, on demand
-    listeners, _lock_fd = _choose_listeners()
+    try:
+        listeners, _lock_fd = _choose_listeners()
+    except OSError as error:
+        if "AF_UNIX path too long" not in str(error):
+            raise
+        _log("cannot bind %s: path longer than %d bytes (AF_UNIX limit); use a shorter VOICEOVER_DATA_DIR"
+             % (engine_paths.socket_path(), engine_paths.UNIX_PATH_LIMIT))
+        return 1
     if listeners is None:
         _log("another engine holds the lock; exiting")
         return 0

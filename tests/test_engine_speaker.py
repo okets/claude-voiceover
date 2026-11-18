@@ -272,6 +272,30 @@ try:
     check("speak_text with an unknown voice fails quietly",
           kokoro_voice.speak_text("Hello.", "no_such_voice", False) is False)
 
+    # --- one-shot downloads a missing model first, like 1.5.0's preview ------------------
+    ensure_calls = []
+    kokoro_voice.ensure_models = lambda: (ensure_calls.append(1), True)[1]
+    kokoro_voice.speak_text("Hello there friend.", VOICE, False)
+    check("speak_text ensures the models before using the engine", ensure_calls == [1], ensure_calls)
+    kokoro_voice.ensure_models = lambda: False
+    del played[:]
+    check("speak_text returns False quietly when the model download fails",
+          kokoro_voice.speak_text("Hello.", VOICE, False) is False and not played)
+    kokoro_voice.ensure_models = lambda: True
+
+    # --- an empty voice means the default voice, as in KokoroSpeaker ----------------------
+    asked = []
+    conn = engine_client.EngineConnection.connect()
+    real_submit = conn.submit
+    conn.submit = lambda text, voice, *a, **k: (asked.append(voice), real_submit(text, voice, *a, **k))[1]
+    speaker = engine_speaker.EngineSpeaker(lambda: conn, DATA / "play4", fake_play_file)
+    speaker.prefetch("One.", None)
+    speaker.begin("Two.", "")
+    speaker.cancel_all([])
+    check("prefetch and begin use DEFAULT_VOICE for an empty voice",
+          asked == [kokoro_voice.DEFAULT_VOICE] * 2, asked)
+    conn.close()
+
     # --- engine down -----------------------------------------------------------------
     kokoro_voice.ensure = lambda root, timeout=10.0: False
     spool.clear()

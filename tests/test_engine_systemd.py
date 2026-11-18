@@ -43,10 +43,10 @@ check("service unit passes the data dir", "Environment=VOICEOVER_DATA_DIR=/data/
 check("service unit without the data dir has no Environment",
       "Environment" not in engine_launcher.service_unit("/usr/bin/python3", SHIM, None))
 check("service unit has no Restart=", "Restart=" not in svc)
-check("percent and dollar are doubled in every value",
+check("percent is doubled everywhere, dollar only in ExecStart (systemd expands $ in Exec lines only)",
       "ExecStart=/opt/p%%1/py$$X " + str(SHIM) + " serve" in lines(engine_launcher.service_unit("/opt/p%1/py$X", SHIM, None))
-      and "Environment=VOICEOVER_DATA_DIR=/d%%/$$h" in lines(engine_launcher.service_unit("/usr/bin/python3", SHIM, "/d%/$h"))
-      and "ListenStream=/r/%%t/$$s.sock" in lines(engine_launcher.socket_unit(Path("/r/%t/$s.sock"), None)))
+      and "Environment=VOICEOVER_DATA_DIR=/d%%/$h" in lines(engine_launcher.service_unit("/usr/bin/python3", SHIM, "/d%/$h"))
+      and "ListenStream=/r/%%t/$s.sock" in lines(engine_launcher.socket_unit(Path("/r/%t/$s.sock"), None)))
 check("a path with spaces is quoted",
       'ExecStart=/usr/bin/python3 "/a b/shim" serve' in lines(engine_launcher.service_unit("/usr/bin/python3", Path("/a b/shim"), None)))
 

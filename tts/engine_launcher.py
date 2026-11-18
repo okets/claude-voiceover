@@ -166,6 +166,11 @@ def _pointer_python():
 
 
 def _serve(args):
+    sock = engine_paths.socket_path()
+    if engine_paths.socket_path_too_long(sock):
+        print("voiceover-engine: socket path %s is longer than the %d-byte AF_UNIX limit; "
+              "use a shorter VOICEOVER_DATA_DIR" % (sock, engine_paths.UNIX_PATH_LIMIT), file=sys.stderr)
+        return EXIT_UNREACHABLE
     root = Path(args.plugin_root)
     script = str(root / "tts" / "kokoro_engine.py")
     if args.stub:
@@ -248,14 +253,16 @@ def run_systemctl(*args) -> int:
         return EXIT_UNREACHABLE
 
 
-def _escape(text) -> str:
-    """systemd expands % specifiers and $ variables in unit values; double both to keep them literal."""
-    return str(text).replace("%", "%%").replace("$", "$$")
+def _escape(text, dollar=False) -> str:
+    """systemd expands % specifiers in every unit value, so % is always doubled; $ variables
+    expand only in Exec lines, so $ is doubled only when `dollar` is set (ExecStart)."""
+    escaped = str(text).replace("%", "%%")
+    return escaped.replace("$", "$$") if dollar else escaped
 
 
-def _quote(text) -> str:
+def _quote(text, dollar=False) -> str:
     """Escape for systemd, and quote when whitespace would split the value."""
-    text = _escape(text)
+    text = _escape(text, dollar)
     return '"%s"' % text.replace("\\", "\\\\").replace('"', '\\"') if any(c.isspace() for c in text) else text
 
 
@@ -270,7 +277,7 @@ def socket_unit(sock: Path, port) -> str:
 def service_unit(python: str, shim: Path, data_dir_env) -> str:
     env = ["Environment=%s" % _quote("VOICEOVER_DATA_DIR=%s" % data_dir_env)] if data_dir_env else []
     lines = ["[Unit]", "Description=Voiceover shared Kokoro engine", "", "[Service]",
-             "ExecStart=%s %s serve" % (_quote(python), _quote(shim))] + env + [""]
+             "ExecStart=%s %s serve" % (_quote(python, dollar=True), _quote(shim, dollar=True))] + env + [""]
     return "\n".join(lines)
 
 

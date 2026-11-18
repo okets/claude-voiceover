@@ -322,7 +322,8 @@ def _start_and_wait(plugin_root, deadline):
     while time.monotonic() < deadline:
         if _reachable():
             return True
-        child.poll()    # reap it if it exits (e.g. another engine won the lock)
+        if child.poll() not in (None, 0):   # it failed (exit 0: another engine won the lock, keep polling)
+            return _reachable()
         time.sleep(CONNECT_POLL_S)
     return False
 
