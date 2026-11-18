@@ -191,7 +191,8 @@ def read_keep_off():
 
 
 def write_keep_off(seconds: float, reason: str) -> None:
-    """Ask launchers not to start the engine for `seconds`."""
+    """Keep the engine off the GPU for `seconds`: an engine started meanwhile loads on the CPU
+    (fallback reason keep_off) and leaves for card_return once the keep-off has expired."""
     _write_json_atomic(keep_off_path(), {"until": time.time() + seconds, "reason": reason})
 
 

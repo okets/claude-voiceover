@@ -48,7 +48,7 @@ Walk the user through getting narration working. Arguments: `$ARGUMENTS`
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/setup_tts.py" --share-engine
    ```
 
-   Relay the token it prints and tell them to put it in their assistant's secrets (`voiceover-engine token` shows it again). `--unshare-engine` undoes it.
+   It does not print the token, and you must never print, read or relay it: anything in this conversation is stored in the transcript. Tell the user to run the `voiceover-engine token` command that setup shows, in their own terminal (not through you), and to put the token in their assistant's secrets. `--unshare-engine` undoes the sharing.
 
 7. Close with a one-line summary: which engine and voice are active, and that `/voiceover:level` adjusts how chatty the narration is.
 
