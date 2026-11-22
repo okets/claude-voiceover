@@ -19,6 +19,10 @@
 - `tts_engine: "auto"` resolves exactly as it does today. Kokoro's code path and `tts/pyproject.toml` are not changed.
 - `tts-phonon/pyproject.toml` lists no `kokoro-onnx`, `onnxruntime` or `soundfile`. `tts/pyproject.toml` and `tts-gpu/pyproject.toml` list no `ptts` or `sounddevice`.
 - Tests: plain scripts using `tests/_harness.py` (`isolate()`, `check()`, `report()`), run by `tests/run_all.sh`. No real model, network, sound card or spawned engine. Stub third-party modules through `sys.modules`, as `tests/test_tts_device.py` does.
+- Test gate (amended after the spike; it replaces every "Expected: `ALL TESTS PASSED`" on `bash tests/run_all.sh` below). The main checkout holds the user's git-ignored `.claude/voiceover.json`, which leaks into 8 existing checks through project scope; the harness and the existing test files are not changed for it. So, after each task's commit:
+  1. Primary: `git clone` the local repo's `feature/phonon-engine` into the builder's scratch directory and run `bash tests/run_all.sh` there. Required: `ALL TESTS PASSED`. Never push from or to the clone; delete it after the run.
+  2. Secondary: in the main checkout, the only failures allowed are the known 8 (in `tests/test_enqueue_speech.py`, and the 2 "enqueue fails" checks in `tests/test_narrator_hooks.py`).
+  3. Every new test file passes in both places: it gives itself its own temp project directory, passes that as `cwd`, and never reads the spool or settings through the default cwd.
 - Coding standards: single responsibility, DRY, small well-named methods.
 - Release target 1.6.0.
 - Commits: on the feature branch the user names, and only if the user has allowed the builder to commit. Never push.
@@ -75,7 +79,7 @@ No product code. Work in a scratch directory outside the repo, in a throwaway vi
 
 **Interfaces:**
 - Produces: `foreign_pending(root, engine_names, since) -> bool` — true when a pending item names a real engine outside `engine_names` and its `created` is later than `since`.
-- Produces: speakers may define an optional `idle()` method. `drain` calls it each time `next_item` finds nothing of this engine's to speak, before it waits on a lease or exits. It must return within 100 ms. Speakers without it are unaffected.
+- Produces: speakers may define an optional `idle()` method. `drain` calls it each time `next_item` finds nothing of this engine's to speak, before it waits on a lease or exits. It must return within 200 ms (amended after the spike: a PortAudio close takes about 115 ms on macOS), and it is called on every poll while the queue is dry, so a speaker's `idle()` must be near-free when there is nothing to release. Speakers without it are unaffected.
 - Changes: in `drain`, when there is no own item and `foreign_pending(root, engine_names, started)` is true (`started` = the time `drain` claimed its lock), log `handover`, and return 0. The existing `finally` releases the lock. This check comes before the lease wait.
 
 - [ ] **Step 1: Write the failing tests** in `tests/test_engine_handover.py`, following `tests/test_engine_lifecycle.py` for setup (`isolate()`, a project root, `spool.enqueue`, `lease.hold`, a collecting speaker).
@@ -176,11 +180,11 @@ check("the 8-bit weights file makes it present", settings.phonon_model_present()
 - `class Sink` with:
   - `write(chunk) -> None` — plays `chunk.tobytes()`; opens the output on the first write.
   - `abort() -> None` — silence now, discard buffered audio; the next `write` plays again.
-  - `close() -> None` — let written audio finish, release the device; returns within 100 ms; the next `write` re-opens.
-  - `remaining() -> float` — seconds of written audio not yet played, by wall clock: each `write` extends an end time by `len(chunk) / SAMPLE_RATE` from `max(now, end)`; `abort` resets it to zero.
-- `class SoundDeviceSink(Sink)` — a `sounddevice.RawOutputStream(samplerate=24000, channels=1, dtype="float32")`. `abort` calls the stream's `abort()`; the next write calls `start()`.
-- `class PipeSink(Sink)` — a player process fed on standard input. `abort` kills it; `close` closes its standard input without waiting.
-- `player_command() -> list | None` — the first available of, in order: `aplay -q -t raw -f FLOAT_LE -r 24000 -c 1 -`, `paplay --raw --format=float32le --rate=24000 --channels=1`, `pw-cat --playback --raw --format f32 --rate 24000 --channels 1 -`, `ffplay -f f32le -ar 24000 -ac 1 -nodisp -autoexit -loglevel quiet -i -` (use Task 1's measured arguments where they differ).
+  - `close() -> None` — let written audio finish, release the device; returns within 200 ms (amended after the spike). Idempotent and near-free when already closed: `drain` calls `idle()`, and so `close()`, on every poll while the queue is dry. The next `write` after a close re-opens.
+  - `remaining() -> float` — seconds of written audio not yet played; `abort` resets it to zero.
+- `class SoundDeviceSink(Sink)` — amended after the spike, which measured that a blocking `write()` on one thread with `abort()` from another crashes the process (bus error). Callback-fed instead: a `sounddevice.RawOutputStream(samplerate=24000, channels=1, dtype="float32", latency="low", blocksize=480, callback=...)`. `write` appends `chunk.tobytes()` to a buffer the sink owns, under a lock, and starts the stream if it is not open; the callback copies from that buffer and fills the rest with zeros when it runs short. `abort` empties the buffer (the stream stays open; the next `write` plays on it). `remaining()` = buffered samples / `SAMPLE_RATE`. `close` calls the stream's `stop()` (not `abort()`, so a tail still in the device plays out) and then `close()`.
+- `class PipeSink(Sink)` — a player process fed on standard input. `abort` kills it; `close` closes its standard input without waiting. `remaining()` by wall clock: each `write` extends an end time by `len(chunk) / SAMPLE_RATE` from `max(now, end)`.
+- `player_command() -> list | None` — the first available of, in order: `aplay -q -t raw -f FLOAT_LE -r 24000 -c 1 -`, `paplay --raw --format=float32le --rate=24000 --channels=1`, `pw-cat --playback --raw --format f32 --rate 24000 --channels 1 -`, `ffplay -f f32le -ar 24000 -nodisp -autoexit -loglevel error -i -`. The ffplay line is the one Task 1 measured (ffplay 9 rejects `-ac 1`; raw input defaults to mono). The `aplay`, `paplay` and `pw-cat` lines are untested: say so in a comment and in `INTERFACES.md`.
 - `open_sink() -> Sink | None` — `SoundDeviceSink` when it constructs, else `PipeSink` when `player_command()` is not None, else `None`. Never raises.
 
 - [ ] **Step 1: Write the failing tests** in `tests/test_pcm_sink.py`. Use a fake chunk class with `__len__` and `tobytes()`, a stub `sounddevice` module in `sys.modules` whose stream records calls, and a `PipeSink` pointed at `[sys.executable, "-c", "import sys; sys.stdin.buffer.read()"]`.
@@ -189,9 +193,11 @@ check("the 8-bit weights file makes it present", settings.phonon_model_present()
 check("the device opens on the first write, not before", stream_opened_before == 0 and stream_opened_after == 1)
 check("a chunk is written as raw bytes", written == [b"\x00" * 7680])
 check("remaining counts written audio", 0.07 < sink.remaining() <= 0.08)   # one 1,920-sample chunk
-check("abort silences and resets remaining", calls[-1] == "abort" and sink.remaining() == 0.0)
-check("writing after abort restarts the stream", "start" in calls_after_abort)
+check("abort silences and resets remaining", callback_output_after_abort == b"\x00" * 1920 and sink.remaining() == 0.0)
+check("writing after abort plays on the same open stream", opened == 1 and callback_output_after_write != b"\x00" * 1920)
+check("close stops the stream rather than aborting it", "stop" in calls and "abort" not in calls)
 check("close releases the device and a later write re-opens it", opened == 2)
+check("a second close does not re-close or re-open", (closes_after_second, opened_after_second) == (1, 1))
 check("the pipe sink feeds the player's stdin", player_received == 7680)
 check("aborting the pipe sink kills the player", player.poll() is not None)
 check("closing the pipe sink returns at once", close_seconds < 0.1)
@@ -220,12 +226,13 @@ For the last two, make the stub `sounddevice` import raise `OSError("PortAudio l
 - Consumes: `engine_common.drain`, `drain_root`, `Playback`, `DryRunSpeaker`, `try_claim_lock`, `remove_tts_lock`, `data_dir`, `engine_log`; `pcm_sink.open_sink`, `Sink`.
 - Produces — `tts-phonon/pyproject.toml`: project `claude-voiceover-tts-phonon`, `requires-python = ">=3.10"`, dependencies `ptts>=0.7.1` and `sounddevice>=0.5`, the same build-system and setuptools blocks as `tts/pyproject.toml`.
 - Produces — `tts/phonon_voice.py`:
-  - Constants: `MODEL_REPO = "hf://gradium/phonon-31m-en"`, `QUANT = "q8_0"`, `THREADS = 2`, `FALLBACK_VOICE = "default"`, `WARM_UP_TEXT = "Ready."`.
-  - `load_model()` — `ptts.set_num_threads(THREADS)` then `ptts.TTS(MODEL_REPO, lang="en", quant=QUANT)`.
+  - Constants: `MODEL_REPO = "hf://gradium/phonon-31m-en@92741c5b07d085ff840e26fea8ce43110b87852f"` (amended after the spike: an unpinned name checks the network on every load, 17 s when it is unreachable; pinned, 0.41 s online or offline), `QUANT = "q8_0"`, `DEVICE = "cpu"`, `THREADS = 2`, `FALLBACK_VOICE = "default"`, `WARM_UP_TEXT = "Ready."`.
+  - `load_model()` — `ptts.set_num_threads(THREADS)` then `ptts.TTS(MODEL_REPO, lang="en", quant=QUANT, device=DEVICE)`. Metal is out of scope and not exposed.
   - `class PhononSpeaker` — `__init__(self, tts, sink)`; `warm_up()` renders `WARM_UP_TEXT` and discards the audio; `prefetch(sentence, voice)` does nothing; `begin(sentence, voice, upcoming=None) -> PhononPlayback`; `idle()` calls `sink.close()`.
   - `class PhononPlayback(Playback)`:
     - One worker thread per speaker runs sentences in order. For a sentence it opens `tts.stream(sentence, voice=...)`, writes each chunk to the sink unless cancelled, and always closes the stream itself.
-    - A voice that cannot be loaded: log it with `engine_log("voice", ...)` and render the sentence once with `FALLBACK_VOICE`.
+    - A voice that cannot be loaded: the `stream()` call itself raises, before any chunk (measured: `LookupError` for an unknown or offline-uncached voice, `OSError` when a fetch fails, after about 2.6 s). Catch both, log it with `engine_log("voice", ...)` and render the sentence with `FALLBACK_VOICE`. Remember the failed voice for the life of the process and go straight to `FALLBACK_VOICE` for it afterwards, so an offline machine pays the fetch delay once, not per sentence.
+    - Voice names are stored and passed in their exact catalogue case; do not rely on `ptts` matching names case-insensitively.
     - `started()` — true once a chunk has been written.
     - `poll()` — re-raises a generation error; otherwise true when the worker has finished the sentence and `sink.remaining() <= 0`.
     - `kill()` — sets the cancel flag, calls `sink.abort()`, and returns without waiting for the worker.
@@ -235,7 +242,7 @@ For the last two, make the stub `sounddevice` import raise `OSError("PortAudio l
 
 ```python
 check("the model loads with 2 threads and 8-bit weights",
-      (threads, tts_kwargs) == ([2], {"lang": "en", "quant": "q8_0"}))
+      (threads, tts_kwargs) == ([2], {"lang": "en", "quant": "q8_0", "device": "cpu"}))
 check("chunks reach the sink as they are generated", sink.written == 3)
 check("a sentence is not done until its audio has played out", playback.poll() is False)   # remaining() > 0
 check("then it is", playback.poll() is True)                                                # remaining() == 0
@@ -243,6 +250,10 @@ check("the voice name is passed through, spaces and all",
       streams[-1].voice == "Captain Silas Blackwater")
 check("an unfetchable voice is spoken in the default voice",
       [s.voice for s in streams[-2:]] == ["Missing", "default"] and sink.written > 0)
+check("an unfetchable voice is tried once per process, not per sentence",
+      stream_voices_for_two_sentences == ["Missing", "default", "default"])
+check("the model loads on the CPU from the pinned revision",
+      tts_args[0].endswith("@92741c5b07d085ff840e26fea8ce43110b87852f") and tts_device == "cpu")
 check("kill silences before the generator is closed", events[:2] == ["abort", "close"])
 check("kill does not wait for the generator to close", kill_seconds < 0.05)
 check("a killed sentence writes nothing more", sink.written == written_at_kill)
