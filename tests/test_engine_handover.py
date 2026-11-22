@@ -217,6 +217,23 @@ def spawned_json_ts():
 
 
 try:
+    # --- the old engine's own backlog alone starts no newcomer --------------------
+    spool.clear(cwd=CWD)
+    (ROOT / "spawned.json").unlink(missing_ok=True)
+    write_lock(engines=["kokoro"])
+    spool.enqueue("Backlog one.", "kokoro", "af_sky", cwd=CWD)
+    spool.enqueue("Backlog two.", "kokoro", "af_sky", cwd=CWD)
+    check("only the old engine's items pending: ensure_drainer spawns nothing",
+          speech.ensure_drainer(CWD) is False and spawned == [], spawned)
+    spool.enqueue("For the new engine.", "phonon", "Bryony", cwd=CWD)
+    check("one item for the resolved engine: it spawns once",
+          speech.ensure_drainer(CWD) is True and len(spawned) == 1, spawned)
+    check("pending_count counts one engine's items",
+          (spool.pending_count(cwd=CWD, engine="kokoro"), spool.pending_count(cwd=CWD, engine="phonon"),
+           spool.pending_count(cwd=CWD)) == (2, 1, 3))
+    engine_common.remove_tts_lock(ROOT)
+    spawned.clear()
+
     # --- the finale case, end to end ----------------------------------------------
     spool.clear(cwd=CWD)
     (ROOT / "spawned.json").unlink(missing_ok=True)

@@ -104,8 +104,11 @@ def _items(cwd=None):
         return []
 
 
-def pending_count(cwd=None) -> int:
-    return len(_items(cwd))
+def pending_count(cwd=None, engine=None) -> int:
+    """Pending items; with engine given, only the items queued for it."""
+    if engine is None:
+        return len(_items(cwd))
+    return sum(1 for path in _items(cwd) if (_read(path) or {}).get("engine") == engine)
 
 
 def _read(path):

@@ -168,7 +168,7 @@ def ensure_drainer(cwd=None) -> bool
     # owner counts as free) or one was spawned <3s ago (<project>/spawned.json; the engine clears it
     # once loaded). Also removes the 1.3 machine-wide queue. Called unconditionally by narrator paths.
     # One exception to the live-lock rule (engine switch): when the lock records "engines", the
-    # resolved engine is not among them and the queue has items, it spawns the resolved engine anyway
+    # resolved engine is not among them and items are queued for the resolved engine, it spawns the resolved engine anyway
     # (the 3s back-off still applies). That newcomer waits for the holder to hand over; no hook waits.
 def prewarm(cwd=None, session=None, ttl=lease.LEASE_TTL) -> bool   # lease.hold + ensure_drainer
 def request_stop(cwd=None, session=None) -> None
@@ -266,7 +266,7 @@ def enqueue(text, engine, voice, session=None, utterance=None, sticky=False,
             shown=None, source=None, cwd=None) -> bool   # utterance None = a message of its own
 def clear(session=None, cwd=None) -> int      # all pending items, or one session's
 def clear_sticky(session, cwd=None) -> int    # retire a session's sticky alerts/permission requests
-def pending_count(cwd=None) -> int
+def pending_count(cwd=None, engine=None) -> int   # engine given: only items queued for it
 def prune(max_age_seconds=QUEUE_MAX_AGE_SECONDS, cwd=None) -> int   # also stale *.taken / *.tmp
 def remove_legacy_queue() -> int              # delete 1.3's machine-wide data_dir()/queue/
 ```

@@ -174,13 +174,15 @@ def ensure_drainer(cwd=None) -> bool:
 
 def _handing_over(lock, engine, cwd) -> bool:
     """True when the live lock's drainer drains other engines than `engine`
-    and speech is pending: the user switched engine while it was busy. The
+    and speech is pending for `engine` itself: the user switched engine while
+    the old one was busy. The old engine's own backlog alone starts nothing -
+    a newcomer would find no work and exit, one uv start-up per hook. The
     new engine is started anyway; it waits for the old one to hand over
     (tts/engine_common.py), so this hook never waits. Without this, a turn's
     last message, queued for the new engine while the old one still speaks,
     would have no later hook to start its engine."""
     holder = _lock_engines(lock)
-    return bool(holder) and engine not in holder and spool.pending_count(cwd) > 0
+    return bool(holder) and engine not in holder and spool.pending_count(cwd, engine=engine) > 0
 
 
 def _lock_engines(lock) -> list:
