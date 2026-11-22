@@ -53,10 +53,21 @@ for name, cmdline in ONE_SHOTS.items():
     check(name + " is stopped by it", unix_kills(cmdline), cmdline)
 
 # --- every one-shot caller uses the --voice form the patterns match ---------------
+# The callers build it through speech.one_shot_command (or, before it, a literal
+# kokoro --voice call); the builder's own command lines must be ones the
+# interrupt stops.
 for script in ("scripts/manage_voices.py", "scripts/setup_tts.py"):
     source = (REPO_ROOT / script).read_text()
-    check(script + " calls kokoro_voice.py with --voice",
-          re.search(r'kokoro_voice\.py"\),\s*"--voice"|kokoro_command\(\s*"--voice"', source) is not None)
+    check(script + " calls the one-shot engines with --voice",
+          re.search(r'kokoro_voice\.py"\),\s*"--voice"|kokoro_command\(\s*"--voice"|one_shot_command\(',
+                    source) is not None)
+from voiceover import speech  # noqa: E402
+
+for engine, voice in (("kokoro", "af_sky"), ("phonon", "Captain Silas Blackwater")):
+    for stream in (True, False):
+        cmdline = " ".join(speech.one_shot_command(engine, voice, "Hello there.", stream=stream))
+        check("the %s one-shot command (stream=%s) is stopped by the interrupt" % (engine, stream),
+              unix_kills(cmdline) and windows_kills(cmdline), cmdline)
 
 # --- the kill switch reaches every project and clears its state --------------------
 sys.path.insert(0, str(REPO_ROOT / "tts"))

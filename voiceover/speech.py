@@ -279,6 +279,20 @@ def macos_say_command(*args):
 _NEURAL_COMMANDS = {"kokoro": kokoro_command, "phonon": phonon_command}
 
 
+def one_shot_command(engine, voice, text, stream=True):
+    """The argv that speaks text once with engine in voice, or None for no
+    engine. The one place the one-shot command line is built: dispatch, the
+    voice sample and setup's test line all call it. stream=False keeps
+    Kokoro's sample on its standard (non-streamed) synthesis; Phonon always
+    streams, and a macOS engine takes its own `say` voice."""
+    if engine in _NEURAL_COMMANDS:
+        flags = ["--stream"] if stream else []
+        return _NEURAL_COMMANDS[engine](*(["--voice", voice] + flags + [text]))
+    if engine in _MACOS_VOICES:
+        return macos_say_command("--voice", _MACOS_VOICES[engine], text)
+    return None
+
+
 def _drain_command(engine, root):
     """The argv that drains root's spool with engine, or None for no engine."""
     if engine in _NEURAL_COMMANDS:
@@ -332,11 +346,8 @@ def truncate_for_speech(text, limit: int = 220) -> str:
 # ---------------------------------------------------------------------------
 
 def _dispatch(message, engine, cwd) -> None:
-    if engine in _NEURAL_COMMANDS:
-        command = _NEURAL_COMMANDS[engine]("--voice", get_voice(cwd), "--stream", message)
-    elif engine in _MACOS_VOICES:
-        command = macos_say_command("--voice", _MACOS_VOICES[engine], message)
-    else:  # "none" or unknown
+    command = one_shot_command(engine, get_voice(cwd), message)
+    if command is None:  # "none" or unknown
         return False
     # The engine owns the lock lifecycle (atomic claim -> speak -> remove).
     # Creating the lock here would race the engine's own claim and make it

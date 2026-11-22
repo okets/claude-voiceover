@@ -63,10 +63,11 @@ def pre_phonon_kokoro_pick(root):
 
 
 def friendly_names():
+    """The catalogue's Kokoro and macOS friendly names (it also holds Phonon's own)."""
     spec = importlib.util.spec_from_file_location("manage_voices", REPO_ROOT / "scripts" / "manage_voices.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return set(module.VOICES)
+    return {name for name, entry in module.VOICES.items() if entry["engine"] != "phonon"}
 
 
 # --- the engine ---------------------------------------------------------------------

@@ -184,6 +184,9 @@ def prewarm(cwd=None, session=None, ttl=lease.LEASE_TTL) -> bool   # lease.hold 
 def kokoro_command(*args) -> list    # uv run --project <tts or tts-gpu> <plugin>/tts/kokoro_voice.py *args
 def phonon_command(*args) -> list    # uv run --project <plugin>/tts-phonon <plugin>/tts/phonon_voice.py *args
 def macos_say_command(*args) -> list # python3 <plugin>/tts/macos_say.py *args
+def one_shot_command(engine, voice, text, stream=True) -> list | None
+    # the ONE builder of a one-shot command line (dispatch, the voice sample, setup's test):
+    # neural engines get --voice <voice> [--stream] <text>; macOS engines their own `say` voice
     # The drain command and the one-shot dispatch look the neural engines up in one table
     # (kokoro -> kokoro_command, phonon -> phonon_command); macOS voices use macos_say_command.
 def request_stop(cwd=None, session=None) -> None
@@ -459,6 +462,12 @@ A sentence that completes no write for `stall_seconds` (30 s; a `PhononSpeaker` 
 while the worker is still running is killed by `poll()`, logged as `stall`, and reported done:
 a player that stopped reading blocks the worker inside its write, and the abort ends that player.
 
+Known limit (Linux, untested): a drainer's piped player is a child that reads stdin and matches
+no kill pattern. The lock-owner process-group kill stops it whenever the engine holds its lock;
+killed by pattern alone (only in the drain's brief exit gap), the engine dies and the player plays
+out what its pipe holds (at most ~0.7 s) and exits at EOF. A possible fix, not made: have the kill
+switch `pgrep -f` the engine patterns and `killpg` each match's group.
+
 Known limit: if `ptts` itself hangs inside generation, that sentence is abandoned after 30 s, but
 the single worker thread stays occupied, so later sentences stall too. The kill switch, or the
 next prompt's cutover, ends the process.
@@ -634,11 +643,23 @@ hooks/), and Stop does not end its turn; `turn.complete` does. Items the mod que
 
 ## scripts/ (used by slash commands; argparse CLIs, stdlib only)
 
-- `manage_settings.py {info|get KEY|set KEY VALUE [--project]|levels}` — wraps settings.py
-- `manage_voices.py {list|set NAME [--project]|test [NAME]|recommend}` — friendly-name map
-  (alloy, river, sky, sarah, nicole, adam, puck, michael, emma, daniel, lewis, george,
-  default-male, default-female) → engine+voice; fixes old doubled-path bug; covers all 13
-  kokoro voices; `test` speaks a sample line.
+- `manage_settings.py {info|get KEY|set KEY VALUE [--project]|levels}` — wraps settings.py.
+  `tts_engine` accepts `phonon`; `voice` accepts null, a Kokoro id or a Phonon name (exact case),
+  whatever the engine (a voice for the other engine falls back at resolution time); `info`
+  prints a `Phonon model:` line beside `Kokoro models:`.
+- `manage_voices.py {list|set NAME [--project]|test [NAME]|recommend}` — friendly-name map →
+  engine+voice: 37 Phonon voices (catalogue name lower-cased and hyphenated, e.g. `bryony`,
+  `captain-silas-blackwater`; labels `"<Name> (Phonon)"` / `"<Name> (Phonon character)"`), the 13
+  Kokoro voices (alloy … george) and `default-female` / `default-male`. `list` groups them under
+  "Phonon voices", "Phonon character voices", "Kokoro neural voices", "macOS system voices".
+  Availability: `ready` when uv and the engine's model are present (`kokoro_ready()`,
+  `phonon_ready()`), else `needs uv …` / `needs model download …`. `set` for a Phonon voice when
+  Phonon is ready (outside dry run) first runs `phonon_command("--fetch-voice", voice)` (120 s
+  timeout; a failure or timeout saves nothing and exits 1); before setup it saves with the
+  "will work once setup completes" note and never starts a download. `test` speaks a sample through
+  `speech.one_shot_command(engine, voice, text, stream=False)`. `recommend` names `zoey` (a
+  placeholder until the user picks one) when Phonon is ready, else the previous advice plus one
+  line mentioning Phonon.
 - `setup_tts.py` — first-run: check uv/ffplay availability, offer kokoro model download
   (~300MB to ~/.kokoro-tts), verify audio, print status. Reuses existing ~/.kokoro-tts cache.
 - `migrate_legacy.py [--dry-run]` — detect legacy smarter-claude install (~/.claude/VERSION or

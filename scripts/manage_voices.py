@@ -7,7 +7,8 @@ Usage:
     manage_voices.py test [NAME]           Speak a sample line (current voice if omitted)
     manage_voices.py recommend             Suggest the best voice for this machine
 
-Friendly names cover all 13 Kokoro neural voices plus the two built-in macOS voices.
+Friendly names cover the 37 Phonon voices, all 13 Kokoro neural voices and the two
+built-in macOS voices.
 Stdlib only; audio itself runs in subprocesses.
 """
 
@@ -23,9 +24,12 @@ PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PLUGIN_ROOT))
 
 from voiceover import settings  # noqa: E402
-from voiceover.speech import kokoro_command  # noqa: E402
+from voiceover.speech import one_shot_command, phonon_command  # noqa: E402
 
 SAMPLE_TEXT = "Hello! This is your Claude Voiceover narrator."
+SAMPLE_TIMEOUT = 120  # seconds; a first run may also build the engine's environment
+FETCH_TIMEOUT = 120
+RECOMMENDED_PHONON = "zoey"  # placeholder until the user picks one after hearing them
 
 # Friendly name -> engine + kokoro voice id + human label.
 # All 13 Kokoro voices, plus the two zero-setup macOS system voices.
@@ -47,7 +51,19 @@ VOICES = {
     "default-male":   {"engine": "macos-male",   "voice": None,   "label": "macOS Daniel (zero setup)"},
 }
 
-MACOS_SAY_VOICES = {"macos-female": "Samantha", "macos-male": "Daniel"}
+
+
+def _phonon_voices():
+    """Friendly name -> spec for every Phonon voice: the name lower-cased and
+    hyphenated (none collides with a Kokoro or macOS name)."""
+    groups = ((settings.PHONON_VOICES, "Phonon"), (settings.PHONON_CHARACTER_VOICES, "Phonon character"))
+    return {voice.lower().replace(" ", "-"): {"engine": "phonon", "voice": voice, "label": f"{voice} ({kind})"}
+            for voices, kind in groups for voice in voices}
+
+
+VOICES.update(_phonon_voices())
+
+ENGINE_LABELS = {"kokoro": "Kokoro", "phonon": "Phonon"}  # the engines setup installs
 
 
 def is_macos():
@@ -60,6 +76,15 @@ def uv_available():
 
 def kokoro_ready():
     return settings.models_present() and uv_available()
+
+
+def phonon_ready():
+    return settings.phonon_model_present() and uv_available()
+
+
+def engine_ready(engine):
+    """Whether an installable engine (Kokoro, Phonon) is set up on this machine."""
+    return {"kokoro": kokoro_ready, "phonon": phonon_ready}[engine]()
 
 
 def dry_run():
@@ -81,8 +106,8 @@ def friendly_name_for(engine, voice):
 
 def voice_availability(spec):
     """Human-readable availability of one voice on this machine."""
-    if spec["engine"] == "kokoro":
-        if kokoro_ready():
+    if spec["engine"] in ENGINE_LABELS:
+        if engine_ready(spec["engine"]):
             return "ready"
         if not uv_available():
             return "needs uv (run /voiceover:setup)"
@@ -90,14 +115,27 @@ def voice_availability(spec):
     return "ready" if is_macos() else "macOS only"
 
 
+LIST_GROUPS = ("Phonon voices", "Phonon character voices", "Kokoro neural voices", "macOS system voices")
+
+
+def list_group(spec):
+    """The heading a voice is listed under."""
+    if spec["engine"] == "phonon":
+        return LIST_GROUPS[1] if spec["voice"] in settings.PHONON_CHARACTER_VOICES else LIST_GROUPS[0]
+    return LIST_GROUPS[2] if spec["engine"] == "kokoro" else LIST_GROUPS[3]
+
+
 def cmd_list(_args):
     engine, voice = current_selection()
     active = friendly_name_for(engine, voice)
     print("Claude Voiceover voices")
-    print()
-    for name, spec in VOICES.items():
-        marker = ">>>" if name == active else "   "
-        print(f"{marker} {name:15} {spec['label']:42} [{voice_availability(spec)}]")
+    for group in LIST_GROUPS:
+        print()
+        print(f"{group}:")
+        for name, spec in VOICES.items():
+            if list_group(spec) == group:
+                marker = ">>>" if name == active else "   "
+                print(f"{marker} {name:15} {spec['label']:42} [{voice_availability(spec)}]")
     print()
     if active:
         print(f"Current voice: {active} ({engine})")
@@ -123,10 +161,14 @@ def cmd_set(args):
         print(f"Valid names: {', '.join(VOICES)}")
         return 1
     spec = VOICES[name]
-    if spec["engine"] == "kokoro" and not kokoro_ready():
-        print(f"Note: Kokoro is not fully set up yet ({voice_availability(spec)}).")
+    engine = spec["engine"]
+    if engine in ENGINE_LABELS and not engine_ready(engine):
+        print(f"Note: {ENGINE_LABELS[engine]} is not fully set up yet ({voice_availability(spec)}).")
         print("The voice is saved and will work once setup completes.")
-    if spec["engine"].startswith("macos") and not is_macos():
+    elif engine == "phonon" and not dry_run() and not fetch_phonon_voice(spec["voice"]):
+        print(f"The {name} voice could not be downloaded, so nothing was saved.")
+        return 1
+    if engine.startswith("macos") and not is_macos():
         print(f"Warning: {name} uses macOS system speech and this machine is {platform.system()}.")
     apply_voice(name, args.project)
     scope = "project" if args.project else "global"
@@ -134,23 +176,31 @@ def cmd_set(args):
     return 0
 
 
+def fetch_phonon_voice(voice):
+    """Load a Phonon voice once, which caches it (a catalogue voice is fetched
+    on first use). True on success. Never starts the model download: callers
+    only fetch once Phonon is set up."""
+    try:
+        return subprocess.run(phonon_command("--fetch-voice", voice), timeout=FETCH_TIMEOUT).returncode == 0
+    except subprocess.TimeoutExpired:
+        print(f"Fetching the {voice} voice timed out after {FETCH_TIMEOUT}s.")
+        return False
+    except OSError as error:
+        print(f"Could not launch the Phonon engine: {error}")
+        return False
+
+
 def speak_sample(engine, voice, text):
     """Speak one sample line through the chosen engine. Returns process exit code."""
     if dry_run():
         print(f"[voiceover] {text}", file=sys.stderr)
         return 0
-    if engine == "kokoro":
-        command = kokoro_command("--voice", voice, text)
-    elif engine in MACOS_SAY_VOICES:
-        command = [
-            sys.executable, str(PLUGIN_ROOT / "tts" / "macos_say.py"),
-            "--voice", MACOS_SAY_VOICES[engine], text,
-        ]
-    else:
+    command = one_shot_command(engine, voice, text, stream=False)
+    if command is None:
         print(f"Nothing to test: engine is '{engine}'.")
         return 1
     try:
-        return subprocess.run(command, timeout=120).returncode
+        return subprocess.run(command, timeout=SAMPLE_TIMEOUT).returncode
     except FileNotFoundError as error:
         print(f"Could not launch TTS: {error}")
         return 1
@@ -178,6 +228,16 @@ def cmd_test(args):
 
 
 def cmd_recommend(_args):
+    if phonon_ready():
+        print(f"Recommended: {RECOMMENDED_PHONON} - {VOICES[RECOMMENDED_PHONON]['label']}")
+        print("Phonon neural voices are installed; list them with /voiceover:voice.")
+        return 0
+    _recommend_without_phonon()
+    print("Phonon voices (about 65MB, light on memory) can be added with /voiceover:setup.")
+    return 0
+
+
+def _recommend_without_phonon():
     if kokoro_ready():
         pick = "puck" if is_macos() else "sarah"
         print(f"Recommended: {pick} - {VOICES[pick]['label']}")
@@ -188,7 +248,6 @@ def cmd_recommend(_args):
     else:
         print("Recommended: run /voiceover:setup to install the Kokoro neural voices.")
         print("(No built-in system voice is wired up on this platform.)")
-    return 0
 
 
 def build_parser():
