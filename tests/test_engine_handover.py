@@ -28,7 +28,7 @@ SESSION = "S1"
 
 
 class Collect:
-    """A speaker with no idle(): records each sentence, plays nothing."""
+    """A speaker with no release_output(): records each sentence, plays nothing."""
 
     def __init__(self):
         self.spoken = []
@@ -46,10 +46,10 @@ class CollectIdle(Collect):
 
     def __init__(self):
         super().__init__()
-        self.idle_calls = 0
+        self.release_calls = 0
 
-    def idle(self):
-        self.idle_calls += 1
+    def release_output(self):
+        self.release_calls += 1
 
 
 def start_kokoro_drain(speaker):
@@ -82,7 +82,7 @@ check("it released its lock", engine_common.lock_is_live(ROOT) is False)
 check("it left the other engine's item in place", spool.pending_count(cwd=CWD) == 1,
       spool.pending_count(cwd=CWD))
 check("it finishes its own items first", speaker.spoken == ["Mine."], speaker.spoken)
-check("a speaker without idle() still drains", speaker.spoken != [])
+check("a speaker without release_output() still drains", speaker.spoken != [])
 finish(thread)
 
 # --- 3: a foreign item queued BEFORE the drainer started does not evict it ----------
@@ -98,14 +98,14 @@ check("an older foreign item does not evict the engine", thread.is_alive())
 finish(thread)
 check("released, it exits", not thread.is_alive())
 
-# --- 4 and 5: a lease alone keeps the engine warm; idle() is called -----------------
+# --- 4 and 5: a lease alone keeps the engine warm; release_output() is called -----------------
 spool.clear(cwd=CWD)
 lease.hold(CWD, SESSION)
 speaker = CollectIdle()
 thread = start_kokoro_drain(speaker)
 time.sleep(0.2)
 check("a lease with an empty queue keeps the engine", thread.is_alive())
-check("the speaker is told the queue ran dry", speaker.idle_calls >= 1, speaker.idle_calls)
+check("the speaker is told the queue ran dry", speaker.release_calls >= 1, speaker.release_calls)
 finish(thread)
 check("released, the idle engine exits", not thread.is_alive())
 
@@ -119,11 +119,11 @@ check("an older foreign item does not", engine_common.foreign_pending(ROOT, {"ko
 check("an own item is not foreign", engine_common.foreign_pending(ROOT, {"phonon"}, before) is False)
 spool.clear(cwd=CWD)
 
-# --- a speaker whose idle() raises does not end the drain ---------------------------
+# --- a speaker whose release_output() raises does not end the drain ---------------------------
 
 
 class IdleRaises(Collect):
-    def idle(self):
+    def release_output(self):
         raise RuntimeError("device went away")
 
 
@@ -132,7 +132,7 @@ speaker = IdleRaises()
 thread = start_kokoro_drain(speaker)
 spool.enqueue("Still here.", "kokoro", "af_sky", session=SESSION, cwd=CWD)
 time.sleep(0.2)
-check("a speaker whose idle() raises still speaks the next item",
+check("a speaker whose release_output() raises still speaks the next item",
       speaker.spoken == ["Still here."], speaker.spoken)
 finish(thread)
 

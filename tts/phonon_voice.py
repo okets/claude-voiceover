@@ -179,7 +179,7 @@ class PhononSpeaker:
     """Streams sentences through a loaded Phonon model into an audio sink.
 
     One worker thread renders sentences in order. The sink's output is
-    opened on the first chunk and released by idle(), which the drain loop
+    opened on the first chunk and released by release_output(), which the drain loop
     calls when the queue runs dry, so a warm engine holds no device.
     """
 
@@ -207,7 +207,7 @@ class PhononSpeaker:
         playback.attach(self._worker.submit(self._render, playback, sentence, voice))
         return playback
 
-    def idle(self):
+    def release_output(self):
         self._sink.close()
 
     def _render(self, playback, sentence, voice):

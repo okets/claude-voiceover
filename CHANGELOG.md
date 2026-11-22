@@ -1,8 +1,6 @@
 # Changelog
 
-## Unreleased
-
-This branch was cut from 1.5.0 (2658e91) and has not been merged with 1.6.0 (the shared Kokoro engine).
+## 1.7.0 - 2026-11-22
 
 ### Added
 - Phonon, a second local neural engine (Gradium's `gradium/phonon-31m-en`, Apache 2.0,
@@ -28,10 +26,34 @@ This branch was cut from 1.5.0 (2658e91) and has not been merged with 1.6.0 (the
   still holds the project (its lock now records the engines it drains), and the newcomer
   waits, loading nothing, until the old engine has finished its own sentences and handed
   over. Without this, the closing message of the very turn that switched voices was lost.
-- A drainer's speaker may define `idle()`, called whenever its queue runs dry (Phonon
-  releases its audio device there).
+- A drainer's speaker may define `release_output()`, called whenever its queue runs dry
+  (Phonon releases its audio device there). `idle()` keeps its 1.6.0 meaning.
 - `spool.pending_count()` can count one engine's items; `speech.one_shot_command()` builds
   every one-shot command line (dispatch, the voice sample, setup's test).
+
+## 1.6.0 - 2026-11-19
+
+### Added
+- A shared Kokoro engine (Linux and macOS): one engine process per user holds the model
+  and serves every narrator drainer, the one-shot speaker and any other program, over a
+  line protocol (protocol 1, documented in `INTERFACES.md`) on a Unix socket, and
+  optionally on `127.0.0.1:<port>` with a token. Callers are scheduled so a latency-sensitive
+  one waits for at most one in-flight sentence.
+- `setup_tts.py --share-engine [PORT]` / `--unshare-engine` (Linux): a systemd user socket
+  that starts the engine on demand and shares it on a loopback TCP port, plus the
+  `voiceover-engine` launcher (`status`, `release`, `stop`, `token`, `rotate-token`, ...).
+- Machine-wide settings `engine_port`, `engine_idle_s` and `engine_plugin_root`.
+- `tts_controller.py stop --all` also stops the shared engine.
+
+### Changed
+- Narration drainers and the one-shot speaker ask the shared engine for audio instead of
+  loading the model themselves, and run under plain `python3` on Linux and macOS.
+  Windows keeps the 1.5.0 in-process engine.
+- `tts_controller.py stop` and the one-shot interrupt stop narration only; they never cut
+  off another program's speech from the engine.
+- The engine unloads after 60 seconds of quiet (330 when a port is shared), and restarts
+  on its own when the plugin version or `tts_device` changes.
+- The one-shot speaker downloads a missing model first, as 1.5.0's voice preview did.
 
 ## 1.5.0 - 2026-11-06
 

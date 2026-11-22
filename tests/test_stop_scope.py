@@ -29,6 +29,7 @@ def windows_kills(cmdline):
 
 DRAINERS = {
     "a kokoro drainer": "uv run --project /p/tts /p/tts/kokoro_voice.py --drain /d/projects/abc",
+    "a kokoro drainer (plain python)": "/usr/bin/python3 /p/tts/kokoro_voice.py --drain /d/projects/abc",
     "a macOS drainer": "python3 /p/tts/macos_say.py --drain /d/projects/abc",
     "a drainer's say": "say --voice=Samantha",
     "a drainer's afplay": "afplay /d/projects/abc/play/12-3.wav",
@@ -38,6 +39,7 @@ DRAINERS = {
 }
 ONE_SHOTS = {
     "the one-shot kokoro engine": "uv run --project /p/tts /p/tts/kokoro_voice.py --voice bf_emma --stream hello",
+    "the one-shot kokoro client (plain python)": "/usr/bin/python3 /p/tts/kokoro_voice.py --voice bf_emma --stream hello",
     "a voice preview": "uv run --project /p/tts /p/tts/kokoro_voice.py --voice af_nicole Hello there",
     "the one-shot say engine": "python3 /p/tts/macos_say.py --voice Samantha hello",
     "the one-shot say child": "say -v Samantha",

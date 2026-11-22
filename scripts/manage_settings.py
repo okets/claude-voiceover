@@ -12,6 +12,7 @@ Wraps voiceover/settings.py. Stdlib only.
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -103,6 +104,33 @@ def parse_value(raw):
         return raw
 
 
+def _is_number(value):
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value))
+
+
+def _check_engine_port(value):
+    if not (isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 65535):
+        raise ValueError("engine_port must be an integer from 1 to 65535, or null")
+
+
+def _check_engine_idle(value):
+    if not (_is_number(value) and value >= 5):
+        raise ValueError("engine_idle_s must be a number of at least 5, or null")
+
+
+def _check_engine_plugin_root(value):
+    if not (isinstance(value, str) and Path(value).is_dir()):
+        raise ValueError("engine_plugin_root must be an existing directory, or null")
+
+
+_ENGINE_VALIDATORS = {
+    "engine_port": _check_engine_port,
+    "engine_idle_s": _check_engine_idle,
+    "engine_plugin_root": _check_engine_plugin_root,
+}
+
+
 def normalize(key, value):
     """Validate and normalize a value for a known key. Raises ValueError."""
     if key == "interaction_level":
@@ -119,6 +147,10 @@ def normalize(key, value):
     if key == "tts_device":
         if value not in VALID_DEVICES:
             raise ValueError(f"tts_device must be one of {VALID_DEVICES}")
+        return value
+    if key in _ENGINE_VALIDATORS:
+        if value is not None:
+            _ENGINE_VALIDATORS[key](value)
         return value
     if key == "voice":
         # Either engine's voice is accepted whatever tts_engine says: a voice

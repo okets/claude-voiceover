@@ -51,6 +51,7 @@ class FakeKokoro:
 
 kokoro_voice.ensure_models = lambda: True
 kokoro_voice.DRY_RUN = False
+kokoro_voice.use_engine = lambda: False  # this file covers the in-process (Windows) path
 kokoro_voice.play_audio_file = lambda path, timeout=30: True
 kokoro_voice.playback_command = lambda path: [sys.executable, "-c", "pass"]
 fake = FakeKokoro()
@@ -154,6 +155,20 @@ check("and removes the clip", not wav.exists())
 kokoro_voice.speak_streaming(FakeKokoro(), "one shot", "af_sarah")
 check("speak_streaming still releases the one-shot lock",
       engine_common.tts_lock_path(engine_common.data_dir()).exists() is False)
+
+# --- one temp-wav player behind play_chunk and play_samples (M8) ---------------------
+heard = []
+real_play_audio_file = kokoro_voice.play_audio_file
+kokoro_voice.play_audio_file = lambda path, timeout=30: (heard.append((path, Path(path).read_bytes())), True)[1]
+check("play_chunk writes one temp wav, plays it and deletes it",
+      kokoro_voice.play_chunk([0.0] * 240, 24000, engine_common.data_dir()) is True
+      and len(heard) == 1 and heard[0][1] == b"RIFF" and not Path(heard[0][0]).exists(), heard)
+engine_common.try_claim_lock(engine_common.data_dir(), 10.0)
+check("play_samples plays the same way and releases the tts lock",
+      kokoro_voice.play_samples([0.0] * 240, 24000) is True and len(heard) == 2
+      and not Path(heard[1][0]).exists()
+      and engine_common.tts_lock_path(engine_common.data_dir()).exists() is False, heard)
+kokoro_voice.play_audio_file = real_play_audio_file
 
 # --- a discarded prefetch is cancelled, so it never occupies the worker ----------
 cancel_speaker = kokoro_voice.KokoroSpeaker(FakeKokoro(delay=0.3), PLAY)

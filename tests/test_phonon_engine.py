@@ -228,8 +228,8 @@ check("once released, the worker ends and closes the generator", wait_for(lambda
 check("and nothing more reaches the sink", wedged_sink.written == 0, wedged_sink.log)
 
 # --- idle and warm-up -------------------------------------------------------------------
-speaker.idle()
-check("idle releases the audio device", sink.closed == 1)
+speaker.release_output()
+check("release_output releases the audio device", sink.closed == 1)
 warm_sink = FakeSink()
 warm = phonon_voice.PhononSpeaker(FakeTTS(), warm_sink)
 before = len(streams)

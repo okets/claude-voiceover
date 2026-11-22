@@ -253,12 +253,16 @@ def kokoro_project(device=None) -> Path:
 
 
 def kokoro_command(*args):
-    """The uv argv that runs the Kokoro engine with args, on the configured device.
+    """The argv that runs the Kokoro narration client with args.
 
-    tts_device "gpu" switches to the separate tts-gpu project (onnxruntime-gpu with
+    Linux/macOS: plain Python (the client talks to the shared engine, which
+    owns the model and the device). Windows: the in-process engine under uv, on
+    the configured device. tts_device "gpu" switches to the separate tts-gpu project (onnxruntime-gpu with
     its CUDA/cuDNN wheels), never on macOS. The engine reads the same machine-wide
     setting to pick its provider and falls back to CPU when the GPU is unusable.
     """
+    if sys.platform != "win32":  # the shared engine owns the model; this client is stdlib-only
+        return [sys.executable, str(_TTS_DIR / "kokoro_voice.py")] + list(args)
     return ["uv", "run", "--project", str(kokoro_project()),
             str(_TTS_DIR / "kokoro_voice.py")] + list(args)
 

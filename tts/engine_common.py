@@ -378,7 +378,8 @@ def split_sentences(text):
             if piece and piece.strip()]
 
 
-def _read_json(path):
+def read_json(path):
+    """A JSON object from path, or None when it is missing, unreadable or not an object."""
     try:
         with open(path, encoding="utf-8") as handle:
             loaded = json.load(handle)
@@ -397,7 +398,7 @@ def _own_pending(root, engine_names):
     """(path, item) for this engine's readable pending items, oldest first."""
     own = []
     for path in sorted(queue_dir(root).glob("*.json")):
-        item = _read_json(path)
+        item = read_json(path)
         if item is not None and _owned(item, engine_names):
             own.append((path, item))
     return own
@@ -417,7 +418,7 @@ def foreign_pending(root, engine_names, since) -> bool:
     started must not make every new engine leave at once, which would have the
     hooks respawn it in a loop."""
     for path in sorted(queue_dir(root).glob("*.json")):
-        item = _read_json(path)
+        item = read_json(path)
         if item is not None and not _owned(item, engine_names) and _created(item) > since:
             return True
     return False
@@ -500,7 +501,7 @@ def stop_requested(root, item) -> bool:
     created = _created(item)
     directory = Path(root) / _STOP_DIR_NAME
     for name in {_stop_file_name(item.get("session")), _stop_file_name(None)}:
-        request = _read_json(directory / name)
+        request = read_json(directory / name)
         try:
             if request and float(request.get("ts")) > created:
                 return True
@@ -671,17 +672,17 @@ def _prefetch_next(root, speaker, engine_names) -> bool:
     return True
 
 
-def _notify_idle(speaker):
-    """Tell a speaker that defines idle() the queue has nothing of its own:
-    it may release what it holds open (an audio device). Called on every
-    empty poll, so idle() must be near-free when there is nothing to release."""
-    idle = getattr(speaker, "idle", None)
-    if not callable(idle):
+def _release_output(speaker):
+    """Tell a speaker that defines release_output() the queue has nothing of
+    its own: it lets go of what it holds open (an audio device). Called on
+    every empty poll, so it must be near-free when there is nothing to release."""
+    release = getattr(speaker, "release_output", None)
+    if not callable(release):
         return
     try:
-        idle()
+        release()
     except Exception as error:
-        engine_log("error", "idle() %s: %s" % (type(error).__name__, error))
+        engine_log("error", "release_output() %s: %s" % (type(error).__name__, error))
 
 
 def _speak_item(root, speaker, item, engine_names, keeper, poll_seconds):
@@ -791,8 +792,8 @@ def drain(root, open_speaker, engine_names, lock_seconds=60.0,
     for more, polling every poll_seconds, so the model stays loaded for the
     turn's next sentence - unless another engine's items arrived after this
     drain started: then it hands the project over and exits, lease or not.
-    A speaker's optional idle() is called whenever there is nothing of its
-    own to speak. A drain started while a DIFFERENT engine holds the lock
+    A speaker's optional release_output() is called whenever there is nothing
+    of its own to speak; its optional idle() while the drain waits on a lease. A drain started while a DIFFERENT engine holds the lock
     waits for it to hand over (_await_handover) instead of exiting; one
     started while the same engine holds it exits. At most MAX_ENGINES projects' engines run at once;
     another steps aside.
@@ -826,7 +827,7 @@ def drain(root, open_speaker, engine_names, lock_seconds=60.0,
         while True:
             item, taken_path = next_item(root, engine_names)
             if item is None:
-                _notify_idle(speaker)
+                _release_output(speaker)
                 if foreign_pending(root, engine_names, started):
                     # The user switched engine: hand the project over now,
                     # even under a lease. The finally releases the lock, so
@@ -835,6 +836,7 @@ def drain(root, open_speaker, engine_names, lock_seconds=60.0,
                     return 0
                 if lease_is_live(root):
                     keeper.keep()  # a session's turn is running: stay warm
+                    getattr(speaker, "idle", lambda: None)()
                     time.sleep(poll_seconds)
                     continue
                 remove_tts_lock(root)
