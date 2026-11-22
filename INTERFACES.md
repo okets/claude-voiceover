@@ -305,6 +305,7 @@ def peek_next(root, engine_names=None)                # the item next_item would
 def newer_utterance_pending(root, utterance, engine_names=None) -> bool
 def stop_requested(root, item) -> bool   # a stop for item's session (or _all) newer than item's "created"
 def lease_is_live(root) -> bool          # any unexpired <root>/leases/*.json; read-only
+def foreign_pending(root, engine_names, since) -> bool  # another engine's item, created after `since`
 def drain(root, open_speaker, engine_names, lock_seconds=60.0, poll_seconds=POLL_SECONDS) -> int
 ```
 
@@ -320,6 +321,10 @@ Speakers (`open_speaker()` returns one, or falsy on failed setup) provide
 a `Playback` has `poll() -> bool` (True once over) and `kill()`. `ProcessPlayback(process,
 cleanup=None)` wraps a child process; `DryRunSpeaker` prints `[voiceover] <sentence>`.
 `drain()` prefetches the next item's first sentence during an item's last one.
+A speaker may also define `idle()`: `drain()` calls it each time it finds nothing of its own
+to speak, before it waits on a lease or exits. It is called on every such poll, so it must be
+near-free when there is nothing to release, and return within 200 ms. Speakers without it are
+unaffected.
 
 Each spoken sentence logs (`engine_log("sound", ...)`, debug_log setting on):
 `source=<source> utterance=<utterance> lag_created=<s> lag_shown=<s> chars=<n> :: <first 60 chars>`.
@@ -329,7 +334,12 @@ A missing `source`, `utterance` or `lag_shown` prints as `-`.
 `drain()` claims the lock BEFORE `open_speaker()` loads anything, and tracks ownership with
 an internal flag: it releases the lock only when it holds it, and never deletes one another
 engine owns. It stays up while `lease_is_live(root)` (polling), and exits once the spool is
-dry and no lease remains. If `MAX_ENGINES` other projects' engines already hold locks it
+dry and no lease remains. With nothing of its own to speak, it hands over: when
+`foreign_pending(root, engine_names, started)` is true (`started` = when it claimed its lock),
+it logs `handover` and exits even under a live lease, so the next hook starts the engine those
+items name. It never abandons a sentence it is speaking and never touches the other engine's
+items. A foreign item queued before it started does not count, so a leftover item for an engine
+nobody starts cannot make every new drainer exit at once. If `MAX_ENGINES` other projects' engines already hold locks it
 steps aside; if `open_speaker()` fails it releases the lock and backs the hooks off for 30s.
 
 The spawn marker `<root>/spawned.json` (`{"ts"}`) is written by `speech.ensure_drainer`

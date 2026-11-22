@@ -377,6 +377,26 @@ def _own_pending(root, engine_names):
     return own
 
 
+def _created(item):
+    try:
+        return float(item.get("created") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def foreign_pending(root, engine_names, since) -> bool:
+    """True when another engine's item was queued after `since`.
+
+    Only items newer than `since` count: a leftover queued before this engine
+    started must not make every new engine leave at once, which would have the
+    hooks respawn it in a loop."""
+    for path in sorted(queue_dir(root).glob("*.json")):
+        item = _read_json(path)
+        if item is not None and not _owned(item, engine_names) and _created(item) > since:
+            return True
+    return False
+
+
 def _survives(item, newest):
     """Whether the jump rule keeps item, given the newest own pending item."""
     if item is newest or item.get("sticky"):
@@ -451,10 +471,7 @@ def stop_requested(root, item) -> bool:
     """True when a stop for item's session - or for every session - was
     requested after item was queued. A stop can therefore never cut a reply
     queued after it, and each session's request is a file of its own."""
-    try:
-        created = float(item.get("created") or 0)
-    except (TypeError, ValueError):
-        created = 0.0
+    created = _created(item)
     directory = Path(root) / _STOP_DIR_NAME
     for name in {_stop_file_name(item.get("session")), _stop_file_name(None)}:
         request = _read_json(directory / name)
@@ -628,6 +645,15 @@ def _prefetch_next(root, speaker, engine_names) -> bool:
     return True
 
 
+def _notify_idle(speaker):
+    """Tell a speaker that defines idle() the queue has nothing of its own:
+    it may release what it holds open (an audio device). Called on every
+    empty poll, so idle() must be near-free when there is nothing to release."""
+    idle = getattr(speaker, "idle", None)
+    if callable(idle):
+        idle()
+
+
 def _speak_item(root, speaker, item, engine_names, keeper, poll_seconds):
     """Play item sentence by sentence until it ends, is stopped or superseded.
 
@@ -688,12 +714,16 @@ def drain(root, open_speaker, engine_names, lock_seconds=60.0,
     item a moment earlier and saw the lock still held. A lock this drain does
     not own is never deleted. While a session holds a lease the drain waits
     for more, polling every poll_seconds, so the model stays loaded for the
-    turn's next sentence. At most MAX_ENGINES projects' engines run at once;
+    turn's next sentence - unless another engine's items arrived after this
+    drain started: then it hands the project over and exits, lease or not.
+    A speaker's optional idle() is called whenever there is nothing of its
+    own to speak. At most MAX_ENGINES projects' engines run at once;
     another steps aside.
     """
     root = Path(root)
     if not try_claim_lock(root, lock_seconds):
         return 0  # another engine is already draining this project
+    started = time.time()
     owns_lock = True
     keeper = _LockKeeper(root, lock_seconds)
     try:
@@ -718,6 +748,13 @@ def drain(root, open_speaker, engine_names, lock_seconds=60.0,
         while True:
             item, taken_path = next_item(root, engine_names)
             if item is None:
+                _notify_idle(speaker)
+                if foreign_pending(root, engine_names, started):
+                    # The user switched engine: hand the project over now,
+                    # even under a lease. The finally releases the lock, so
+                    # the next hook starts the engine those items name.
+                    engine_log("handover", "another engine's speech is pending")
+                    return 0
                 if lease_is_live(root):
                     keeper.keep()  # a session's turn is running: stay warm
                     time.sleep(poll_seconds)
