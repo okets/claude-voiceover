@@ -36,10 +36,10 @@ Hierarchy (first hit wins): project `<cwd>/.claude/voiceover.json` → global
 ```python
 DEFAULTS = {
     "interaction_level": "concise",     # silent | quiet | concise | verbose
-    "tts_engine": "auto",               # auto | kokoro | macos-female | macos-male | none
+    "tts_engine": "auto",               # auto | kokoro | phonon | macos-female | macos-male | none
     "tts_enabled": True,
     "notification_sounds": True,        # quiet-mode mp3 pings
-    "voice": None,                      # explicit kokoro voice id, else per-project hash
+    "voice": None,                      # explicit voice for the engine (Kokoro id or Phonon name), else per-project hash
     "speak_subagent_completions": True, # verbose level only
 }
 
@@ -53,17 +53,27 @@ def get_interaction_level(cwd=None) -> str                   # normalized string
 def level_at_least(minimum: str, cwd=None) -> bool           # ordering per LEVELS
 def is_tts_enabled(cwd=None) -> bool                         # tts_enabled and level != silent
 def resolve_engine(cwd=None) -> str
-    # "auto": macOS -> "macos-female"; else "kokoro" if models_present() else "none"
+    # explicit "kokoro" | "phonon" | "macos-female" | "macos-male" | "none" as given;
+    # "auto": macOS -> "macos-female"; else "kokoro" if models_present() else "none" (never phonon)
 def get_voice(cwd=None) -> str
-    # explicit setting wins; else for kokoro: stable choice from KOKORO_VOICES by
-    # sha1(project_root) — the "random voice per project" behavior, now stateless
+    # engine-aware. Under phonon: the explicit voice if is_phonon_voice(), else a stable pick from
+    # PHONON_VOICES (standard voices only) by sha1(project_root). Under any other engine: any
+    # explicit string as given, except a Phonon name, which falls back to the stable pick from
+    # KOKORO_VOICES by sha1(project_root) — the "random voice per project" behavior, stateless
 def models_present() -> bool                                  # ~/.kokoro-tts/models/*.onnx exists
+def is_phonon_voice(name) -> bool             # one of the 37 catalogue names or "default", exact case
+def phonon_model_present() -> bool
+    # <hub>/models--gradium--phonon-31m-en/snapshots/*/model.q8.gguf exists, <hub> = $HF_HOME/hub
+    # or ~/.cache/huggingface/hub (measured in the spike). Reads the folder; never raises
 def detect_project_root(cwd=None) -> Path
     # nearest .claude dir, else git root, else cwd. ~/.claude is Claude Code's own user
     # configuration, NOT a project marker: accepting it would give every project without a
     # .claude of its own the home directory as its root (one shared queue and voice).
 
 KOKORO_VOICES = [...all 13 ids...]  # af_alloy? -> use the real 13 ids from old kokoro_voice.py
+PHONON_VOICES = [...25 standard names...]          # Zoey ... Bryony, catalogue order and case
+PHONON_CHARACTER_VOICES = [...12 character names...]  # Captain Silas Blackwater ... Fairy Godmother
+PHONON_DEFAULT_VOICE = "default"                    # bundled with the model; the offline fallback
 ```
 
 ## voiceover/projects.py
