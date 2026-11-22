@@ -23,6 +23,9 @@ from pathlib import Path
 TTS_PROCESS_PATTERNS = [
     "kokoro_voice.py --voice",
     "macos_say.py --voice",
+    # Phonon's one-shot plays in-process (or through a piped player child that
+    # dies with the engine's process group), so the engine is the whole stop.
+    "phonon_voice.py --voice",
     "tts_controller.py",
     # The `say` children macos_say.py's one-shot path launches.
     "say -v Samantha",
@@ -31,6 +34,10 @@ TTS_PROCESS_PATTERNS = [
     "afplay .*voiceover-oneshot-.*\\.wav",
 ]
 
+
+# The engine scripts a lock may name as its owner: a lock-owner pid is only
+# signalled when its command line runs one of these (pids get recycled).
+ENGINE_SCRIPTS = ("kokoro_voice.py", "macos_say.py", "phonon_voice.py")
 
 def pid_is_running(pid) -> bool:
     """True while a process with this pid exists.
@@ -100,7 +107,7 @@ def _kill_lock_owner_group(lock_path) -> None:
         probe = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
                                capture_output=True, text=True, timeout=2)
         command = probe.stdout.strip()
-        if "kokoro_voice.py" in command or "macos_say.py" in command:
+        if any(script in command for script in ENGINE_SCRIPTS):
             os.killpg(os.getpgid(pid), signal.SIGTERM)
     except Exception:
         pass

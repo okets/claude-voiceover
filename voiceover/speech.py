@@ -4,6 +4,7 @@ speak() gates on settings, truncates, honors the TTS lock, then spawns the
 resolved engine as a DETACHED subprocess (never waits):
 
     kokoro       -> uv run --project <plugin>/tts <plugin>/tts/kokoro_voice.py --voice <voice> --stream <text>
+    phonon       -> uv run --project <plugin>/tts-phonon <plugin>/tts/phonon_voice.py --voice <voice> --stream <text>
     macos-female -> python3 <plugin>/tts/macos_say.py --voice Samantha <text>
     macos-male   -> python3 <plugin>/tts/macos_say.py --voice Daniel <text>
     none         -> no-op
@@ -38,6 +39,7 @@ from .projects import project_dir, session_slug
 _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 _TTS_DIR = _PLUGIN_ROOT / "tts"
 _TTS_GPU_DIR = _PLUGIN_ROOT / "tts-gpu"
+_TTS_PHONON_DIR = _PLUGIN_ROOT / "tts-phonon"
 _SOUNDS_DIR = Path(__file__).resolve().parent / "sounds"
 
 _LOCK_FILE_NAME = "tts.lock"
@@ -122,8 +124,8 @@ def enqueue_speech(text, min_level="concise", cwd=None, full=False, session=None
         if engine == "none":
             return False
         # Resolve the voice for THIS engine, exactly as _dispatch does: the
-        # macOS engines take a `say -v <Name>` voice, and get_voice() only
-        # ever returns a kokoro id.
+        # macOS engines take a `say -v <Name>` voice; get_voice() returns the
+        # Kokoro id or Phonon name for the project's resolved engine.
         voice = _MACOS_VOICES.get(engine) or get_voice(cwd)
         queued = spool.enqueue(message, engine, voice, session=session,
                                utterance=utterance, sticky=sticky, shown=shown,
@@ -261,12 +263,28 @@ def kokoro_command(*args):
             str(_TTS_DIR / "kokoro_voice.py")] + list(args)
 
 
+def phonon_command(*args):
+    """The uv argv that runs the Phonon engine with args, from its own uv
+    project (tts-phonon/), which carries nothing of Kokoro's."""
+    return ["uv", "run", "--project", str(_TTS_PHONON_DIR),
+            str(_TTS_DIR / "phonon_voice.py")] + list(args)
+
+
+def macos_say_command(*args):
+    """The argv that runs the macOS `say` engine with args (plain python3)."""
+    return ["python3", str(_TTS_DIR / "macos_say.py")] + list(args)
+
+
+# The neural engines, by name: each builds its own uv command line.
+_NEURAL_COMMANDS = {"kokoro": kokoro_command, "phonon": phonon_command}
+
+
 def _drain_command(engine, root):
     """The argv that drains root's spool with engine, or None for no engine."""
-    if engine == "kokoro":
-        return kokoro_command("--drain", str(root))
+    if engine in _NEURAL_COMMANDS:
+        return _NEURAL_COMMANDS[engine]("--drain", str(root))
     if engine in _MACOS_VOICES:
-        return ["python3", str(_TTS_DIR / "macos_say.py"), "--drain", str(root)]
+        return macos_say_command("--drain", str(root))
     return None
 
 
@@ -314,13 +332,10 @@ def truncate_for_speech(text, limit: int = 220) -> str:
 # ---------------------------------------------------------------------------
 
 def _dispatch(message, engine, cwd) -> None:
-    if engine == "kokoro":
-        command = kokoro_command("--voice", get_voice(cwd), "--stream", message)
+    if engine in _NEURAL_COMMANDS:
+        command = _NEURAL_COMMANDS[engine]("--voice", get_voice(cwd), "--stream", message)
     elif engine in _MACOS_VOICES:
-        command = [
-            "python3", str(_TTS_DIR / "macos_say.py"),
-            "--voice", _MACOS_VOICES[engine], message,
-        ]
+        command = macos_say_command("--voice", _MACOS_VOICES[engine], message)
     else:  # "none" or unknown
         return False
     # The engine owns the lock lifecycle (atomic claim -> speak -> remove).

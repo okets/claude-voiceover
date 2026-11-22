@@ -181,6 +181,11 @@ def ensure_drainer(cwd=None) -> bool
     # resolved engine is not among them and items are queued for the resolved engine, it spawns the resolved engine anyway
     # (the 3s back-off still applies). That newcomer waits for the holder to hand over; no hook waits.
 def prewarm(cwd=None, session=None, ttl=lease.LEASE_TTL) -> bool   # lease.hold + ensure_drainer
+def kokoro_command(*args) -> list    # uv run --project <tts or tts-gpu> <plugin>/tts/kokoro_voice.py *args
+def phonon_command(*args) -> list    # uv run --project <plugin>/tts-phonon <plugin>/tts/phonon_voice.py *args
+def macos_say_command(*args) -> list # python3 <plugin>/tts/macos_say.py *args
+    # The drain command and the one-shot dispatch look the neural engines up in one table
+    # (kokoro -> kokoro_command, phonon -> phonon_command); macOS voices use macos_say_command.
 def request_stop(cwd=None, session=None) -> None
     # ask the project's engine to stop session's sentence now (None: any): <project>/stop/<slug|_all>.json
     # {"ts"}. The engine honours only items queued before the request.
@@ -462,12 +467,15 @@ next prompt's cutover, ends the process.
 
 Straight ports (cross-platform playback / TTS-process kill). One fix: make the Unix kill
 target only OUR processes — never a bare `pkill -f say`. `TTS_PROCESS_PATTERNS` match the
-ONE-SHOT speaker only (`kokoro_voice.py --voice`, `macos_say.py --voice`, `say -v <Name>`,
+ONE-SHOT speaker only (`kokoro_voice.py --voice`, `phonon_voice.py --voice`, `macos_say.py --voice`, `say -v <Name>`,
 the one-shot temp wav playback, `tts_controller.py`): narrator drainers run as
 `--drain <project dir>`, speak through `say --voice=<Name>` and play wavs from their
 project's `play/` dir, so a concise-level interrupt can never cut off another project's
 narration. `process_utils.lock_owner_is_running(lock_path)` / `pid_is_running(pid)` give
-the lock-owner liveness check hooks use.
+the lock-owner liveness check hooks use. `ENGINE_SCRIPTS` (kokoro_voice.py, macos_say.py,
+phonon_voice.py) is the one list a lock-owner pid's command line must match before its process
+group is signalled. Phonon's one-shot plays in-process on macOS and Windows, so killing the
+engine is the whole stop there.
 
 ## tts/
 
@@ -481,11 +489,14 @@ the lock-owner liveness check hooks use.
   auto-download to ~/.kokoro-tts/models, plays via voiceover/audio_player logic duplicated
   locally or inline — this file may NOT import voiceover/ (different process/venv); it stays
   self-contained like today).
+- `tts/phonon_voice.py` (run from `tts-phonon/`) — the Phonon engine; see its own section above.
 - `tts/macos_say.py --voice <Name> <text>` — collapse of the 3 old macos_*_tts.py scripts;
   stdlib only; uses `say`.
 - `tts/tts_controller.py stop` — kill switch: kills every lock owner's process group (the
   one-shot speaker's lock and every project's `projects/*/tts.lock`, pid verified against
-  our engine names), pattern-kills our engine and audio-child lines, then `clear_projects()`
+  our engine names, `ENGINE_SCRIPTS`), pattern-kills our engine lines (`kokoro_voice.py`,
+  `macos_say.py`, `phonon_voice.py` — a drainer or one-shot, including a Phonon newcomer waiting
+  without a lock) and audio-child lines, then `clear_projects()`
   drops every project's lock, spawn marker, stop files, queue, leases and wavs.
 
 ## hooks/

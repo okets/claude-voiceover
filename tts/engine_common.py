@@ -1,8 +1,8 @@
 # tts/engine_common.py
 """Shared engine-side helpers for the claude-voiceover TTS engines.
 
-Imported as a sibling by tts/kokoro_voice.py and tts/macos_say.py, both of
-which resolve it through sys.path[0] (their own directory) whether they run
+Imported as a sibling by tts/kokoro_voice.py, tts/phonon_voice.py and
+tts/macos_say.py, all of which resolve it through sys.path[0] (their own directory) whether they run
 under `uv run` or plain python3.
 
 This file MUST NOT import from voiceover/ - the engines live in a different
