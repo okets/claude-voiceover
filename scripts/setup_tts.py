@@ -2,15 +2,19 @@
 """Claude Voiceover first-run setup.
 
 Usage:
-    setup_tts.py                Print a status report and next steps
-    setup_tts.py --download     Download the Kokoro models (~300MB, one time)
-    setup_tts.py --test         Speak a sample line through the resolved engine
+    setup_tts.py                    Print a status report and next steps
+    setup_tts.py --download-phonon  Install the Phonon voices (~65MB model, one time)
+    setup_tts.py --download         Download the Kokoro models (~300MB, one time)
+    setup_tts.py --test             Speak a sample line through the resolved engine
 
 Checks tooling (uv, audio playback), reuses an existing ~/.kokoro-tts cache,
-and never re-downloads models that are already present. Stdlib only.
+and never re-downloads models that are already present. Installing an engine
+never selects it: the engine changes only when the user picks a voice.
+Stdlib only (sounddevice lives only in the Phonon environment).
 """
 
 import argparse
+import ctypes.util
 import os
 import platform
 import shutil
@@ -22,8 +26,11 @@ from pathlib import Path
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PLUGIN_ROOT))
 
+sys.path.insert(1, str(PLUGIN_ROOT / "tts"))
+
 from voiceover import settings  # noqa: E402
-from voiceover.speech import kokoro_command  # noqa: E402
+from voiceover.speech import one_shot_command, phonon_command  # noqa: E402
+from pcm_sink import PLAYER_NAMES  # noqa: E402  (stdlib only; never imports sounddevice)
 
 KOKORO_DIR = Path.home() / ".kokoro-tts" / "models"
 MODEL_FILES = {
@@ -32,6 +39,9 @@ MODEL_FILES = {
 }
 
 LINUX_PLAYERS = ["ffplay", "aplay", "paplay", "mpv"]
+PHONON_INSTALL_TIMEOUT = 600  # the first run also builds the tts-phonon environment
+RECOMMENDED_PHONON = "zoey"   # placeholder until the user picks one after hearing them
+NOT_SELECTED = "Phonon is installed but not selected. Pick a voice with /voiceover:voice."
 
 
 def check(label, ok, detail_ok="", detail_missing=""):
@@ -56,6 +66,47 @@ def audio_player_found():
     return None
 
 
+def portaudio_found():
+    """Whether the PortAudio library sounddevice needs is installed (Linux)."""
+    return ctypes.util.find_library("portaudio") is not None
+
+
+def phonon_audio_status():
+    """(ok, detail) for Phonon's streaming output on this platform. macOS and
+    Windows get PortAudio from the sounddevice wheel; Linux needs the system
+    library or one of the raw-audio players the engine can pipe to."""
+    if platform.system() in ("Darwin", "Windows"):
+        return True, "PortAudio (bundled with the Phonon environment)"
+    if portaudio_found():
+        return True, "PortAudio"
+    players = [name for name in PLAYER_NAMES if shutil.which(name)]
+    if players:
+        return True, "piped to " + players[0]
+    return False, ("no PortAudio and no player - install one of " + ", ".join(PLAYER_NAMES)
+                   + " (e.g. alsa-utils for aplay, or ffmpeg for ffplay), or libportaudio2")
+
+
+def phonon_selected():
+    return settings.resolve_engine() == "phonon"
+
+
+def print_phonon_status():
+    """Phonon's block of the report. Returns True when its model is installed."""
+    print("Phonon neural voices (37 voices, local and free, about 65MB):")
+    installed = check("Phonon model", settings.phonon_model_present(), "installed", "not downloaded")
+    audio_ok, detail = phonon_audio_status()
+    check("Phonon audio output", audio_ok, detail, detail)
+    print()
+    if not installed:
+        print("Phonon is not installed. Run: setup_tts.py --download-phonon  (~65MB, one time)")
+    elif not phonon_selected():
+        print(NOT_SELECTED)
+    else:
+        print("Phonon is installed and selected.")
+    print()
+    return installed
+
+
 def model_status():
     """Return (all_present, list of (name, path, present, size_mb))."""
     rows = []
@@ -78,12 +129,13 @@ def print_status():
     print()
     print("Tooling:")
     uv_ok = check("uv package manager", shutil.which("uv") is not None,
-                  shutil.which("uv") or "", "needed for Kokoro voices - install: https://docs.astral.sh/uv/")
+                  shutil.which("uv") or "", "needed for Phonon and Kokoro voices - install: https://docs.astral.sh/uv/")
     player = audio_player_found()
     check("audio playback", player is not None, str(player), "install ffmpeg (ffplay) or another audio player")
     if system == "Darwin":
         check("macOS 'say' voices", shutil.which("say") is not None, "instant, zero-setup narration")
     print()
+    phonon_ok = print_phonon_status()
     print("Kokoro neural voices (13 voices, local and free):")
     models_ok, rows = model_status()
     for name, path, present, size_mb in rows:
@@ -98,7 +150,27 @@ def print_status():
     print(f"Resolved voice:  {settings.get_voice()}")
     print(f"TTS device:      {settings.get_machine_setting('tts_device')}"
           " (gpu = NVIDIA CUDA via the tts-gpu environment; manage_settings.py set tts_device gpu)")
-    return models_ok and uv_ok
+    return (models_ok or phonon_ok) and uv_ok
+
+
+def install_phonon():
+    """Run the Phonon engine's --install through uv (the first run also builds
+    its environment), its output on the terminal. Selects nothing."""
+    print("Installing Phonon (builds its environment and downloads the ~65MB model)...")
+    try:
+        code = subprocess.run(phonon_command("--install"), timeout=PHONON_INSTALL_TIMEOUT).returncode
+    except subprocess.TimeoutExpired:
+        print(f"Phonon install failed: timed out after {PHONON_INSTALL_TIMEOUT}s.")
+        return False
+    except OSError as error:
+        print(f"Phonon install failed: could not run uv ({error}). Install uv: https://docs.astral.sh/uv/")
+        return False
+    if code != 0:
+        print(f"Phonon install failed (exit {code}); the engine's error is above.")
+        return False
+    print("Phonon installed. Your current voice is unchanged.")
+    print(f"Next step: pick a voice with /voiceover:voice (for example {RECOMMENDED_PHONON}).")
+    return True
 
 
 def download_progress(name):
@@ -146,13 +218,12 @@ def speak_test():
         print(f"[voiceover] {text}", file=sys.stderr)
         return True
     engine = settings.resolve_engine()
-    if engine == "kokoro":
-        command = kokoro_command("--voice", settings.get_voice(), text)
-    elif engine in ("macos-female", "macos-male"):
-        voice = "Samantha" if engine == "macos-female" else "Daniel"
-        command = [sys.executable, str(PLUGIN_ROOT / "tts" / "macos_say.py"), "--voice", voice, text]
-    else:
-        print("No usable engine yet - download Kokoro models or switch to a macOS voice.")
+    command = one_shot_command(engine, settings.get_voice(), text, stream=False)
+    if command is None:
+        if settings.phonon_model_present():
+            print(NOT_SELECTED)
+        else:
+            print("No usable engine yet - install Phonon or Kokoro, or switch to a macOS voice.")
         return False
     print(f"Speaking a test line via {engine}...")
     try:
@@ -164,10 +235,16 @@ def speak_test():
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="setup_tts.py", description="Claude Voiceover first-run setup")
+    parser.add_argument("--download-phonon", action="store_true",
+                        help="Install the Phonon voices (~65MB model; builds its environment)")
     parser.add_argument("--download", action="store_true", help="Download Kokoro models (~300MB, skips files already cached)")
     parser.add_argument("--test", action="store_true", help="Speak a sample line to verify audio")
     args = parser.parse_args(argv)
 
+    if args.download_phonon:
+        if not install_phonon():
+            return 1
+        print()
     if args.download:
         ok = download_models()
         if not ok:
@@ -178,9 +255,10 @@ def main(argv=None):
         print()
         if not speak_test():
             return 1
-    if not args.download and not ready:
+    if not (args.download or args.download_phonon) and not ready:
         print()
-        print("Next step: setup_tts.py --download, or pick a macOS voice with /voiceover:voice default-female")
+        print("Next step: setup_tts.py --download-phonon (Phonon, ~65MB) or --download (Kokoro, ~300MB),"
+              " or pick a macOS voice with /voiceover:voice default-female")
     return 0
 
 

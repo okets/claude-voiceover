@@ -35,6 +35,7 @@ _PLAYERS = (
     ["pw-cat", "--playback", "--raw", "--format", "f32", "--rate", "24000", "--channels", "1", "-"],
     ["ffplay", "-f", "f32le", "-ar", "24000", "-nodisp", "-autoexit", "-loglevel", "error", "-i", "-"],
 )
+PLAYER_NAMES = tuple(command[0] for command in _PLAYERS)  # setup reports which is on PATH
 
 
 class Sink:

@@ -398,6 +398,7 @@ class Sink:
 class SoundDeviceSink(Sink)          # PortAudio, callback-fed (latency="low", blocksize=480)
 class PipeSink(Sink)                 # PipeSink(command): a player process fed on stdin
 def player_command() -> list | None  # first player on PATH: aplay, paplay, pw-cat, ffplay
+PLAYER_NAMES = ("aplay", "paplay", "pw-cat", "ffplay")   # in that order; setup reports them
 def open_sink() -> Sink | None       # SoundDeviceSink, else PipeSink, else None; never raises
 ```
 
@@ -660,8 +661,18 @@ hooks/), and Stop does not end its turn; `turn.complete` does. Items the mod que
   `speech.one_shot_command(engine, voice, text, stream=False)`. `recommend` names `zoey` (a
   placeholder until the user picks one) when Phonon is ready, else the previous advice plus one
   line mentioning Phonon.
-- `setup_tts.py` — first-run: check uv/ffplay availability, offer kokoro model download
-  (~300MB to ~/.kokoro-tts), verify audio, print status. Reuses existing ~/.kokoro-tts cache.
+- `setup_tts.py [--download-phonon] [--download] [--test]` — first-run: check uv/ffplay
+  availability, print status, verify audio. The status shows a Phonon block (model present via
+  `settings.phonon_model_present()`; audio output: bundled PortAudio on macOS/Windows, on Linux
+  the PortAudio library (`ctypes.util.find_library`) or the first of `pcm_sink.PLAYER_NAMES` on
+  PATH, else what to install; never imports sounddevice) before the Kokoro block, and says
+  "Phonon is installed but not selected. Pick a voice with /voiceover:voice." when the model is
+  present and the resolved engine is not phonon. `--download-phonon` runs
+  `speech.phonon_command("--install")` with its output on the terminal and a 600 s timeout (the
+  first run builds tts-phonon/), then names `/voiceover:voice` (zoey as the placeholder
+  suggestion); a failure exits 1. `--download` keeps meaning Kokoro (~300MB to ~/.kokoro-tts;
+  an existing cache is reused). Installing never selects an engine. `--test` speaks through
+  `speech.one_shot_command(..., stream=False)`.
 - `migrate_legacy.py [--dry-run]` — detect legacy smarter-claude install (~/.claude/VERSION or
   'uv run ~/.claude/hooks/' in ~/.claude/settings.json); back up settings.json; strip the five
   legacy hook groups; list (and with --yes delete) legacy files; never touch statusLine,
