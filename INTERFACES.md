@@ -450,6 +450,13 @@ aborts the sink (silence first), and returns without waiting for the generator; 
 and each write happen under one lock, so no chunk reaches the sink after `kill()` returns. The
 one-shot waits for `remaining()` to reach 0 before closing the sink, so the end is not cut off.
 `--install` and `--fetch-voice` never open the audio device. `--fetch-voice` has no fallback.
+A sentence that completes no write for `stall_seconds` (30 s; a `PhononSpeaker` argument)
+while the worker is still running is killed by `poll()`, logged as `stall`, and reported done:
+a player that stopped reading blocks the worker inside its write, and the abort ends that player.
+
+Known limit: if `ptts` itself hangs inside generation, that sentence is abandoned after 30 s, but
+the single worker thread stays occupied, so later sentences stall too. The kill switch, or the
+next prompt's cutover, ends the process.
 
 ## voiceover/audio_player.py, voiceover/process_utils.py
 

@@ -7,6 +7,10 @@
 # PortAudio cannot load (Linux without the system library) the engine pipes audio
 # to a player process instead.
 #
+# Python: run for real on 3.12 (macOS, the builder's spike and smoke tests) and on
+# 3.12 and 3.14 (Ubuntu, the measuring session). 3.15 only resolved, never installed,
+# so it is excluded until it has been run.
+#
 # Keep Kokoro's packages (kokoro-onnx, onnxruntime, soundfile) out of this file,
 # and ptts/sounddevice out of ../tts and ../tts-gpu (tests/test_phonon_engine.py checks).
 
@@ -14,7 +18,7 @@
 name = "claude-voiceover-tts-phonon"
 version = "1.0.0"
 description = "Phonon TTS engine dependencies for the Claude Voiceover plugin"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.15"
 dependencies = [
     "ptts>=0.7.1",
     "sounddevice>=0.5",

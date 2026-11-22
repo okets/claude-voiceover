@@ -53,16 +53,18 @@ class FakeChunk:
 
 
 class FakeStream:
-    def __init__(self, text, voice, chunks=3, gate=None, fail_after=None):
+    def __init__(self, text, voice, chunks=3, gate=None, fail_after=None, hold=None):
         self.text, self.voice = text, voice
         self.closed = False
-        self._chunks, self._gate, self._fail_after = chunks, gate, fail_after
+        self._chunks, self._gate, self._fail_after, self._hold = chunks, gate, fail_after, hold
         self._produced = 0
 
     def __iter__(self):
         return self
 
     def __next__(self):
+        if self._hold is not None:
+            self._hold.wait(10)  # wedged before its first chunk until the test releases it
         if self._gate is not None and self._produced >= 1:
             self._gate.wait(5)  # the second chunk comes only once the test allows it
         if self._fail_after is not None and self._produced == self._fail_after:
@@ -210,6 +212,21 @@ check("a sentence whose audio never drains ends after its length plus the grace"
       done and time.time() - began < 1.0, time.time() - began)
 check("and the stuck audio is discarded", "abort" in stuck_sink.log)
 
+# --- a sentence that makes no progress cannot hold the engine ---------------------------
+hold = threading.Event()
+behaviour["Wedged."] = {"hold": hold}
+wedged_sink = FakeSink()
+wedged = phonon_voice.PhononSpeaker(FakeTTS(), wedged_sink, stall_seconds=0.1)
+playback = wedged.begin("Wedged.", "Bryony")
+began = time.time()
+done = wait_for(playback.poll, seconds=3.0)
+check("a sentence with no completed write for the stall limit ends",
+      done and time.time() - began < 1.0, time.time() - began)
+check("and its output is aborted (which frees a write stuck on a pipe)", "abort" in wedged_sink.log)
+hold.set()
+check("once released, the worker ends and closes the generator", wait_for(lambda: streams[-1].closed))
+check("and nothing more reaches the sink", wedged_sink.written == 0, wedged_sink.log)
+
 # --- idle and warm-up -------------------------------------------------------------------
 speaker.idle()
 check("idle releases the audio device", sink.closed == 1)
@@ -336,7 +353,7 @@ def names(relative):
     """The package names in a pyproject's dependencies (house style: no tomllib on 3.10)."""
     toml = (REPO_ROOT / relative).read_text()
     block = toml.split("dependencies = [", 1)[1].split("\n]", 1)[0]
-    return {re.split(r"[\s;\[<>=!~]", dep, 1)[0].lower() for dep in re.findall(r'"([^"]+)"', block)}
+    return {re.split(r"[\s;\[<>=!~]", dep, maxsplit=1)[0].lower() for dep in re.findall(r'"([^"]+)"', block)}
 
 
 check("the Phonon environment carries nothing of Kokoro's",

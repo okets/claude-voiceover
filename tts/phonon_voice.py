@@ -47,6 +47,8 @@ FALLBACK_VOICE = "default"  # bundled with the model: works offline
 WARM_UP_TEXT = "Ready."
 FETCH_TEXT = "Hello."
 GRACE_SECONDS = 10.0  # a sentence's audio may take this long past its length to drain
+STALL_SECONDS = 30.0  # no completed write for this long: the sentence is abandoned
+                      # (far above the slowest honest gap: an offline voice fetch, 2.6 s)
 
 
 def log(message):
@@ -99,12 +101,13 @@ class PhononPlayback(Playback):
     starts after.
     """
 
-    def __init__(self, sink, grace_seconds):
-        self._sink, self._grace = sink, grace_seconds
+    def __init__(self, sink, grace_seconds, stall_seconds):
+        self._sink, self._grace, self._stall = sink, grace_seconds, stall_seconds
         self._gate = threading.Lock()
         self._cancelled = False
         self._writes = 0
         self._audio_seconds = 0.0
+        self._progress_at = time.monotonic()  # begin, then each completed write
         self._finished_at = None
         self._future = None
 
@@ -124,6 +127,7 @@ class PhononPlayback(Playback):
             self._sink.write(chunk)
             self._writes += 1
             self._audio_seconds += len(chunk) / float(SAMPLE_RATE)
+            self._progress_at = time.monotonic()
             return True
 
     def finish(self):
@@ -136,7 +140,7 @@ class PhononPlayback(Playback):
 
     def poll(self) -> bool:
         if self._future is None or not self._future.done():
-            return False
+            return self._abandon_if_stalled()
         self._future.result()  # a generation error surfaces here
         if self._sink.remaining() <= 0:
             return True
@@ -156,6 +160,16 @@ class PhononPlayback(Playback):
             if self._writes != writes:
                 self._sink.abort()  # ...is silenced too
 
+    def _abandon_if_stalled(self) -> bool:
+        """The worker has written nothing for the stall limit (a player that
+        stopped reading blocks it inside the write): kill the sentence - the
+        abort ends the player, which frees the write - and report it done."""
+        if time.monotonic() - self._progress_at <= self._stall:
+            return False
+        engine_log("stall", "no audio written for %.0f s; sentence abandoned" % self._stall)
+        self.kill()
+        return True
+
     def _overdue(self) -> bool:
         deadline = self._finished_at + self._audio_seconds + self._grace
         return time.monotonic() > deadline
@@ -169,8 +183,9 @@ class PhononSpeaker:
     calls when the queue runs dry, so a warm engine holds no device.
     """
 
-    def __init__(self, tts, sink, grace_seconds=GRACE_SECONDS):
-        self._tts, self._sink, self._grace = tts, sink, grace_seconds
+    def __init__(self, tts, sink, grace_seconds=GRACE_SECONDS, stall_seconds=STALL_SECONDS):
+        self._tts, self._sink = tts, sink
+        self._grace, self._stall = grace_seconds, stall_seconds
         self._voices = _Voices(tts)
         self._worker = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
@@ -188,7 +203,7 @@ class PhononSpeaker:
         """Nothing to do: a warm first chunk arrives in under 35 ms (measured)."""
 
     def begin(self, sentence, voice, upcoming=None):
-        playback = PhononPlayback(self._sink, self._grace)
+        playback = PhononPlayback(self._sink, self._grace, self._stall)
         playback.attach(self._worker.submit(self._render, playback, sentence, voice))
         return playback
 
