@@ -305,6 +305,72 @@ with working sound, that settles each before product code is written:
 If the spike contradicts the design (for example, audio cannot be made
 gapless, or silence is not immediate), stop and bring it back to the user.
 
+### Spike results (22 Nov 2026, plan Task 1)
+
+Run by the builder session on an Apple-silicon Mac (macOS 27.2, Python 3.12,
+`ptts` 0.7.1, `sounddevice` 0.5.6, output to an external USB speaker), with a
+throwaway venv and a scratch `HOME`, outside the repo. "Measured" means the
+program observed it; nobody listened, because the user was away. "Heard" is
+therefore not done for every audio item.
+
+1. `sounddevice` on macOS: **measured.** `import sounddevice` loads the
+   `libportaudio.dylib` bundled in its own wheel (not Homebrew's), with no
+   system package needed.
+2. Voice per stream: **measured.** `tts.stream(text, voice="Bryony")`. Names
+   match in any case (`"bryony"` works) and with spaces
+   (`"Captain Silas Blackwater"`). A voice that cannot be used raises from the
+   `stream()` call itself, before any chunk: `LookupError` for an unknown name
+   (`"Missing"`, `"af_sky"`) or an uncached voice under `HF_HUB_OFFLINE=1`;
+   `OSError` ("cannot fetch …") for an uncached voice when the network fails,
+   after about 2.6 s. The bundled `default` voice works offline.
+   `ptts.catalog_voices()` lists exactly the 37 English names in this spec.
+3. Gapless streaming: **measured, not heard.** A 12 s sentence streamed into
+   PortAudio produced zero output underflows, both with a blocking
+   `RawOutputStream.write` and with a callback-fed stream. First chunk 16 to
+   23 ms after a warm-up. The first chunk is 1,920 samples; later chunks are
+   larger (14 chunks for 12 s).
+4. Stop: **measured, not heard.** The plan's sink (blocking `write()` on a
+   worker thread, `abort()` from another thread) **crashes the process with a
+   bus error** inside `sounddevice._raw_write`, and a same-thread `abort()`
+   itself blocks for 107 ms. A **callback-fed stream** works instead: the
+   worker appends chunk bytes to a buffer the sink owns, the PortAudio callback
+   copies from it (zeros when empty), and stop empties the buffer. With
+   `latency="low"` and `blocksize=480` (20 ms): `kill()` returns in under
+   0.1 ms, the first silent callback follows 10 to 15 ms later and reaches the
+   device 14 ms after that (25 to 30 ms in all, from PortAudio's own
+   timestamps), 50 callbacks per second, zero underflows, no crash over three
+   kills, and the next sentence plays on the same open stream. Opening and
+   starting the stream takes 5 to 7 ms; `stop()`/`abort()` plus `close()`
+   takes 108 to 121 ms on macOS whichever way it is done.
+5. Linux piped player: **not done** (no Linux machine here). Measured on macOS
+   with `ffplay` 9.0.2 instead: `-ac 1` is rejected ("Option not found"); the
+   raw demuxer's default is one channel, so
+   `ffplay -f f32le -ar 24000 -nodisp -autoexit -loglevel error -i -` plays
+   (4.6 s of audio, the player exited 4.35 s after its input closed), and
+   killing it ends the process in 12 ms. `aplay`, `paplay` and `pw-cat`
+   arguments are untested.
+6. Model download: **measured.** On an empty cache with `HF_HOME` unset,
+   `quant="q8_0"` downloads only `model.q8.gguf` (64,512,352 bytes),
+   `tokenizer.json`, `config.json` and `default-voice.safetensors` (about
+   0.5 MB together), into `~/.cache/huggingface/hub/models--gradium--phonon-31m-en/snapshots/<rev>/`.
+   The 103 MB full-precision file is not fetched. The unpinned name
+   `hf://gradium/phonon-31m-en` checks the network on every load: 1.6 s
+   online, and **17 s** with the network unreachable before it falls back to
+   the cache. Pinned to a revision
+   (`hf://gradium/phonon-31m-en@92741c5b07d085ff840e26fea8ce43110b87852f`,
+   which is `ptts.DEFAULT_MODEL` in 0.7.1 and has the same files), it loads in
+   0.41 s online or offline. With no `device` argument the model ran on `cpu`
+   (`ptts.available_devices()` lists `metal` and `cpu` on this build).
+7. Memory: **measured, as one-shot runs rather than drains.** Speaking the
+   same three sentences, Phonon (a script with the callback sink) peaked at
+   343 MiB resident and used 0.7 s of CPU; Kokoro (`kokoro_voice.py --stream`
+   under `uv run`) peaked at 724 MiB and used 8.5 s of CPU.
+8. Windows: **not done.**
+
+Gate: a catalogue voice can be chosen per stream; streaming showed no
+underflow; stop reaches silence in about 30 ms with the callback sink. The
+gate passes with the callback sink, not with the sink the plan describes.
+
 ## Left to the builder
 
 - How playback helpers are shared between the two engine scripts without
