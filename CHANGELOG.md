@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.7.0 - 2026-11-22
+
+### Added
+- Phonon, a second local neural engine (Gradium's `gradium/phonon-31m-en`, Apache 2.0,
+  English, CPU only), opt-in: `tts_engine: "phonon"`; `auto` resolves exactly as before.
+  37 voices (25 standard, 12 character), each fetched on first use; a voice that cannot be
+  loaded is spoken in the model's bundled `default` voice. The per-project automatic pick
+  chooses among the 25 standard voices.
+- Streaming playback: audio starts while a sentence is still being generated. Output goes
+  through PortAudio (bundled on macOS and Windows), or is piped to `aplay`, `paplay`,
+  `pw-cat` or `ffplay` where PortAudio cannot load (the usual case on Linux).
+- Phonon runs from its own uv project (`tts-phonon/`), built and downloaded (about 65MB)
+  only when it is first set up or used; it shares no package with Kokoro's environments.
+- `/voiceover:setup` offers Phonon first, then Kokoro, each only on a yes
+  (`setup_tts.py --download-phonon`); installing never changes the current voice.
+  `/voiceover:voice` lists voices grouped by engine; picking a Phonon voice downloads that
+  voice first and saves nothing if it cannot.
+
+### Changed (shared code: affects Kokoro and macOS speech on an engine switch)
+- A drainer hands over to another engine: an engine with nothing of its own to speak, that
+  sees speech queued for a different engine since it started, releases its project and
+  exits even while a turn holds it warm, so the newly chosen engine can start.
+- A newcomer waits: the hooks start the newly chosen engine even while a different engine
+  still holds the project (its lock now records the engines it drains), and the newcomer
+  waits, loading nothing, until the old engine has finished its own sentences and handed
+  over. Without this, the closing message of the very turn that switched voices was lost.
+- A drainer's speaker may define `release_output()`, called whenever its queue runs dry
+  (Phonon releases its audio device there). `idle()` keeps its 1.6.0 meaning.
+- `spool.pending_count()` can count one engine's items; `speech.one_shot_command()` builds
+  every one-shot command line (dispatch, the voice sample, setup's test).
+
 ## 1.6.0 - 2026-11-19
 
 ### Added

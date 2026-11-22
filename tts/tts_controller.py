@@ -8,8 +8,8 @@ Usage: python3 tts_controller.py stop [--all]
 (the one reachable through the current data dir), cancelling any request in flight.
 
 Stops every engine, one-shot and narrator drainers alike, by killing their
-engine processes (kokoro_voice.py / macos_say.py, plus the `say -v` and
-afplay-of-a-wav lines they spawn) and clears every project's state so
+engine processes (kokoro_voice.py / macos_say.py / phonon_voice.py, plus the
+`say -v` and afplay-of-a-wav lines they spawn) and clears every project's state so
 narration can restart cleanly.
 Stdlib-only; runs under plain python3.
 """
@@ -29,6 +29,7 @@ if _TTS_DIR not in sys.path:
 UNIX_PATTERNS = [
     r"kokoro_voice\.py",
     r"macos_say\.py",
+    r"phonon_voice\.py",   # drainers (a waiting newcomer holds no lock) and one-shots
     r"(^|[/ ])say -v ",   # the `say` line macos_say.py spawns
     r"afplay .*\.wav",    # kokoro playback of its temp wav
     r"(^|[/ ])say --voice=",  # the `say` a drainer spawns
@@ -40,7 +41,11 @@ UNIX_PATTERNS = [
 WINDOWS_PATTERNS = [
     r"kokoro_voice\.py",
     r"macos_say\.py",
+    r"phonon_voice\.py",
 ]
+
+# The engine scripts a lock may name as its owner (see _kill_lock_owner_groups).
+ENGINE_SCRIPTS = ("kokoro_voice.py", "macos_say.py", "phonon_voice.py")
 
 
 # --- data dir / tts.lock (inline: may not import voiceover.settings) --------
@@ -91,7 +96,7 @@ def _kill_lock_owner_groups():
             probe = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
                                    capture_output=True, text=True, timeout=2)
             command = probe.stdout.strip()
-            if "kokoro_voice.py" in command or "macos_say.py" in command:
+            if any(script in command for script in ENGINE_SCRIPTS):
                 os.killpg(os.getpgid(pid), signal.SIGTERM)
         except Exception:
             pass

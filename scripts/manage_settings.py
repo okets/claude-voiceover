@@ -31,7 +31,7 @@ LEVEL_DESCRIPTIONS = {
 
 NUMERIC_ALIASES = {"0": "silent", "1": "quiet", "2": "concise", "3": "verbose", "4": "narrator"}
 
-VALID_ENGINES = ["auto", "kokoro", "macos-female", "macos-male", "none"]
+VALID_ENGINES = ["auto", "kokoro", "phonon", "macos-female", "macos-male", "none"]
 VALID_DEVICES = ["cpu", "gpu"]
 
 
@@ -70,6 +70,7 @@ def cmd_info(_args):
     print(f"Resolved engine: {settings.resolve_engine()}")
     print(f"Resolved voice:  {settings.get_voice()}")
     print(f"Kokoro models:   {'installed' if settings.models_present() else 'not downloaded (run /voiceover:setup)'}")
+    print(f"Phonon model:    {'installed' if settings.phonon_model_present() else 'not downloaded (run /voiceover:setup)'}")
     return 0
 
 
@@ -152,8 +153,12 @@ def normalize(key, value):
             _ENGINE_VALIDATORS[key](value)
         return value
     if key == "voice":
-        if value is not None and value not in settings.KOKORO_VOICES:
-            raise ValueError(f"voice must be null or one of {settings.KOKORO_VOICES}")
+        # Either engine's voice is accepted whatever tts_engine says: a voice
+        # for the other engine falls back at resolution time. /voiceover:voice
+        # sets engine and voice together.
+        if value is not None and value not in settings.KOKORO_VOICES and not settings.is_phonon_voice(value):
+            raise ValueError("voice must be null, a Kokoro id (%s) or a Phonon voice name (exact case)"
+                             % ", ".join(settings.KOKORO_VOICES))
         return value
     if key in ("tts_enabled", "notification_sounds", "speak_subagent_completions"):
         if not isinstance(value, bool):

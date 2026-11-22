@@ -4,6 +4,7 @@ speak() gates on settings, truncates, honors the TTS lock, then spawns the
 resolved engine as a DETACHED subprocess (never waits):
 
     kokoro       -> uv run --project <plugin>/tts <plugin>/tts/kokoro_voice.py --voice <voice> --stream <text>
+    phonon       -> uv run --project <plugin>/tts-phonon <plugin>/tts/phonon_voice.py --voice <voice> --stream <text>
     macos-female -> python3 <plugin>/tts/macos_say.py --voice Samantha <text>
     macos-male   -> python3 <plugin>/tts/macos_say.py --voice Daniel <text>
     none         -> no-op
@@ -38,6 +39,7 @@ from .projects import project_dir, session_slug
 _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 _TTS_DIR = _PLUGIN_ROOT / "tts"
 _TTS_GPU_DIR = _PLUGIN_ROOT / "tts-gpu"
+_TTS_PHONON_DIR = _PLUGIN_ROOT / "tts-phonon"
 _SOUNDS_DIR = Path(__file__).resolve().parent / "sounds"
 
 _LOCK_FILE_NAME = "tts.lock"
@@ -122,8 +124,8 @@ def enqueue_speech(text, min_level="concise", cwd=None, full=False, session=None
         if engine == "none":
             return False
         # Resolve the voice for THIS engine, exactly as _dispatch does: the
-        # macOS engines take a `say -v <Name>` voice, and get_voice() only
-        # ever returns a kokoro id.
+        # macOS engines take a `say -v <Name>` voice; get_voice() returns the
+        # Kokoro id or Phonon name for the project's resolved engine.
         voice = _MACOS_VOICES.get(engine) or get_voice(cwd)
         queued = spool.enqueue(message, engine, voice, session=session,
                                utterance=utterance, sticky=sticky, shown=shown,
@@ -154,11 +156,12 @@ def ensure_drainer(cwd=None) -> bool:
         if spool.pending_count(cwd) == 0 and not lease.any_live(cwd):
             return False
         lock = project_lock_path(cwd)
+        engine = resolve_engine(cwd)
         if lock_is_live(lock) and process_utils.lock_owner_is_running(lock):
-            return False  # this project's drainer is already working
+            if not _handing_over(lock, engine, cwd):
+                return False  # this project's drainer is already working
         if _recently_spawned(cwd):
             return False  # one is starting up
-        engine = resolve_engine(cwd)
         command = _drain_command(engine, project_dir(cwd))
         if command is None:
             return False
@@ -169,6 +172,28 @@ def ensure_drainer(cwd=None) -> bool:
         return spawned
     except Exception:
         return False
+
+
+def _handing_over(lock, engine, cwd) -> bool:
+    """True when the live lock's drainer drains other engines than `engine`
+    and speech is pending for `engine` itself: the user switched engine while
+    the old one was busy. The old engine's own backlog alone starts nothing -
+    a newcomer would find no work and exit, one uv start-up per hook. The
+    new engine is started anyway; it waits for the old one to hand over
+    (tts/engine_common.py), so this hook never waits. Without this, a turn's
+    last message, queued for the new engine while the old one still speaks,
+    would have no later hook to start its engine."""
+    holder = _lock_engines(lock)
+    return bool(holder) and engine not in holder and spool.pending_count(cwd, engine=engine) > 0
+
+
+def _lock_engines(lock) -> list:
+    """The engines a drainer's lock records; [] for a one-shot or older lock."""
+    try:
+        engines = json.loads(Path(lock).read_text()).get("engines")
+    except (OSError, ValueError, AttributeError):
+        return []
+    return engines if isinstance(engines, list) else []
 
 
 def _recently_spawned(cwd) -> bool:
@@ -242,12 +267,42 @@ def kokoro_command(*args):
             str(_TTS_DIR / "kokoro_voice.py")] + list(args)
 
 
+def phonon_command(*args):
+    """The uv argv that runs the Phonon engine with args, from its own uv
+    project (tts-phonon/), which carries nothing of Kokoro's."""
+    return ["uv", "run", "--project", str(_TTS_PHONON_DIR),
+            str(_TTS_DIR / "phonon_voice.py")] + list(args)
+
+
+def macos_say_command(*args):
+    """The argv that runs the macOS `say` engine with args (plain python3)."""
+    return ["python3", str(_TTS_DIR / "macos_say.py")] + list(args)
+
+
+# The neural engines, by name: each builds its own uv command line.
+_NEURAL_COMMANDS = {"kokoro": kokoro_command, "phonon": phonon_command}
+
+
+def one_shot_command(engine, voice, text, stream=True):
+    """The argv that speaks text once with engine in voice, or None for no
+    engine. The one place the one-shot command line is built: dispatch, the
+    voice sample and setup's test line all call it. stream=False keeps
+    Kokoro's sample on its standard (non-streamed) synthesis; Phonon always
+    streams, and a macOS engine takes its own `say` voice."""
+    if engine in _NEURAL_COMMANDS:
+        flags = ["--stream"] if stream else []
+        return _NEURAL_COMMANDS[engine](*(["--voice", voice] + flags + [text]))
+    if engine in _MACOS_VOICES:
+        return macos_say_command("--voice", _MACOS_VOICES[engine], text)
+    return None
+
+
 def _drain_command(engine, root):
     """The argv that drains root's spool with engine, or None for no engine."""
-    if engine == "kokoro":
-        return kokoro_command("--drain", str(root))
+    if engine in _NEURAL_COMMANDS:
+        return _NEURAL_COMMANDS[engine]("--drain", str(root))
     if engine in _MACOS_VOICES:
-        return ["python3", str(_TTS_DIR / "macos_say.py"), "--drain", str(root)]
+        return macos_say_command("--drain", str(root))
     return None
 
 
@@ -295,14 +350,8 @@ def truncate_for_speech(text, limit: int = 220) -> str:
 # ---------------------------------------------------------------------------
 
 def _dispatch(message, engine, cwd) -> None:
-    if engine == "kokoro":
-        command = kokoro_command("--voice", get_voice(cwd), "--stream", message)
-    elif engine in _MACOS_VOICES:
-        command = [
-            "python3", str(_TTS_DIR / "macos_say.py"),
-            "--voice", _MACOS_VOICES[engine], message,
-        ]
-    else:  # "none" or unknown
+    command = one_shot_command(engine, get_voice(cwd), message)
+    if command is None:  # "none" or unknown
         return False
     # The engine owns the lock lifecycle (atomic claim -> speak -> remove).
     # Creating the lock here would race the engine's own claim and make it

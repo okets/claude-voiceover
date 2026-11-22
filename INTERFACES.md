@@ -36,10 +36,10 @@ Hierarchy (first hit wins): project `<cwd>/.claude/voiceover.json` → global
 ```python
 DEFAULTS = {
     "interaction_level": "concise",     # silent | quiet | concise | verbose
-    "tts_engine": "auto",               # auto | kokoro | macos-female | macos-male | none
+    "tts_engine": "auto",               # auto | kokoro | phonon | macos-female | macos-male | none
     "tts_enabled": True,
     "notification_sounds": True,        # quiet-mode mp3 pings
-    "voice": None,                      # explicit kokoro voice id, else per-project hash
+    "voice": None,                      # explicit voice for the engine (Kokoro id or Phonon name), else per-project hash
     "speak_subagent_completions": True, # verbose level only
     # machine-wide only (global settings file; read by the engine too, see "Shared engine"):
     "tts_device": "cpu",                # cpu | gpu
@@ -58,17 +58,27 @@ def get_interaction_level(cwd=None) -> str                   # normalized string
 def level_at_least(minimum: str, cwd=None) -> bool           # ordering per LEVELS
 def is_tts_enabled(cwd=None) -> bool                         # tts_enabled and level != silent
 def resolve_engine(cwd=None) -> str
-    # "auto": macOS -> "macos-female"; else "kokoro" if models_present() else "none"
+    # explicit "kokoro" | "phonon" | "macos-female" | "macos-male" | "none" as given;
+    # "auto": macOS -> "macos-female"; else "kokoro" if models_present() else "none" (never phonon)
 def get_voice(cwd=None) -> str
-    # explicit setting wins; else for kokoro: stable choice from KOKORO_VOICES by
-    # sha1(project_root) — the "random voice per project" behavior, now stateless
+    # engine-aware. Under phonon: the explicit voice if is_phonon_voice(), else a stable pick from
+    # PHONON_VOICES (standard voices only) by sha1(project_root). Under any other engine: any
+    # explicit string as given, except a Phonon name, which falls back to the stable pick from
+    # KOKORO_VOICES by sha1(project_root) — the "random voice per project" behavior, stateless
 def models_present() -> bool                                  # ~/.kokoro-tts/models/*.onnx exists
+def is_phonon_voice(name) -> bool             # one of the 37 catalogue names or "default", exact case
+def phonon_model_present() -> bool
+    # <hub>/models--gradium--phonon-31m-en/snapshots/*/model.q8.gguf exists, <hub> = $HF_HOME/hub
+    # or ~/.cache/huggingface/hub (measured in the spike). Reads the folder; never raises
 def detect_project_root(cwd=None) -> Path
     # nearest .claude dir, else git root, else cwd. ~/.claude is Claude Code's own user
     # configuration, NOT a project marker: accepting it would give every project without a
     # .claude of its own the home directory as its root (one shared queue and voice).
 
 KOKORO_VOICES = [...all 13 ids...]  # af_alloy? -> use the real 13 ids from old kokoro_voice.py
+PHONON_VOICES = [...25 standard names...]          # Zoey ... Bryony, catalogue order and case
+PHONON_CHARACTER_VOICES = [...12 character names...]  # Captain Silas Blackwater ... Fairy Godmother
+PHONON_DEFAULT_VOICE = "default"                    # bundled with the model; the offline fallback
 ```
 
 ## voiceover/projects.py
@@ -174,8 +184,19 @@ def ensure_drainer(cwd=None) -> bool
     # holds a lease (the pre-warm), unless a live lock whose owner pid still runs holds it (a dead
     # owner counts as free) or one was spawned <3s ago (<project>/spawned.json; the engine clears it
     # once loaded). Also removes the 1.3 machine-wide queue. Called unconditionally by narrator paths.
+    # One exception to the live-lock rule (engine switch): when the lock records "engines", the
+    # resolved engine is not among them and items are queued for the resolved engine, it spawns the resolved engine anyway
+    # (the 3s back-off still applies). That newcomer waits for the holder to hand over; no hook waits.
     # (the "engine" here is the project's narrator drainer; on Linux/macOS it is a client of the shared engine)
 def prewarm(cwd=None, session=None, ttl=lease.LEASE_TTL) -> bool   # lease.hold + ensure_drainer
+def kokoro_command(*args) -> list    # uv run --project <tts or tts-gpu> <plugin>/tts/kokoro_voice.py *args
+def phonon_command(*args) -> list    # uv run --project <plugin>/tts-phonon <plugin>/tts/phonon_voice.py *args
+def macos_say_command(*args) -> list # python3 <plugin>/tts/macos_say.py *args
+def one_shot_command(engine, voice, text, stream=True) -> list | None
+    # the ONE builder of a one-shot command line (dispatch, the voice sample, setup's test):
+    # neural engines get --voice <voice> [--stream] <text>; macOS engines their own `say` voice
+    # The drain command and the one-shot dispatch look the neural engines up in one table
+    # (kokoro -> kokoro_command, phonon -> phonon_command); macOS voices use macos_say_command.
 def request_stop(cwd=None, session=None) -> None
     # ask the project's engine to stop session's sentence now (None: any): <project>/stop/<slug|_all>.json
     # {"ts"}. The engine honours only items queued before the request.
@@ -272,7 +293,7 @@ def enqueue(text, engine, voice, session=None, utterance=None, sticky=False,
             shown=None, source=None, cwd=None) -> bool   # utterance None = a message of its own
 def clear(session=None, cwd=None) -> int      # all pending items, or one session's
 def clear_sticky(session, cwd=None) -> int    # retire a session's sticky alerts/permission requests
-def pending_count(cwd=None) -> int
+def pending_count(cwd=None, engine=None) -> int   # engine given: only items queued for it
 def prune(max_age_seconds=QUEUE_MAX_AGE_SECONDS, cwd=None) -> int   # also stale *.taken / *.tmp
 def remove_legacy_queue() -> int              # delete 1.3's machine-wide data_dir()/queue/
 ```
@@ -300,7 +321,8 @@ def drain_root(argv) -> Path | None  # the directory after --drain, or None
 def tts_lock_path(root) -> Path      # <root>/tts.lock
 def lock_is_live(root) -> bool       # unexpired AND its pid still runs (a dead owner = free)
 def try_claim_lock(root, duration) -> bool   # atomic (os.link); takes over an expired or dead-pid lock
-def update_lock_expiry(root, duration) -> None
+def update_lock_expiry(root, duration, engines=None) -> None   # a drainer passes its engine names
+def lock_holder_engines(root) -> frozenset | None   # None: no live lock; empty: holder records none
 def remove_tts_lock(root) -> None
 def queue_dir(root) -> Path          # <root>/queue/
 def take_oldest(root, engine_names=None) -> tuple   # (item, taken_path) | (None, None); atomic claim
@@ -314,6 +336,7 @@ def peek_next(root, engine_names=None)                # the item next_item would
 def newer_utterance_pending(root, utterance, engine_names=None) -> bool
 def stop_requested(root, item) -> bool   # a stop for item's session (or _all) newer than item's "created"
 def lease_is_live(root) -> bool          # any unexpired <root>/leases/*.json; read-only
+def foreign_pending(root, engine_names, since) -> bool  # another engine's item, created after `since`
 def drain(root, open_speaker, engine_names, lock_seconds=60.0, poll_seconds=POLL_SECONDS) -> int
 ```
 
@@ -329,6 +352,11 @@ Speakers (`open_speaker()` returns one, or falsy on failed setup) provide
 a `Playback` has `poll() -> bool` (True once over) and `kill()`. `ProcessPlayback(process,
 cleanup=None)` wraps a child process; `DryRunSpeaker` prints `[voiceover] <sentence>`.
 `drain()` prefetches the next item's first sentence during an item's last one.
+A speaker may also define `release_output()`: `drain()` calls it each time it finds nothing of its own
+to speak, before it waits on a lease or exits. It is called on every such poll, so it must be
+near-free when there is nothing to release, and return within 200 ms. Speakers without it are
+unaffected. A speaker's `idle()` is separate: it is called only while the drain waits on a live
+lease (the shared-engine client re-warms the engine there).
 
 Each spoken sentence logs (`engine_log("sound", ...)`, debug_log setting on):
 `source=<source> utterance=<utterance> lag_created=<s> lag_shown=<s> chars=<n> :: <first 60 chars>`.
@@ -338,23 +366,136 @@ A missing `source`, `utterance` or `lag_shown` prints as `-`.
 `drain()` claims the lock BEFORE `open_speaker()` loads anything, and tracks ownership with
 an internal flag: it releases the lock only when it holds it, and never deletes one another
 engine owns. It stays up while `lease_is_live(root)` (polling), and exits once the spool is
-dry and no lease remains. If `MAX_ENGINES` other projects' engines already hold locks it
+dry and no lease remains. With nothing of its own to speak, it hands over: when
+`foreign_pending(root, engine_names, started)` is true (`started` = when it claimed its lock),
+it logs `handover` and exits even under a live lease, so the next hook starts the engine those
+items name. It never abandons a sentence it is speaking and never touches the other engine's
+items. A foreign item queued before it started does not count, so a leftover item for an engine
+nobody starts cannot make every new drainer exit at once.
+
+Lock content is `{"expiry", "pid"}`; a drainer's lock adds `"engines"`, the sorted engine names it
+drains, written at every claim and kept by every expiry refresh. One-shot locks and older locks
+have no such key and behave as before.
+
+A newcomer waits for an engine that is handing over. When `drain()`'s first claim fails and the
+live lock records engines disjoint from its own, and it has pending items of its own, it polls
+every `poll_seconds` until the claim succeeds, none of its own items remain, the holder stops
+being another engine, or `QUEUE_MAX_AGE_SECONDS` pass. While waiting it loads nothing
+(`open_speaker()` runs only after the claim) and refreshes `spawned.json` about once a second so
+the hooks start no second waiter. A holder with one of its engines, or recording none, makes it
+exit 0 at once as before. A speaker's `release_output()` that raises is logged (`error`) and the drain goes
+on. If `MAX_ENGINES` other projects' engines already hold locks it
 steps aside; if `open_speaker()` fails it releases the lock and backs the hooks off for 30s.
 
 The spawn marker `<root>/spawned.json` (`{"ts"}`) is written by `speech.ensure_drainer`
 before a spawn and read by it to back off for 3s; the engine clears it once loaded (or
 writes it ahead on a cap/failed load so the hooks do not respawn per call).
 
+## tts/pcm_sink.py
+
+Stdlib only at import (`sounddevice` is imported inside `SoundDeviceSink`). Plays raw 24 kHz
+mono float32 audio as it arrives, for a streaming engine (Phonon). Chunks need only `len()`
+(samples) and `tobytes()`; nothing imports numpy.
+
+```python
+SAMPLE_RATE = 24000
+class Sink:
+    def write(self, chunk) -> None   # play after what is written; opens the output on demand
+    def abort(self) -> None          # silence now, discard buffered audio; the next write plays again
+    def close(self) -> None          # release the output; idempotent and near-free when closed;
+                                     # within 200 ms (a PortAudio stop+close is ~115-125 ms on macOS)
+    def remaining(self) -> float     # seconds written but not yet played
+class SoundDeviceSink(Sink)          # PortAudio, callback-fed (latency="low", blocksize=480)
+class PipeSink(Sink)                 # PipeSink(command): a player process fed on stdin
+def player_command() -> list | None  # first player on PATH: aplay, paplay, pw-cat, ffplay
+PLAYER_NAMES = ("aplay", "paplay", "pw-cat", "ffplay")   # in that order; setup reports them
+def open_sink() -> Sink | None       # SoundDeviceSink, else PipeSink, else None; never raises
+```
+
+`SoundDeviceSink` never calls a stream's blocking `write()`: the spike measured that `write()` on
+one thread with `abort()` from another crashes the process. The worker appends to a buffer the
+sink owns; PortAudio's callback copies from it and pads with zeros (a partial last block plays at
+once). `abort()` only empties that buffer and never calls into PortAudio (silence reaches the
+device ~25-30 ms later, measured). `close()` calls the stream's `stop()` (so a tail in the device
+plays out) then `close()`. `remaining()` is the bytes in the sink's own buffer; the device's
+~25 ms output latency is not added. Construction fails (and `open_sink()` falls back) when the
+import fails (no PortAudio: the normal case on Linux, measured) or `check_output_settings` finds
+no usable output.
+
+`PipeSink`: `remaining()` by wall clock (each write extends an end time from `max(now, end)`);
+`abort()` kills the player; `close()` closes its stdin without waiting. A player that died never
+raises into the writer: that chunk is dropped and the next write starts a new player. Player
+arguments: the `ffplay` line is measured (ffplay 9 rejects `-ac 1`; raw input defaults to mono);
+the `aplay`, `paplay` and `pw-cat` lines are untested.
+
+## tts/phonon_voice.py, tts-phonon/
+
+The Phonon engine. Runs from its own uv project, `tts-phonon/pyproject.toml` (`ptts>=0.7.1`,
+`sounddevice>=0.5`; nothing of Kokoro's), and imports `ptts` and `sounddevice` only inside
+functions, so a dry run and the test suite load neither. Never imports `voiceover/`.
+
+```text
+uv run --project <plugin>/tts-phonon <plugin>/tts/phonon_voice.py --drain <project dir>
+uv run --project <plugin>/tts-phonon <plugin>/tts/phonon_voice.py --voice <name> --stream <text>
+phonon_voice.py --install              # load (downloading on first use) the model; 0, or 1 + stderr
+phonon_voice.py --fetch-voice <name>   # load the model and render one word in <name>; 0, or 1
+```
+
+```python
+MODEL_REPO = "hf://gradium/phonon-31m-en@92741c5b07d085ff840e26fea8ce43110b87852f"  # pinned
+QUANT, DEVICE, THREADS = "q8_0", "cpu", 2
+FALLBACK_VOICE = "default"             # bundled with the model; works offline
+def load_model()                       # ptts.set_num_threads(2); ptts.TTS(MODEL_REPO, lang="en", quant, device)
+class PhononSpeaker:                   # PhononSpeaker(tts, sink, grace_seconds=10.0)
+    def warm_up(self)                  # renders "Ready." in "default"; writes nothing, opens no device
+    def prefetch(self, sentence, voice)    # no-op: a warm first chunk takes < 35 ms
+    def begin(self, sentence, voice, upcoming=None) -> PhononPlayback
+    def release_output(self)           # sink.close(): a warm engine holds no device
+class PhononPlayback(Playback)         # started(): a chunk was written; poll(); kill()
+def open_speaker()                     # open_sink(), load_model(), warm_up(); None (logged) on failure
+def speak_once(text, voice) -> bool    # the one-shot: owns data_dir()'s lock, released on every path
+def parse_args(argv) -> (voice, text, use_streaming)
+```
+
+One worker thread per speaker renders sentences in order: it opens `tts.stream(sentence,
+voice=...)`, writes each chunk to the sink, and closes the generator on every path (end, cancel,
+error). A voice that cannot be loaded raises from `stream()` itself (`LookupError`, or `OSError`
+after a ~2.6 s failed fetch): the sentence is spoken in `"default"`, logged as `voice`, and that
+voice goes straight to `"default"` for the rest of the process. `poll()` re-raises a generation
+error, and is true once the worker finished and `sink.remaining()` is 0; if the audio has not
+drained within its length plus `grace_seconds` after the worker finished (a vanished device), it
+aborts the sink, logs `stall`, and reports the sentence done. `kill()` sets the cancel flag,
+aborts the sink (silence first), and returns without waiting for the generator; the cancel check
+and each write happen under one lock, so no chunk reaches the sink after `kill()` returns. The
+one-shot waits for `remaining()` to reach 0 before closing the sink, so the end is not cut off.
+`--install` and `--fetch-voice` never open the audio device. `--fetch-voice` has no fallback.
+A sentence that completes no write for `stall_seconds` (30 s; a `PhononSpeaker` argument)
+while the worker is still running is killed by `poll()`, logged as `stall`, and reported done:
+a player that stopped reading blocks the worker inside its write, and the abort ends that player.
+
+Known limit (Linux, untested): a drainer's piped player is a child that reads stdin and matches
+no kill pattern. The lock-owner process-group kill stops it whenever the engine holds its lock;
+killed by pattern alone (only in the drain's brief exit gap), the engine dies and the player plays
+out what its pipe holds (at most ~0.7 s) and exits at EOF. A possible fix, not made: have the kill
+switch `pgrep -f` the engine patterns and `killpg` each match's group.
+
+Known limit: if `ptts` itself hangs inside generation, that sentence is abandoned after 30 s, but
+the single worker thread stays occupied, so later sentences stall too. The kill switch, or the
+next prompt's cutover, ends the process.
+
 ## voiceover/audio_player.py, voiceover/process_utils.py
 
 Straight ports (cross-platform playback / TTS-process kill). One fix: make the Unix kill
 target only OUR processes — never a bare `pkill -f say`. `TTS_PROCESS_PATTERNS` match the
-ONE-SHOT speaker only (`kokoro_voice.py --voice`, `macos_say.py --voice`, `say -v <Name>`,
+ONE-SHOT speaker only (`kokoro_voice.py --voice`, `phonon_voice.py --voice`, `macos_say.py --voice`, `say -v <Name>`,
 the one-shot temp wav playback, `tts_controller.py`): narrator drainers run as
 `--drain <project dir>`, speak through `say --voice=<Name>` and play wavs from their
 project's `play/` dir, so a concise-level interrupt can never cut off another project's
 narration. `process_utils.lock_owner_is_running(lock_path)` / `pid_is_running(pid)` give
-the lock-owner liveness check hooks use.
+the lock-owner liveness check hooks use. `ENGINE_SCRIPTS` (kokoro_voice.py, macos_say.py,
+phonon_voice.py) is the one list a lock-owner pid's command line must match before its process
+group is signalled. Phonon's one-shot plays in-process on macOS and Windows, so killing the
+engine is the whole stop there.
 
 ## tts/
 
@@ -380,11 +521,14 @@ the lock-owner liveness check hooks use.
   Linux/macOS it asks the shared engine (starting it with `ensure`); `--stream` submits one request
   per sentence up front and plays each sentence's audio whole, in order. On Windows it synthesizes in-process.
   This file may NOT import voiceover/; it stays self-contained.
+- `tts/phonon_voice.py` (run from `tts-phonon/`) — the Phonon engine; see its own section above.
 - `tts/macos_say.py --voice <Name> <text>` — collapse of the 3 old macos_*_tts.py scripts;
   stdlib only; uses `say`.
 - `tts/tts_controller.py stop [--all]` — kill switch: kills every lock owner's process group (the
   one-shot speaker's lock and every project's `projects/*/tts.lock`, pid verified against
-  our engine names), pattern-kills our engine and audio-child lines, then `clear_projects()`
+  our engine names, `ENGINE_SCRIPTS`), pattern-kills our engine lines (`kokoro_voice.py`,
+  `macos_say.py`, `phonon_voice.py` — a drainer or one-shot, including a Phonon newcomer waiting
+  without a lock) and audio-child lines, then `clear_projects()`
   drops every project's lock, spawn marker, stop files, queue, leases and wavs. It stops narration
   only: the shared engine and any interface request in flight are untouched. `--all` also sends
   the engine `stop` (through `engine_client`, every error ignored), cancelling whatever it was serving.
@@ -795,13 +939,35 @@ hooks/), and Stop does not end its turn; `turn.complete` does. Items the mod que
 
 ## scripts/ (used by slash commands; argparse CLIs, stdlib only)
 
-- `manage_settings.py {info|get KEY|set KEY VALUE [--project]|levels}` — wraps settings.py
-- `manage_voices.py {list|set NAME [--project]|test [NAME]|recommend}` — friendly-name map
-  (alloy, river, sky, sarah, nicole, adam, puck, michael, emma, daniel, lewis, george,
-  default-male, default-female) → engine+voice; fixes old doubled-path bug; covers all 13
-  kokoro voices; `test` speaks a sample line.
-- `setup_tts.py` — first-run: check uv/ffplay availability, offer kokoro model download
-  (~300MB to ~/.kokoro-tts), verify audio, print status. Reuses existing ~/.kokoro-tts cache.
+- `manage_settings.py {info|get KEY|set KEY VALUE [--project]|levels}` — wraps settings.py.
+  `tts_engine` accepts `phonon`; `voice` accepts null, a Kokoro id or a Phonon name (exact case),
+  whatever the engine (a voice for the other engine falls back at resolution time); `info`
+  prints a `Phonon model:` line beside `Kokoro models:`.
+- `manage_voices.py {list|set NAME [--project]|test [NAME]|recommend}` — friendly-name map →
+  engine+voice: 37 Phonon voices (catalogue name lower-cased and hyphenated, e.g. `bryony`,
+  `captain-silas-blackwater`; labels `"<Name> (Phonon)"` / `"<Name> (Phonon character)"`), the 13
+  Kokoro voices (alloy … george) and `default-female` / `default-male`. `list` groups them under
+  "Phonon voices", "Phonon character voices", "Kokoro neural voices", "macOS system voices".
+  Availability: `ready` when uv and the engine's model are present (`kokoro_ready()`,
+  `phonon_ready()`), else `needs uv …` / `needs model download …`. `set` for a Phonon voice when
+  Phonon is ready (outside dry run) first runs `phonon_command("--fetch-voice", voice)` (120 s
+  timeout; a failure or timeout saves nothing and exits 1); before setup it saves with the
+  "will work once setup completes" note and never starts a download. `test` speaks a sample through
+  `speech.one_shot_command(engine, voice, text, stream=False)`. `recommend` names `zoey` (a
+  placeholder until the user picks one) when Phonon is ready, else the previous advice plus one
+  line mentioning Phonon.
+- `setup_tts.py [--download-phonon] [--download] [--test]` — first-run: check uv/ffplay
+  availability, print status, verify audio. The status shows a Phonon block (model present via
+  `settings.phonon_model_present()`; audio output: bundled PortAudio on macOS/Windows, on Linux
+  the PortAudio library (`ctypes.util.find_library`) or the first of `pcm_sink.PLAYER_NAMES` on
+  PATH, else what to install; never imports sounddevice) before the Kokoro block, and says
+  "Phonon is installed but not selected. Pick a voice with /voiceover:voice." when the model is
+  present and the resolved engine is not phonon. `--download-phonon` runs
+  `speech.phonon_command("--install")` with its output on the terminal and a 600 s timeout (the
+  first run builds tts-phonon/), then names `/voiceover:voice` (zoey as the placeholder
+  suggestion); a failure exits 1. `--download` keeps meaning Kokoro (~300MB to ~/.kokoro-tts;
+  an existing cache is reused). Installing never selects an engine. `--test` speaks through
+  `speech.one_shot_command(..., stream=False)`.
 - `migrate_legacy.py [--dry-run]` — detect legacy smarter-claude install (~/.claude/VERSION or
   'uv run ~/.claude/hooks/' in ~/.claude/settings.json); back up settings.json; strip the five
   legacy hook groups; list (and with --yes delete) legacy files; never touch statusLine,

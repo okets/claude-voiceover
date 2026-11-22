@@ -1,8 +1,8 @@
 # tts/engine_common.py
 """Shared engine-side helpers for the claude-voiceover TTS engines.
 
-Imported as a sibling by tts/kokoro_voice.py and tts/macos_say.py, both of
-which resolve it through sys.path[0] (their own directory) whether they run
+Imported as a sibling by tts/kokoro_voice.py, tts/phonon_voice.py and
+tts/macos_say.py, all of which resolve it through sys.path[0] (their own directory) whether they run
 under `uv run` or plain python3.
 
 This file MUST NOT import from voiceover/ - the engines live in a different
@@ -141,7 +141,7 @@ def try_claim_lock(root, duration):
         Path(root).mkdir(parents=True, exist_ok=True)
     except OSError:
         return False
-    payload = json.dumps({"expiry": time.time() + duration, "pid": os.getpid()})
+    payload = _lock_payload(duration)
     # Write payload to a private temp file, then os.link() it into place:
     # the lock appears WITH its content in one atomic step, so a racing
     # claimer can never observe an empty lock and judge it stale.
@@ -176,13 +176,39 @@ def try_claim_lock(root, duration):
             pass
 
 
-def update_lock_expiry(root, duration):
-    """Refresh our own lock with a new expiry (keeps our PID)."""
+def _lock_payload(duration, engines=None):
+    """Lock content: {"expiry", "pid"}, plus "engines" - the sorted engine
+    names a drainer drains - when given. One-shot locks record none."""
+    payload = {"expiry": time.time() + duration, "pid": os.getpid()}
+    if engines:
+        payload["engines"] = sorted(engines)
+    return json.dumps(payload)
+
+
+def update_lock_expiry(root, duration, engines=None):
+    """Refresh our own lock with a new expiry (keeps our PID, and the
+    engines a drainer passes)."""
     try:
-        tts_lock_path(root).write_text(
-            json.dumps({"expiry": time.time() + duration, "pid": os.getpid()}))
+        tts_lock_path(root).write_text(_lock_payload(duration, engines))
     except OSError:
         pass
+
+
+def lock_holder_engines(root):
+    """The engines root's live lock records: None when no live lock,
+    an empty frozenset when the holder records none (a one-shot or older
+    lock)."""
+    try:
+        raw = tts_lock_path(root).read_text().strip()
+    except OSError:
+        return None
+    if not _lock_held(raw):
+        return None
+    try:
+        engines = json.loads(raw).get("engines") or []
+    except (ValueError, AttributeError):
+        engines = []
+    return frozenset(engines)
 
 
 def remove_tts_lock(root):
@@ -378,6 +404,26 @@ def _own_pending(root, engine_names):
     return own
 
 
+def _created(item):
+    try:
+        return float(item.get("created") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def foreign_pending(root, engine_names, since) -> bool:
+    """True when another engine's item was queued after `since`.
+
+    Only items newer than `since` count: a leftover queued before this engine
+    started must not make every new engine leave at once, which would have the
+    hooks respawn it in a loop."""
+    for path in sorted(queue_dir(root).glob("*.json")):
+        item = read_json(path)
+        if item is not None and not _owned(item, engine_names) and _created(item) > since:
+            return True
+    return False
+
+
 def _survives(item, newest):
     """Whether the jump rule keeps item, given the newest own pending item."""
     if item is newest or item.get("sticky"):
@@ -452,10 +498,7 @@ def stop_requested(root, item) -> bool:
     """True when a stop for item's session - or for every session - was
     requested after item was queued. A stop can therefore never cut a reply
     queued after it, and each session's request is a file of its own."""
-    try:
-        created = float(item.get("created") or 0)
-    except (TypeError, ValueError):
-        created = 0.0
+    created = _created(item)
     directory = Path(root) / _STOP_DIR_NAME
     for name in {_stop_file_name(item.get("session")), _stop_file_name(None)}:
         request = read_json(directory / name)
@@ -593,14 +636,14 @@ class DryRunSpeaker:
 class _LockKeeper:
     """Refreshes the drainer's lock whenever half its expiry has passed."""
 
-    def __init__(self, root, seconds):
-        self._root, self._seconds = root, seconds
+    def __init__(self, root, seconds, engines):
+        self._root, self._seconds, self._engines = root, seconds, engines
         self._last = time.time()
 
     def keep(self):
         now = time.time()
         if now - self._last >= self._seconds / 2:
-            update_lock_expiry(self._root, self._seconds)
+            update_lock_expiry(self._root, self._seconds, self._engines)
             self._last = now
 
     def reset(self):
@@ -627,6 +670,19 @@ def _prefetch_next(root, speaker, engine_names) -> bool:
     if first:
         speaker.prefetch(first[0], upcoming.get("voice"))
     return True
+
+
+def _release_output(speaker):
+    """Tell a speaker that defines release_output() the queue has nothing of
+    its own: it lets go of what it holds open (an audio device). Called on
+    every empty poll, so it must be near-free when there is nothing to release."""
+    release = getattr(speaker, "release_output", None)
+    if not callable(release):
+        return
+    try:
+        release()
+    except Exception as error:
+        engine_log("error", "release_output() %s: %s" % (type(error).__name__, error))
 
 
 def _speak_item(root, speaker, item, engine_names, keeper, poll_seconds):
@@ -666,6 +722,51 @@ def _speak_item(root, speaker, item, engine_names, keeper, poll_seconds):
 # --- the drain loop ---------------------------------------------------------
 
 QUEUE_MAX_AGE_SECONDS = 300  # must match voiceover/spool.py
+_MARK_EVERY_SECONDS = 1.0     # a waiting newcomer's spawn-marker refresh (hooks back off 3s)
+
+
+def _claim(root, seconds, engine_names):
+    """Claim root's lock and record the engines this drainer drains in it."""
+    if not try_claim_lock(root, seconds):
+        return False
+    update_lock_expiry(root, seconds, engine_names)
+    return True
+
+
+def _waits_for(holder, engine_names) -> bool:
+    """Whether a newcomer waits for this lock holder: only for one that
+    records engines, none of them ours. A holder with our engine, or with no
+    recorded engines (a one-shot or older lock), is left alone as before."""
+    return bool(holder) and engine_names is not None and holder.isdisjoint(engine_names)
+
+
+def _await_handover(root, engine_names, lock_seconds, poll_seconds) -> bool:
+    """Wait for another engine that holds root's lock to hand it over. True
+    once the lock is ours.
+
+    The newcomer was started for its own items while a different engine is
+    still speaking (the user switched engine mid-turn). That engine hands
+    over once its own items are spoken, so wait for the lock instead of
+    exiting - nothing else would start this engine again before the turn
+    ends. Gives up when the holder stops being another engine, when none of
+    our own items remain, or after the spool's age cap. Loads nothing while
+    waiting, and keeps the spawn marker fresh so hooks start no second one.
+    """
+    deadline = time.time() + QUEUE_MAX_AGE_SECONDS
+    marked = 0.0
+    while time.time() < deadline:
+        holder = lock_holder_engines(root)
+        if holder is not None and not _waits_for(holder, engine_names):
+            return False
+        if not _own_pending(root, engine_names):
+            return False
+        if time.time() - marked >= _MARK_EVERY_SECONDS:
+            _mark_spawned(root)
+            marked = time.time()
+        if _claim(root, lock_seconds, engine_names):
+            return True
+        time.sleep(poll_seconds)
+    return False
 
 
 def drain(root, open_speaker, engine_names, lock_seconds=60.0,
@@ -689,14 +790,21 @@ def drain(root, open_speaker, engine_names, lock_seconds=60.0,
     item a moment earlier and saw the lock still held. A lock this drain does
     not own is never deleted. While a session holds a lease the drain waits
     for more, polling every poll_seconds, so the model stays loaded for the
-    turn's next sentence. At most MAX_ENGINES projects' engines run at once;
+    turn's next sentence - unless another engine's items arrived after this
+    drain started: then it hands the project over and exits, lease or not.
+    A speaker's optional release_output() is called whenever there is nothing
+    of its own to speak; its optional idle() while the drain waits on a lease. A drain started while a DIFFERENT engine holds the lock
+    waits for it to hand over (_await_handover) instead of exiting; one
+    started while the same engine holds it exits. At most MAX_ENGINES projects' engines run at once;
     another steps aside.
     """
     root = Path(root)
-    if not try_claim_lock(root, lock_seconds):
-        return 0  # another engine is already draining this project
+    if not _claim(root, lock_seconds, engine_names):
+        if not _await_handover(root, engine_names, lock_seconds, poll_seconds):
+            return 0  # another engine is already draining this project
+    started = time.time()
     owns_lock = True
-    keeper = _LockKeeper(root, lock_seconds)
+    keeper = _LockKeeper(root, lock_seconds, engine_names)
     try:
         if _other_engines_running(root) >= MAX_ENGINES:
             # Two projects already speak: step aside. Refresh the spawn
@@ -714,11 +822,18 @@ def drain(root, open_speaker, engine_names, lock_seconds=60.0,
         _clear_spawned(root)  # up and loaded: hooks may spawn again if this one dies
         # A model download, load and warm-up can outlast the lock's expiry,
         # and the keeper only refreshes once an item starts.
-        update_lock_expiry(root, lock_seconds)
+        update_lock_expiry(root, lock_seconds, engine_names)
         keeper.reset()
         while True:
             item, taken_path = next_item(root, engine_names)
             if item is None:
+                _release_output(speaker)
+                if foreign_pending(root, engine_names, started):
+                    # The user switched engine: hand the project over now,
+                    # even under a lease. The finally releases the lock, so
+                    # the next hook starts the engine those items name.
+                    engine_log("handover", "another engine's speech is pending")
+                    return 0
                 if lease_is_live(root):
                     keeper.keep()  # a session's turn is running: stay warm
                     getattr(speaker, "idle", lambda: None)()
@@ -730,12 +845,12 @@ def drain(root, open_speaker, engine_names, lock_seconds=60.0,
                 if item is None:
                     # A session may have taken a lease after our check, then
                     # seen our lock and started nothing: stay for it.
-                    if not lease_is_live(root) or not try_claim_lock(root, lock_seconds):
+                    if not lease_is_live(root) or not _claim(root, lock_seconds, engine_names):
                         return 0
                     owns_lock = True
                     keeper.reset()
                     continue
-                if not try_claim_lock(root, lock_seconds):
+                if not _claim(root, lock_seconds, engine_names):
                     # Another engine claimed the lock in the gap - it will
                     # drain this item. Never delete a lock we do not own.
                     put_back(taken_path)

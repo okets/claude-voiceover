@@ -16,14 +16,14 @@ from pathlib import Path
 
 DEFAULTS = {
     "interaction_level": "concise",     # silent | quiet | concise | verbose | narrator
-    "tts_engine": "auto",               # auto | kokoro | macos-female | macos-male | none
+    "tts_engine": "auto",               # auto | kokoro | phonon | macos-female | macos-male | none
     "tts_device": "cpu",                # cpu | gpu (Kokoro on an NVIDIA GPU; opt-in, falls back to cpu)
     "engine_port": None,                # TCP port of the shared Kokoro engine (127.0.0.1); null = socket only
     "engine_idle_s": None,              # seconds the engine keeps the model loaded; null = 330 with a port, else 60
     "engine_plugin_root": None,         # plugin directory the engine launcher runs from; null = this install
     "tts_enabled": True,
     "notification_sounds": True,        # quiet-mode mp3 pings
-    "voice": None,                      # explicit kokoro voice id, else per-project hash
+    "voice": None,                      # explicit voice for the engine (Kokoro id or Phonon name), else per-project hash
     "speak_subagent_completions": True, # verbose level only
     "debug_log": False,                 # write pipeline diagnostics to data_dir()/voiceover.log
 }
@@ -63,6 +63,25 @@ KOKORO_VOICE_SPEEDS = {
     "bm_lewis": 1.0,
     "bm_george": 1.2,
 }
+
+# Phonon's English catalogue (gradium/phonon-voices), names in exact catalogue
+# case. The automatic per-project pick uses the standard voices only.
+PHONON_VOICES = [
+    "Zoey", "Juniper", "Everly", "Harper", "Hadley", "Delia", "Easton", "Micah",
+    "Trevor", "Russell", "Preston", "Miles", "Maeve", "Freya", "Pippa", "Elodie-Rose",
+    "Imogen", "Lottie", "Alfie", "Hugh", "Edwin", "Spencer", "Toby", "Teddy", "Bryony",
+]
+PHONON_CHARACTER_VOICES = [
+    "Captain Silas Blackwater", "Morwenna of the Deep", "Old Mortlake", "Azgorath",
+    "Fennick the Young Elf", "The Thing Under the Stairs", "Vyrmathrax the Ancient",
+    "Grub the Ogre", "Master Aldric", "The Snow Queen", "Sir Bramwell", "Fairy Godmother",
+]
+PHONON_DEFAULT_VOICE = "default"  # bundled with the model: works offline
+_PHONON_NAMES = frozenset(PHONON_VOICES + PHONON_CHARACTER_VOICES + [PHONON_DEFAULT_VOICE])
+_PHONON_MODEL_DIR = "models--gradium--phonon-31m-en"
+_PHONON_WEIGHTS = "model.q8.gguf"
+
+_EXPLICIT_ENGINES = ("kokoro", "phonon", "macos-female", "macos-male", "none")
 
 _GLOBAL_SETTINGS_NAME = "settings.json"
 _PROJECT_SETTINGS_RELPATH = Path(".claude") / "voiceover.json"
@@ -229,7 +248,7 @@ def resolve_engine(cwd=None) -> str:
     engine = get_setting("tts_engine", cwd)
     if isinstance(engine, str):
         engine = engine.strip().lower()
-    if engine in ("kokoro", "macos-female", "macos-male", "none"):
+    if engine in _EXPLICIT_ENGINES:
         return engine
     # 'auto' and anything unrecognized resolve automatically.
     if sys.platform == "darwin":
@@ -237,15 +256,56 @@ def resolve_engine(cwd=None) -> str:
     return "kokoro" if models_present() else "none"
 
 
-def get_voice(cwd=None) -> str:
-    """Kokoro voice id: explicit setting wins, else a stable per-project pick.
+def is_phonon_voice(name) -> bool:
+    """True for a Phonon catalogue voice or the bundled 'default', exact case."""
+    return isinstance(name, str) and name in _PHONON_NAMES
 
-    The stable pick hashes the project root path so each project keeps the
-    same "random" voice across sessions, without storing any state.
-    """
+
+def _hf_hub_dir() -> Path:
+    """The Hugging Face cache ptts downloads into: $HF_HOME/hub, else
+    ~/.cache/huggingface/hub."""
+    hf_home = os.environ.get("HF_HOME")
+    base = Path(hf_home) if hf_home else Path.home() / ".cache" / "huggingface"
+    return base / "hub"
+
+
+def phonon_model_present() -> bool:
+    """True when Phonon's 8-bit weights are cached. Reads the folder, loads nothing."""
+    try:
+        snapshots = _hf_hub_dir() / _PHONON_MODEL_DIR / "snapshots"
+        return any(snapshots.glob("*/" + _PHONON_WEIGHTS))
+    except OSError:
+        return False
+
+
+def _explicit_voice(cwd):
+    """The voice setting, stripped, or None when unset or blank."""
     explicit = get_setting("voice", cwd)
     if isinstance(explicit, str) and explicit.strip():
         return explicit.strip()
+    return None
+
+
+def _stable_pick(voices, cwd):
+    """A voice from voices chosen by hashing the project root path, so each
+    project keeps the same "random" voice across sessions, with no state."""
     root = str(detect_project_root(cwd))
     digest = hashlib.sha1(root.encode("utf-8")).hexdigest()
-    return KOKORO_VOICES[int(digest, 16) % len(KOKORO_VOICES)]
+    return voices[int(digest, 16) % len(voices)]
+
+
+def get_voice(cwd=None) -> str:
+    """The voice for the project's resolved engine.
+
+    Under Phonon an explicit voice wins only when it is a Phonon voice; any
+    other string falls back to the per-project pick among the standard
+    Phonon voices. Under every other engine any explicit string passes
+    through as before, except a Phonon voice name, which falls back to the
+    per-project Kokoro pick.
+    """
+    explicit = _explicit_voice(cwd)
+    if resolve_engine(cwd) == "phonon":
+        return explicit if is_phonon_voice(explicit) else _stable_pick(PHONON_VOICES, cwd)
+    if explicit and not is_phonon_voice(explicit):
+        return explicit
+    return _stable_pick(KOKORO_VOICES, cwd)

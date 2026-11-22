@@ -1,0 +1,35 @@
+# The Phonon engine's own environment (tts/phonon_voice.py runs from here).
+#
+# A separate uv project, so neither engine's environment carries the other's
+# packages: nothing here is built or downloaded until Phonon is first used or set
+# up, and a Kokoro user never builds it. ptts brings numpy with it; sounddevice's
+# macOS and Windows wheels bundle PortAudio (measured on macOS), and where
+# PortAudio cannot load (Linux without the system library) the engine pipes audio
+# to a player process instead.
+#
+# Python: run for real on 3.12 (macOS, the builder's spike and smoke tests) and on
+# 3.12 and 3.14 (Ubuntu, the measuring session). 3.15 only resolved, never installed,
+# so it is excluded until it has been run.
+#
+# Keep Kokoro's packages (kokoro-onnx, onnxruntime, soundfile) out of this file,
+# and ptts/sounddevice out of ../tts and ../tts-gpu (tests/test_phonon_engine.py checks).
+
+[project]
+name = "claude-voiceover-tts-phonon"
+version = "1.0.0"
+description = "Phonon TTS engine dependencies for the Claude Voiceover plugin"
+requires-python = ">=3.10,<3.15"
+dependencies = [
+    "ptts>=0.7.1",
+    "sounddevice>=0.5",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = []
+
+[tool.setuptools.packages.find]
+exclude = ["*"]
