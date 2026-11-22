@@ -116,6 +116,21 @@ Release the lease at the end of cases 3 and 4 so each thread exits.
 
 ---
 
+### Task 2b: A newcomer engine waits for one that is handing over
+
+Added after Task 2's Step 5 found that a turn's closing message, queued for a newly chosen engine at `hooks/stop.py:79`, is left unspoken: `hooks/stop.py:84` sees the old engine's live lock and starts nothing, and no later hook in the turn starts the new one.
+
+**Files:** `tts/engine_common.py`, `voiceover/speech.py`, `tests/test_engine_handover.py` (extend), `INTERFACES.md`, the spec.
+
+- A drainer's lock JSON gains `"engines"` (sorted engine names), written at every claim and kept by every expiry refresh. One-shot and older locks have none and behave as today.
+- `speech.ensure_drainer`: where a live lock with a running owner made it return False, it spawns the resolved engine when the lock records engines, the resolved engine is not among them, and the spool has items. The `spawned.json` back-off still applies; no waiting in the hook.
+- `engine_common.drain`: when the first claim fails and the holder records engines disjoint from ours and we have pending items, poll every `poll_seconds` until the claim succeeds, none of our items remain, or `QUEUE_MAX_AGE_SECONDS` pass. Load nothing while waiting; refresh the spawn marker about once a second. A holder with our engine or with no recorded engines: return 0 as today.
+- Task 2 follow-up: a speaker's `idle()` that raises is logged and the drain carries on.
+- Tests: the finale case end to end in-process; a second `ensure_drainer` spawns nothing while one newcomer waits; a waiting newcomer whose items disappear exits without loading; a second drain for the same engine exits at once; a lock without `"engines"` is left alone; `"engines"` survives an expiry refresh; `open_speaker` only after the claim; an `idle()` that raises does not end the drain. `test_engine_lifecycle.py`, `test_lock_ownership.py` and `test_drain.py` pass untouched.
+- Commit: `feat: a newcomer engine waits for one that is handing over`.
+
+---
+
 ### Task 3: Settings — the phonon engine and engine-aware voices
 
 **Files:**

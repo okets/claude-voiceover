@@ -167,6 +167,9 @@ def ensure_drainer(cwd=None) -> bool
     # holds a lease (the pre-warm), unless a live lock whose owner pid still runs holds it (a dead
     # owner counts as free) or one was spawned <3s ago (<project>/spawned.json; the engine clears it
     # once loaded). Also removes the 1.3 machine-wide queue. Called unconditionally by narrator paths.
+    # One exception to the live-lock rule (engine switch): when the lock records "engines", the
+    # resolved engine is not among them and the queue has items, it spawns the resolved engine anyway
+    # (the 3s back-off still applies). That newcomer waits for the holder to hand over; no hook waits.
 def prewarm(cwd=None, session=None, ttl=lease.LEASE_TTL) -> bool   # lease.hold + ensure_drainer
 def request_stop(cwd=None, session=None) -> None
     # ask the project's engine to stop session's sentence now (None: any): <project>/stop/<slug|_all>.json
@@ -291,7 +294,8 @@ def drain_root(argv) -> Path | None  # the directory after --drain, or None
 def tts_lock_path(root) -> Path      # <root>/tts.lock
 def lock_is_live(root) -> bool       # unexpired AND its pid still runs (a dead owner = free)
 def try_claim_lock(root, duration) -> bool   # atomic (os.link); takes over an expired or dead-pid lock
-def update_lock_expiry(root, duration) -> None
+def update_lock_expiry(root, duration, engines=None) -> None   # a drainer passes its engine names
+def lock_holder_engines(root) -> frozenset | None   # None: no live lock; empty: holder records none
 def remove_tts_lock(root) -> None
 def queue_dir(root) -> Path          # <root>/queue/
 def take_oldest(root, engine_names=None) -> tuple   # (item, taken_path) | (None, None); atomic claim
@@ -339,7 +343,20 @@ dry and no lease remains. With nothing of its own to speak, it hands over: when
 it logs `handover` and exits even under a live lease, so the next hook starts the engine those
 items name. It never abandons a sentence it is speaking and never touches the other engine's
 items. A foreign item queued before it started does not count, so a leftover item for an engine
-nobody starts cannot make every new drainer exit at once. If `MAX_ENGINES` other projects' engines already hold locks it
+nobody starts cannot make every new drainer exit at once.
+
+Lock content is `{"expiry", "pid"}`; a drainer's lock adds `"engines"`, the sorted engine names it
+drains, written at every claim and kept by every expiry refresh. One-shot locks and older locks
+have no such key and behave as before.
+
+A newcomer waits for an engine that is handing over. When `drain()`'s first claim fails and the
+live lock records engines disjoint from its own, and it has pending items of its own, it polls
+every `poll_seconds` until the claim succeeds, none of its own items remain, the holder stops
+being another engine, or `QUEUE_MAX_AGE_SECONDS` pass. While waiting it loads nothing
+(`open_speaker()` runs only after the claim) and refreshes `spawned.json` about once a second so
+the hooks start no second waiter. A holder with one of its engines, or recording none, makes it
+exit 0 at once as before. A speaker's `idle()` that raises is logged (`error`) and the drain goes
+on. If `MAX_ENGINES` other projects' engines already hold locks it
 steps aside; if `open_speaker()` fails it releases the lock and backs the hooks off for 30s.
 
 The spawn marker `<root>/spawned.json` (`{"ts"}`) is written by `speech.ensure_drainer`

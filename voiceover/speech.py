@@ -154,11 +154,12 @@ def ensure_drainer(cwd=None) -> bool:
         if spool.pending_count(cwd) == 0 and not lease.any_live(cwd):
             return False
         lock = project_lock_path(cwd)
+        engine = resolve_engine(cwd)
         if lock_is_live(lock) and process_utils.lock_owner_is_running(lock):
-            return False  # this project's drainer is already working
+            if not _handing_over(lock, engine, cwd):
+                return False  # this project's drainer is already working
         if _recently_spawned(cwd):
             return False  # one is starting up
-        engine = resolve_engine(cwd)
         command = _drain_command(engine, project_dir(cwd))
         if command is None:
             return False
@@ -169,6 +170,26 @@ def ensure_drainer(cwd=None) -> bool:
         return spawned
     except Exception:
         return False
+
+
+def _handing_over(lock, engine, cwd) -> bool:
+    """True when the live lock's drainer drains other engines than `engine`
+    and speech is pending: the user switched engine while it was busy. The
+    new engine is started anyway; it waits for the old one to hand over
+    (tts/engine_common.py), so this hook never waits. Without this, a turn's
+    last message, queued for the new engine while the old one still speaks,
+    would have no later hook to start its engine."""
+    holder = _lock_engines(lock)
+    return bool(holder) and engine not in holder and spool.pending_count(cwd) > 0
+
+
+def _lock_engines(lock) -> list:
+    """The engines a drainer's lock records; [] for a one-shot or older lock."""
+    try:
+        engines = json.loads(Path(lock).read_text()).get("engines")
+    except (OSError, ValueError, AttributeError):
+        return []
+    return engines if isinstance(engines, list) else []
 
 
 def _recently_spawned(cwd) -> bool:

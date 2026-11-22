@@ -129,6 +129,22 @@ abandons a sentence it is speaking, and it never touches the foreign items.
 The rule needs its own tests, including that a lease alone (no foreign items)
 still keeps the engine warm as before.
 
+Handing over is not enough on its own. At the end of a turn the Stop hook
+queues Claude's closing message (`hooks/stop.py:79`) and then asks for an
+engine (`hooks/stop.py:84`). After a switch, that message belongs to the new
+engine while the old one usually still holds the lock, speaking its own
+earlier items; the hook therefore starts nothing, the old engine hands over
+afterwards, and no later hook in that turn starts the new engine. The very
+turn that runs `/voiceover:voice` would end in silence. So a newcomer waits:
+a drainer's lock records the engines it drains, the hooks start the resolved
+engine even under a live lock when that lock belongs to a different engine
+and speech is pending, and the newcomer, finding the lock held by a
+different engine, waits for it (loading nothing, keeping the hooks from
+starting a second one) until the old engine hands over, its own items are
+gone, or the five-minute age cap passes. Hooks still never wait. A lock that
+records no engines (a one-shot speaker, an older engine) and a second
+drainer for the same engine behave exactly as before.
+
 ### The engine process
 
 - `tts/phonon_voice.py`, run as
@@ -251,6 +267,9 @@ still keeps the engine warm as before.
 
 ## Calls made by the designer (not the user's decisions)
 
+- A newcomer engine waits for one that is handing over, and the hooks start
+  it under a live lock of a different engine (the section on switching
+  engines). Shared code again, flagged for the same reason.
 - A drainer steps aside for another engine's pending items (the section on
   switching engines). It follows from goal 3, but it changes shared code
   that Kokoro and macOS speech also run, so it is flagged first.
