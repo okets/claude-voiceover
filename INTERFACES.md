@@ -409,6 +409,48 @@ raises into the writer: that chunk is dropped and the next write starts a new pl
 arguments: the `ffplay` line is measured (ffplay 9 rejects `-ac 1`; raw input defaults to mono);
 the `aplay`, `paplay` and `pw-cat` lines are untested.
 
+## tts/phonon_voice.py, tts-phonon/
+
+The Phonon engine. Runs from its own uv project, `tts-phonon/pyproject.toml` (`ptts>=0.7.1`,
+`sounddevice>=0.5`; nothing of Kokoro's), and imports `ptts` and `sounddevice` only inside
+functions, so a dry run and the test suite load neither. Never imports `voiceover/`.
+
+```text
+uv run --project <plugin>/tts-phonon <plugin>/tts/phonon_voice.py --drain <project dir>
+uv run --project <plugin>/tts-phonon <plugin>/tts/phonon_voice.py --voice <name> --stream <text>
+phonon_voice.py --install              # load (downloading on first use) the model; 0, or 1 + stderr
+phonon_voice.py --fetch-voice <name>   # load the model and render one word in <name>; 0, or 1
+```
+
+```python
+MODEL_REPO = "hf://gradium/phonon-31m-en@92741c5b07d085ff840e26fea8ce43110b87852f"  # pinned
+QUANT, DEVICE, THREADS = "q8_0", "cpu", 2
+FALLBACK_VOICE = "default"             # bundled with the model; works offline
+def load_model()                       # ptts.set_num_threads(2); ptts.TTS(MODEL_REPO, lang="en", quant, device)
+class PhononSpeaker:                   # PhononSpeaker(tts, sink, grace_seconds=10.0)
+    def warm_up(self)                  # renders "Ready." in "default"; writes nothing, opens no device
+    def prefetch(self, sentence, voice)    # no-op: a warm first chunk takes < 35 ms
+    def begin(self, sentence, voice, upcoming=None) -> PhononPlayback
+    def idle(self)                     # sink.close(): a warm engine holds no device
+class PhononPlayback(Playback)         # started(): a chunk was written; poll(); kill()
+def open_speaker()                     # open_sink(), load_model(), warm_up(); None (logged) on failure
+def speak_once(text, voice) -> bool    # the one-shot: owns data_dir()'s lock, released on every path
+def parse_args(argv) -> (voice, text, use_streaming)
+```
+
+One worker thread per speaker renders sentences in order: it opens `tts.stream(sentence,
+voice=...)`, writes each chunk to the sink, and closes the generator on every path (end, cancel,
+error). A voice that cannot be loaded raises from `stream()` itself (`LookupError`, or `OSError`
+after a ~2.6 s failed fetch): the sentence is spoken in `"default"`, logged as `voice`, and that
+voice goes straight to `"default"` for the rest of the process. `poll()` re-raises a generation
+error, and is true once the worker finished and `sink.remaining()` is 0; if the audio has not
+drained within its length plus `grace_seconds` after the worker finished (a vanished device), it
+aborts the sink, logs `stall`, and reports the sentence done. `kill()` sets the cancel flag,
+aborts the sink (silence first), and returns without waiting for the generator; the cancel check
+and each write happen under one lock, so no chunk reaches the sink after `kill()` returns. The
+one-shot waits for `remaining()` to reach 0 before closing the sink, so the end is not cut off.
+`--install` and `--fetch-voice` never open the audio device. `--fetch-voice` has no fallback.
+
 ## voiceover/audio_player.py, voiceover/process_utils.py
 
 Straight ports (cross-platform playback / TTS-process kill). One fix: make the Unix kill

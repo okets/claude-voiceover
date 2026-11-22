@@ -158,6 +158,32 @@ check("close releases the device and a later write re-opens it", calls.count("op
 sink.close()
 check("no code path ever calls the stream's blocking write()", "write" not in calls)
 
+# --- a failed open leaves no stale audio behind ---------------------------------------
+class FailsOnce(StubStream):
+    failures = 1
+
+    def __init__(self, **kwargs):
+        if FailsOnce.failures:
+            FailsOnce.failures -= 1
+            raise RuntimeError("Error opening RawOutputStream: device unavailable")
+        super().__init__(**kwargs)
+
+
+sys.modules["sounddevice"].RawOutputStream = FailsOnce
+sink = pcm_sink.SoundDeviceSink()
+raised = None
+try:
+    sink.write(Chunk(1920, fill=b"\x04"))
+except RuntimeError as error:
+    raised = error
+check("a failed open raises to the writer", raised is not None)
+check("and discards what that write buffered", sink.remaining() == 0.0, sink.remaining())
+sink.write(Chunk(480, fill=b"\x05"))
+check("the next write plays only its own bytes",
+      play_block(streams[-1]) == b"\x05" * BLOCK_BYTES and sink.remaining() == 0.0)
+sink.close()
+sys.modules["sounddevice"].RawOutputStream = StubStream
+
 # --- PipeSink -------------------------------------------------------------------------
 work = temp_dir("vo-pcm-pipe-")
 

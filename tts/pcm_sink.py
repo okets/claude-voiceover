@@ -80,7 +80,14 @@ class SoundDeviceSink(Sink):
         data = chunk.tobytes()
         with self._buffer_lock:
             self._buffer.extend(data)
-        self._ensure_open()
+        try:
+            self._ensure_open()
+        except Exception:
+            # The device is gone or changed: what is buffered belongs to a
+            # sentence that is about to be reported failed. A later open
+            # must not play it.
+            self.abort()
+            raise
 
     def abort(self) -> None:
         with self._buffer_lock:
