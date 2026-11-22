@@ -373,6 +373,42 @@ The spawn marker `<root>/spawned.json` (`{"ts"}`) is written by `speech.ensure_d
 before a spawn and read by it to back off for 3s; the engine clears it once loaded (or
 writes it ahead on a cap/failed load so the hooks do not respawn per call).
 
+## tts/pcm_sink.py
+
+Stdlib only at import (`sounddevice` is imported inside `SoundDeviceSink`). Plays raw 24 kHz
+mono float32 audio as it arrives, for a streaming engine (Phonon). Chunks need only `len()`
+(samples) and `tobytes()`; nothing imports numpy.
+
+```python
+SAMPLE_RATE = 24000
+class Sink:
+    def write(self, chunk) -> None   # play after what is written; opens the output on demand
+    def abort(self) -> None          # silence now, discard buffered audio; the next write plays again
+    def close(self) -> None          # release the output; idempotent and near-free when closed;
+                                     # within 200 ms (a PortAudio stop+close is ~115-125 ms on macOS)
+    def remaining(self) -> float     # seconds written but not yet played
+class SoundDeviceSink(Sink)          # PortAudio, callback-fed (latency="low", blocksize=480)
+class PipeSink(Sink)                 # PipeSink(command): a player process fed on stdin
+def player_command() -> list | None  # first player on PATH: aplay, paplay, pw-cat, ffplay
+def open_sink() -> Sink | None       # SoundDeviceSink, else PipeSink, else None; never raises
+```
+
+`SoundDeviceSink` never calls a stream's blocking `write()`: the spike measured that `write()` on
+one thread with `abort()` from another crashes the process. The worker appends to a buffer the
+sink owns; PortAudio's callback copies from it and pads with zeros (a partial last block plays at
+once). `abort()` only empties that buffer and never calls into PortAudio (silence reaches the
+device ~25-30 ms later, measured). `close()` calls the stream's `stop()` (so a tail in the device
+plays out) then `close()`. `remaining()` is the bytes in the sink's own buffer; the device's
+~25 ms output latency is not added. Construction fails (and `open_sink()` falls back) when the
+import fails (no PortAudio: the normal case on Linux, measured) or `check_output_settings` finds
+no usable output.
+
+`PipeSink`: `remaining()` by wall clock (each write extends an end time from `max(now, end)`);
+`abort()` kills the player; `close()` closes its stdin without waiting. A player that died never
+raises into the writer: that chunk is dropped and the next write starts a new player. Player
+arguments: the `ffplay` line is measured (ffplay 9 rejects `-ac 1`; raw input defaults to mono);
+the `aplay`, `paplay` and `pw-cat` lines are untested.
+
 ## voiceover/audio_player.py, voiceover/process_utils.py
 
 Straight ports (cross-platform playback / TTS-process kill). One fix: make the Unix kill
