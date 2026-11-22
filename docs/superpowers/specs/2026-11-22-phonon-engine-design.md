@@ -1,8 +1,10 @@
 # Phonon Engine — Design
 
+This branch was cut from 1.5.0 (2658e91) and has not been merged with 1.6.0 (the shared Kokoro engine).
+
 Date: 2026-11-22
 Status: approved by the user 2026-11-22.
-Target version: 1.6.0
+Target version: undecided (1.6.0 is already released upstream; the number is the user's).
 Builds on: `2026-09-10-narration-queue-design.md` and
 `2026-10-02-low-latency-narration-design.md`. The spool, the lock, the lease
 and the jump rule stand unchanged. The drain loop gains one rule, described

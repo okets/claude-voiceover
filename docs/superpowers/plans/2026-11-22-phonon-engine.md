@@ -24,7 +24,7 @@
   2. Secondary: in the main checkout, the only failures allowed are the known 8 (in `tests/test_enqueue_speech.py`, and the 2 "enqueue fails" checks in `tests/test_narrator_hooks.py`).
   3. Every new test file passes in both places: it gives itself its own temp project directory, passes that as `cwd`, and never reads the spool or settings through the default cwd.
 - Coding standards: single responsibility, DRY, small well-named methods.
-- Release target 1.6.0.
+- Release target: deferred (1.6.0 is already released upstream; see Task 9).
 - Commits: on the feature branch the user names, and only if the user has allowed the builder to commit. Never push.
 
 ## Review Focus
@@ -418,6 +418,10 @@ check("a missing Linux player is named", "aplay" in out_linux_no_player)
 ---
 
 ### Task 9: Docs, version and live verification
+
+Amended 2026-11-22: This branch was cut from 1.5.0 (2658e91) and has not been merged with 1.6.0 (the shared Kokoro engine). The version step is deferred: the docs go under "Unreleased", neither
+manifest's version changes, and the number and the release are the user's. The live checks run
+for Phonon only, on this base; check 5 and the Kokoro side of the lag comparison wait for the merge.
 
 **Files:**
 - Modify: `README.md`, `INTERFACES.md`, `CHANGELOG.md`, `.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json`

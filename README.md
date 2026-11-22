@@ -11,7 +11,7 @@ Since March 2026 Claude Code has native `/voice` dictation, but it is input-only
 ## Why Voiceover
 
 - **A real narrator, not a bell.** Narrator mode reads Claude's actual words aloud as it works — streaming audio that starts within seconds — and announces out loud when Claude is blocked waiting for your input, question and options included. Prefer tool-by-tool play-by-play instead? That's one level down the dial.
-- **Local and free neural voices.** 13 Kokoro neural voices run entirely on your machine — no API keys, no cloud, no cost. On macOS you can also use the built-in system voices with zero setup.
+- **Local and free neural voices.** Two neural engines run entirely on your machine — no API keys, no cloud, no cost: Phonon (37 voices, opt-in, streams as it speaks) and Kokoro (13 voices). On macOS you can also use the built-in system voices with zero setup.
 - **Cross-platform.** macOS, Windows, and Linux.
 
 ## Quickstart (30 seconds)
@@ -23,7 +23,7 @@ Since March 2026 Claude Code has native `/voice` dictation, but it is input-only
 /voiceover:setup
 ```
 
-On macOS you'll have a voice immediately (system voices need no setup). Opt into the Kokoro neural voices during setup for the good stuff. Then turn on the full experience:
+On macOS you'll have a voice immediately (system voices need no setup). Opt into the Phonon or Kokoro neural voices during setup for the good stuff. Then turn on the full experience:
 
 ```
 /voiceover:level narrator
@@ -46,7 +46,11 @@ Set with `/voiceover:level` — per machine, or per project.
 
 ## Voices
 
-Set with `/voiceover:voice <name>`. Kokoro voices are local neural TTS; the default voices use macOS system speech and work instantly.
+Set with `/voiceover:voice <name>`. Phonon and Kokoro voices are local neural TTS; the default voices use macOS system speech and work instantly. Picking a voice also picks its engine. `/voiceover:voice` with no name lists every voice, grouped by engine, and marks which are ready on your machine.
+
+**Phonon** (opt-in, 37 voices): 25 standard voices — `zoey`, `juniper`, `everly`, `harper`, `hadley`, `delia`, `easton`, `micah`, `trevor`, `russell`, `preston`, `miles`, `maeve`, `freya`, `pippa`, `elodie-rose`, `imogen`, `lottie`, `alfie`, `hugh`, `edwin`, `spencer`, `toby`, `teddy`, `bryony` — and 12 character voices such as `captain-silas-blackwater`, `the-snow-queen` and `fairy-godmother`. Each voice is a small download (about 256KB) the first time you pick it.
+
+**Kokoro** (13 voices) and the macOS system voices:
 
 | Name | Voice | Name | Voice |
 |------|-------|------|-------|
@@ -59,7 +63,15 @@ Set with `/voiceover:voice <name>`. Kokoro voices are local neural TTS; the defa
 | `echo` | American Male | `default-male` | macOS Daniel, zero setup |
 | `puck` | American Male | | |
 
-No voice picked? Each project gets a stable voice of its own, so you can tell your sessions apart by ear. Pick one for just the current project with `/voiceover:voice <name> --project`.
+No voice picked? Each project gets a stable voice of its own, so you can tell your sessions apart by ear (under Phonon, one of the 25 standard voices). Pick one for just the current project with `/voiceover:voice <name> --project`.
+
+### Which neural engine?
+
+Both are optional, local and free; install one or both from `/voiceover:setup`, and installing never changes your current voice. **Phonon** ([Gradium](https://gradium.ai/blog/release-phonon-open-weight)'s open-weight `gradium/phonon-31m-en` model, Apache 2.0) streams: speech starts while a sentence is still being generated. It runs on the CPU only, the bundled model is English only, and the download is about 65MB. **Kokoro** keeps the voices people already know, needs about 300MB, and can use an NVIDIA GPU. An engine you don't use costs nothing: neither is built, downloaded or started until you choose it, and neither carries the other's packages.
+
+On speed and size, Gradium's figures are Gradium's own and not reproduced here. Our two measurements: on an Intel i7-9750H laptop (Ubuntu) Phonon rendered about eight times faster than real time with a 26–31 ms first chunk once warm; on an Apple-silicon Mac, speaking the same three sentences as one-shot runs, Phonon peaked at 343 MiB of memory and 0.7 s of CPU against Kokoro's 724 MiB and 8.5 s. That is one comparison of one-shot runs, not a benchmark.
+
+Not yet run: Phonon's Linux audio path (it plays through PortAudio or pipes to `aplay`, `paplay`, `pw-cat` or `ffplay`) and Windows.
 
 ### Narrator, per project
 
@@ -77,7 +89,7 @@ Narrator level tells you what Claude wrote; the bundled **Narration** output sty
 
 | Command | What it does |
 |---------|--------------|
-| `/voiceover:setup` | First-run setup: checks tooling, offers the Kokoro model download, verifies audio |
+| `/voiceover:setup` | First-run setup: checks tooling, offers the Phonon and Kokoro downloads, verifies audio |
 | `/voiceover:voice` | Pick a voice by friendly name (add `--project` for per-project) |
 | `/voiceover:level` | Set silent / quiet / concise / verbose / narrator (or 0–4) |
 | `/voiceover:migrate` | Clean up a legacy smarter-claude install |
@@ -86,7 +98,8 @@ Narrator level tells you what Claude wrote; the bundled **Narration** output sty
 
 - **Claude Code 2.1.287 or newer** — for narration that starts as Claude writes (mods are on by default there). Older builds narrate through the hooks.
 - **python3** (3.9+) — that's it for macOS system voices and notification sounds.
-- **[uv](https://docs.astral.sh/uv/)** — only if you opt into Kokoro neural voices.
+- **[uv](https://docs.astral.sh/uv/)** — only if you opt into Phonon or Kokoro neural voices.
+- **~65MB model download** — only if you opt into Phonon. One time, stored in the Hugging Face cache (`~/.cache/huggingface`, or `$HF_HOME`). On Linux Phonon also needs the PortAudio library or one of `aplay`, `paplay`, `pw-cat` or `ffplay`; setup tells you which you have.
 - **~300MB model download** — only if you opt into Kokoro. One time, stored in `~/.kokoro-tts`, reused if you already have it (e.g. from smarter-claude).
 
 Nothing phones home. All speech is generated on your machine.
