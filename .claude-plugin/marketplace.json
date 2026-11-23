@@ -9,7 +9,7 @@
     {
       "name": "voiceover",
       "source": "./",
-      "description": "Give Claude Code a voice: real-time text-to-speech narration of what Claude is doing, with local, free Kokoro neural voices, instant macOS voices, notification sounds, and a silent/quiet/concise/verbose dial.",
+      "description": "Give Claude Code a voice: real-time text-to-speech narration of what Claude is doing, with local, free Kokoro neural voices, instant macOS voices, notification sounds, and a silent-to-narrator dial.",
       "author": {
         "name": "Hanan (okets)",
         "url": "https://github.com/okets"

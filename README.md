@@ -41,7 +41,7 @@ Set with `/voiceover:level` — per machine, or per project.
 | silent | 0 | Nothing at all |
 | quiet | 1 | Sound pings only (permission needed, task done) |
 | concise | 2 | Speaks permission requests and task completions *(default)* |
-| verbose | 3 | Full play-by-play of every tool Claude uses, including subagent completions |
+| tools | 3 | Full play-by-play of every tool Claude uses, including subagent completions |
 | narrator | 4 | Claude's actual words read aloud as it works, with fluent speech between sentences (model loads once per turn, not per sentence) — tool chatter stays quiet, code blocks become a spoken "…code snippet…" cue |
 
 ## Voices
@@ -91,7 +91,7 @@ Narrator level tells you what Claude wrote; the bundled **Narration** output sty
 |---------|--------------|
 | `/voiceover:setup` | First-run setup: checks tooling, offers the Phonon and Kokoro downloads, verifies audio |
 | `/voiceover:voice` | Pick a voice by friendly name (add `--project` for per-project) |
-| `/voiceover:level` | Set silent / quiet / concise / verbose / narrator (or 0–4) |
+| `/voiceover:level` | Set silent / quiet / concise / tools / narrator (or 0–4) |
 | `/voiceover:migrate` | Clean up a legacy smarter-claude install |
 
 ## Requirements

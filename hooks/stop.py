@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Stop hook: speak a completion summary for the finished request cycle.
 
-Reads the Stop payload from stdin. Concise and verbose speak
+Reads the Stop payload from stdin. Concise and tools speak
 completion_message(cycle_stats(transcript_path)); narrator queues Claude's
 unread closing prose, or plays the decide sound when there is none; quiet
 plays the decide sound; stop_hook_active is skipped to avoid announcement
@@ -100,7 +100,9 @@ def main():
         stats = cycle_stats(transcript_path)
     text = completion_message(stats)
     if text:
-        speak(text, min_level="concise", cwd=cwd, interrupt=True)
+        # full=True: the closing message is Claude's own prose, not tool
+        # chatter, so the word budget for announcements must not clip it.
+        speak(text, min_level="concise", cwd=cwd, interrupt=True, full=True)
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 DEFAULTS = {
-    "interaction_level": "concise",     # silent | quiet | concise | verbose | narrator
+    "interaction_level": "concise",     # silent | quiet | concise | tools | narrator
     "tts_engine": "auto",               # auto | kokoro | phonon | macos-female | macos-male | none
     "tts_device": "cpu",                # cpu | gpu (Kokoro on an NVIDIA GPU; opt-in, falls back to cpu)
     "engine_port": None,                # TCP port of the shared Kokoro engine (127.0.0.1); null = socket only
@@ -24,11 +24,17 @@ DEFAULTS = {
     "tts_enabled": True,
     "notification_sounds": True,        # quiet-mode mp3 pings
     "voice": None,                      # explicit voice for the engine (Kokoro id or Phonon name), else per-project hash
-    "speak_subagent_completions": True, # verbose level only
+    "speak_subagent_completions": True, # tools level only
     "debug_log": False,                 # write pipeline diagnostics to data_dir()/voiceover.log
 }
 
-LEVELS = ["silent", "quiet", "concise", "verbose", "narrator"]  # numeric aliases 0..4 accepted
+LEVELS = ["silent", "quiet", "concise", "tools", "narrator"]  # numeric aliases 0..4 accepted
+
+# Level names from earlier releases, mapped to their current name. Settings
+# files written before a rename still hold the old name, so it keeps
+# resolving: no migration step, and nobody is dropped to the default level
+# by an upgrade. "tools" was called "verbose" through 1.7.0.
+LEGACY_LEVEL_NAMES = {"verbose": "tools"}
 
 # The 13 Kokoro voice ids, ported verbatim from the legacy kokoro_voice.py.
 KOKORO_VOICES = [
@@ -197,7 +203,8 @@ def set_setting(key: str, value, scope: str = "global", cwd=None) -> bool:
 
 
 def _normalize_level(value) -> str:
-    """Accept level names or numeric aliases 0..3; fall back to 'concise'."""
+    """Accept level names, legacy names or numeric aliases 0..4; fall back to
+    'concise'."""
     if isinstance(value, bool):
         return DEFAULTS["interaction_level"]
     if isinstance(value, int) and 0 <= value < len(LEVELS):
@@ -206,6 +213,8 @@ def _normalize_level(value) -> str:
         text = value.strip().lower()
         if text in LEVELS:
             return text
+        if text in LEGACY_LEVEL_NAMES:
+            return LEGACY_LEVEL_NAMES[text]
         if text.isdigit() and 0 <= int(text) < len(LEVELS):
             return LEVELS[int(text)]
     return DEFAULTS["interaction_level"]
