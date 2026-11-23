@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PostToolUse hook: announce a finished tool call at verbose level.
+"""PostToolUse hook: announce a finished tool call at the tools level.
 
 Reads the PostToolUse payload from stdin. Message text (including the
 "<description> - done" variants and deduplication) comes from
@@ -65,7 +65,7 @@ def main():
 
     text = post_tool_announcement(tool_name, tool_input, tool_response)
     if text:
-        speak(text, min_level="verbose", cwd=cwd)
+        speak(text, min_level="tools", cwd=cwd)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """SubagentStop hook: manager-style announcement when a subagent finishes.
 
-Reads the SubagentStop payload from stdin. Speaks only at verbose level
+Reads the SubagentStop payload from stdin. Speaks only at the tools level
 and only when the speak_subagent_completions setting is on; message text
 comes from voiceover.templates. Never blocks, no stdout, always exits 0.
 """
@@ -26,14 +26,14 @@ def main():
     from voiceover.templates import subagent_completion_message
 
     cwd = payload.get("cwd")
-    if get_interaction_level(cwd) != "verbose":
+    if get_interaction_level(cwd) != "tools":
         return
     if not get_setting("speak_subagent_completions", cwd):
         return
 
     text = subagent_completion_message(payload)
     if text:
-        speak(text, min_level="verbose", cwd=cwd)
+        speak(text, min_level="tools", cwd=cwd)
 
 
 if __name__ == "__main__":

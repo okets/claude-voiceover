@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """PreToolUse hook: interrupt narration on new activity, then announce the tool.
 
-Reads the PreToolUse payload from stdin. Announcements are verbose-level
+Reads the PreToolUse payload from stdin. Announcements are tools-level
 play-by-play; message text comes from voiceover.templates. Never blocks,
 never prints to stdout, always exits 0.
 """
@@ -71,7 +71,7 @@ def main():
 
     text = pre_tool_announcement(tool_name, tool_input, payload.get("transcript_path"))
     if text:
-        speak(text, min_level="verbose", cwd=cwd)
+        speak(text, min_level="tools", cwd=cwd)
 
 
 if __name__ == "__main__":

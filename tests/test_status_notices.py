@@ -74,7 +74,7 @@ prose, _ = peek_new_prose(str(transcript("normal.jsonl", [USER], [REAL])))
 check("ordinary assistant prose is narrated",
       prose is not None and "picking the thread" in prose, "spoke: %r" % prose)
 
-# --- the other reader, used at concise/verbose levels --------------------
+# --- the other reader, used at concise/tools levels ----------------------
 path = tx_dir / "cycle.jsonl"
 with open(path, "w", encoding="utf-8") as handle:
     for entry in (USER, REAL, LIMIT):

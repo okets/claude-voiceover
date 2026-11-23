@@ -10,6 +10,7 @@ import random
 import re
 from pathlib import Path
 
+from .prose import clean_for_speech
 from .settings import data_dir, get_interaction_level
 from .transcript import (
     CycleStats,
@@ -646,15 +647,25 @@ _COMPLETION_FALLBACKS = ["Task complete.", "All done!", "Finished.",
 def completion_message(stats):
     """Spoken summary of a finished request cycle.
 
-    Simple cycles read the assistant's short closing response verbatim;
-    everything else gets a templated stats summary.
+    Claude's own closing words are the news of the turn, so they are what
+    gets spoken whenever the turn left any: markdown cleaned for the voice,
+    at whatever length and however much work the turn did. Only a turn that
+    ended without prose falls back to a templated stats summary.
     """
     if not isinstance(stats, CycleStats):
         return random.choice(_COMPLETION_FALLBACKS)
-    response = (stats.final_response_text or "").strip()
-    if stats.complexity == "simple" and 10 < len(response) < 300:
-        return response
-    return _templated_completion(stats)
+    return _speakable_closing(stats.final_response_text) or _templated_completion(stats)
+
+
+# Below this a closing is an acknowledgement ("Done."), not news: the
+# templated summary of what actually changed tells the listener more.
+_MIN_CLOSING_CHARS = 10
+
+
+def _speakable_closing(response):
+    """Claude's closing prose as speech, or None when there is none to speak."""
+    spoken = clean_for_speech(response or "").strip()
+    return spoken if len(spoken) > _MIN_CLOSING_CHARS else None
 
 
 def _templated_completion(stats):
@@ -715,7 +726,7 @@ def subagent_completion_message(payload):
     task = (payload.get("task") or payload.get("description")
             or payload.get("summary") or "the task")
     snippet = truncate_to_words(str(task), max_words=8)
-    if get_interaction_level() == "verbose":
+    if get_interaction_level() == "tools":
         return random.choice(_SUBAGENT_VERBOSE).format(snippet)
     return random.choice(_SUBAGENT_CONCISE).format(snippet)
 

@@ -35,12 +35,12 @@ Hierarchy (first hit wins): project `<cwd>/.claude/voiceover.json` → global
 
 ```python
 DEFAULTS = {
-    "interaction_level": "concise",     # silent | quiet | concise | verbose
+    "interaction_level": "concise",     # silent | quiet | concise | tools
     "tts_engine": "auto",               # auto | kokoro | phonon | macos-female | macos-male | none
     "tts_enabled": True,
     "notification_sounds": True,        # quiet-mode mp3 pings
     "voice": None,                      # explicit voice for the engine (Kokoro id or Phonon name), else per-project hash
-    "speak_subagent_completions": True, # verbose level only
+    "speak_subagent_completions": True, # tools level only
     # machine-wide only (global settings file; read by the engine too, see "Shared engine"):
     "tts_device": "cpu",                # cpu | gpu
     "engine_port": None,                # TCP port of the shared Kokoro engine on 127.0.0.1; null = socket only
@@ -48,7 +48,8 @@ DEFAULTS = {
     "engine_plugin_root": None,         # plugin directory the engine runs from; null = this install
 }
 
-LEVELS = ["silent", "quiet", "concise", "verbose", "narrator"]   # numeric aliases 0..4 accepted everywhere
+LEVELS = ["silent", "quiet", "concise", "tools", "narrator"]    # numeric aliases 0..4 accepted everywhere
+LEGACY_LEVEL_NAMES = {"verbose": "tools"}                       # old names still resolve, stored as the new one
 
 def data_dir() -> Path
 def get_setting(key: str, cwd: str | None = None)            # hierarchy lookup
@@ -212,7 +213,7 @@ def lock_is_live(path=None) -> bool          # unexpired lock at path (default l
 Level gating convention (callers pass min_level):
 - quiet: sounds only (play_sound works at quiet+; speak() at quiet is used for nothing today)
 - concise: permission requests, cycle completion
-- verbose: pre/post tool play-by-play, subagent completions (EXACTLY verbose)
+- tools: pre/post tool play-by-play, subagent completions (EXACTLY tools)
 - narrator: Claude's actual prose via voiceover/prose.py (peek_new_prose/commit_offset,
   byte-offset cursor in data_dir()/prose_state.json); tool chatter silent.
   Prose is QUEUED via speech.enqueue_speech() into voiceover/spool.py and the cursor
@@ -240,7 +241,8 @@ def post_tool_announcement(tool_name: str, tool_input: dict, tool_response: dict
 def permission_request_message(payload: dict) -> str
     # 'May I run git push?' style; extracts tool/command/filename from payload + transcript
 def completion_message(stats: CycleStats) -> str
-    # simple cycle -> stats.final_response_text if < 300 chars; else templated stats summary
+    # stats.final_response_text, cleaned for speech, at any length; a cycle that
+    # left no prose -> templated stats summary, else a fallback phrase
 def subagent_completion_message(payload: dict) -> str
     # resurrect the manager-style templates ('my agent handled X')
 def speakable_filename(path: str) -> str      # '. ' -> ' dot ' etc.
@@ -840,7 +842,7 @@ bridge re-pins and cuts over). Below the narrator level the classic hooks run as
 - `pre_tool_use.py` — narrator: queue unread prose (`source="pre_tool_use"`), hold the lease,
   `ensure_drainer`; for `AskUserQuestion` / `ExitPlanMode` wait out the transcript flush race
   for the lead-in prose, then `narrator.queue_dialog` (sticky alert). Other levels: stop_speech
-  (one-shot only), then verbose-level announcement via pre_tool_announcement.
+  (one-shot only), then tools-level announcement via pre_tool_announcement.
 - `post_tool_use.py` — narrator: `spool.clear_sticky(session)` first, in mod sessions too (a
   finished tool means the session's pending alert or permission request was answered; do not
   read it out), then stand down for a mod session; otherwise hold or re-hold the lease, queue
@@ -851,7 +853,7 @@ bridge re-pins and cuts over). Below the narrator level the classic hooks run as
 - `stop.py` — concise+ speaks completion_message(cycle_stats(transcript_path)); narrator queues
   the unread closing prose (back of the queue) then `narrator.turn_end`; quiet plays 'decide'
   sound. Detect stop_hook_active to avoid loops.
-- `subagent_stop.py` — verbose + speak_subagent_completions -> subagent_completion_message.
+- `subagent_stop.py` — tools + speak_subagent_completions -> subagent_completion_message.
 - `user_prompt_submit.py` — `narrator.repin`, then a new user message ends the previous turn's
   narration: narrator level -> `narrator.cutover` (spool.clear(session) then request_stop, then
   pre-warm; a background task's notification only pre-warms); other levels -> spool.clear(session)
@@ -976,7 +978,7 @@ hooks/), and Stop does not end its turn; `turn.complete` does. Items the mod que
 ## commands/ (plugin slash commands, markdown)
 
 - `voice.md` (/voiceover:voice) — set voice by friendly name via manage_voices.py
-- `level.md` (/voiceover:level) — silent|quiet|concise|verbose|narrator or 0-4 via manage_settings.py
+- `level.md` (/voiceover:level) — silent|quiet|concise|tools|narrator or 0-4 via manage_settings.py
 - `setup.md` (/voiceover:setup) — run setup_tts.py, guide model download + voice pick
 - `migrate.md` (/voiceover:migrate) — run migrate_legacy.py flow with confirmation
 All commands invoke scripts with `"${CLAUDE_PLUGIN_ROOT}/scripts/<script>.py"` paths.

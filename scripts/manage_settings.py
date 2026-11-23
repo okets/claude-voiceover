@@ -25,11 +25,11 @@ LEVEL_DESCRIPTIONS = {
     "silent": "Nothing at all - no speech, no sounds",
     "quiet": "Sound pings only (permission request, cycle done) - no speech",
     "concise": "Speaks permission requests and cycle completions [default]",
-    "verbose": "Full play-by-play narration of tools, plus subagent completions",
+    "tools": "Tool narration: play-by-play of every tool, plus subagent completions",
     "narrator": "Claude's actual words, read aloud - tool chatter stays quiet",
 }
 
-NUMERIC_ALIASES = {"0": "silent", "1": "quiet", "2": "concise", "3": "verbose", "4": "narrator"}
+NUMERIC_ALIASES = {"0": "silent", "1": "quiet", "2": "concise", "3": "tools", "4": "narrator"}
 
 VALID_ENGINES = ["auto", "kokoro", "phonon", "macos-female", "macos-male", "none"]
 VALID_DEVICES = ["cpu", "gpu"]
@@ -136,9 +136,12 @@ def normalize(key, value):
     if key == "interaction_level":
         if isinstance(value, int):
             value = str(value)
-        value = NUMERIC_ALIASES.get(str(value), str(value)).lower()
+        value = NUMERIC_ALIASES.get(str(value), str(value)).strip().lower()
+        # A level renamed in a past release is still accepted by its old name
+        # and stored under the current one.
+        value = settings.LEGACY_LEVEL_NAMES.get(value, value)
         if value not in settings.LEVELS:
-            raise ValueError(f"interaction_level must be one of {settings.LEVELS} (or 0-3)")
+            raise ValueError(f"interaction_level must be one of {settings.LEVELS} (or 0-4)")
         return value
     if key == "tts_engine":
         if value not in VALID_ENGINES:

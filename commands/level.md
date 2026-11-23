@@ -1,5 +1,5 @@
 ---
-description: "Set the narration level: silent, quiet, concise, verbose, narrator (or 0-4)"
+description: "Set the narration level: silent, quiet, concise, tools, narrator (or 0-4)"
 argument-hint: "[level] [--project]"
 allowed-tools: ["Bash"]
 ---
@@ -15,7 +15,7 @@ Change how much Claude Voiceover says. Arguments: `$ARGUMENTS`
 | silent | 0 | Nothing at all |
 | quiet | 1 | Sound pings only (permission needed, task done) |
 | concise | 2 | Speaks permission requests and task completions (default) |
-| verbose | 3 | Full play-by-play narration of every tool Claude uses |
+| tools | 3 | Full play-by-play narration of every tool Claude uses |
 | narrator | 4 | Claude's actual words, read aloud - tool chatter stays quiet |
 
 ## Steps
@@ -34,4 +34,4 @@ Change how much Claude Voiceover says. Arguments: `$ARGUMENTS`
 
 3. Confirm in one sentence what the user will now hear (use the table above).
 
-Do not edit any settings files by hand - the script handles the settings hierarchy and accepts both names (silent, quiet, concise, verbose, narrator) and 0-4 aliases.
+Do not edit any settings files by hand - the script handles the settings hierarchy and accepts both names (silent, quiet, concise, tools, narrator) and 0-4 aliases. It also still accepts the old name "verbose" for tools, and stores it as tools.

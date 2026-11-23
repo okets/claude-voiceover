@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.8.0 - 2026-11-23
+
+### Changed
+- The `verbose` level is now called `tools`, which says what it does: the play-by-play of
+  every tool Claude uses. Nothing about its behaviour changed. Settings files that still
+  say `verbose` keep working and resolve to `tools`, `/voiceover:level verbose` is still
+  accepted and stores `tools`, and the numeric alias is still 3 - so no one has to migrate
+  anything.
+
+### Fixed
+- Concise and verbose: the end-of-turn message now speaks Claude's actual closing words
+  whenever the turn left any, at whatever length, instead of swapping them for "Work
+  complete." Previously the closing was read verbatim only when the turn was simple and
+  the text under 300 characters, and the hook then applied the tool-chatter word budget on
+  top, so a normal three-or-four-sentence closing - what the plugin's own narration output
+  style asks Claude to write - was replaced by a canned phrase on most turns. The
+  templated stats summary ("2 files updated") is now the fallback for a turn that ended
+  without prose, not the default. Markdown in the closing (headers, emphasis, backticks,
+  code fences) is cleaned for the voice as narrator mode already did.
+
 ## 1.7.0 - 2026-11-22
 
 ### Added
